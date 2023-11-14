@@ -10,3 +10,7 @@ def canonical_repo(root: Path) -> Path:
 
 def view_repo(root: Path, name: str) -> Path:
     return root / "views" / f"{name}.git"
+
+
+def intake_repo(root: Path, name: str) -> Path:
+    return root / "intake" / f"{name}.git"
