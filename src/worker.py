@@ -1,0 +1,140 @@
+"""Projection-job worker with short state-lock critical sections."""
+
+from __future__ import annotations
+
+import copy
+import time
+import uuid
+from pathlib import Path
+
+from errors import ForgeError
+from layout import canonical_repo
+from outbox import next_job, requeue_expired_jobs, update_transaction_status
+from service import build_projection_plan, publish_projection_plan
+from state import (
+    has_unconfirmed_source,
+    is_ancestor,
+    locked,
+    save_state,
+    source_publication_pending,
+)
+
+
+LEASE_SECONDS = 60
+RETRY_SECONDS = 60
+
+
+def claim_projection_job(root: Path, now: float | None = None) -> dict | None:
+    now = time.time() if now is None else now
+    with locked(root) as state:
+        requeue_expired_jobs(state, now)
+        if has_unconfirmed_source(state):
+            save_state(root, state)
+            return None
+        excluded: set[str] = set()
+        while True:
+            job = next_job(state, now, excluded)
+            if not job:
+                save_state(root, state)
+                return None
+            if source_publication_pending(root, state, job["view"]):
+                excluded.add(job["id"])
+                continue
+            view = state["views"].get(job["view"])
+            if not view:
+                job["status"] = "retry"
+                job["last_error"] = "unknown projection view"
+                job["next_attempt_at"] = now + RETRY_SECONDS
+                excluded.add(job["id"])
+                continue
+            if job["canonical_to"] == view["canonical_frontier"] or is_ancestor(
+                canonical_repo(root), job["canonical_to"], view["canonical_frontier"]
+            ):
+                job["status"] = "completed"
+                job["last_error"] = None
+                transaction = state["transactions"][job["transaction_id"]]
+                transaction.get("view_errors", {}).pop(job["view"], None)
+                if job["view"] in transaction.get("pending_views", []):
+                    transaction["pending_views"].remove(job["view"])
+                update_transaction_status(state, job["transaction_id"])
+                continue
+            token = uuid.uuid4().hex
+            job["status"] = "running"
+            job["attempts"] += 1
+            job["lease_token"] = token
+            job["lease_expires_at"] = now + LEASE_SECONDS
+            job["expected_frontier"] = view["canonical_frontier"]
+            job["expected_projected_tip"] = view["projected_tip"]
+            snapshot = copy.deepcopy(job)
+            snapshot["view_state"] = copy.deepcopy(view)
+            save_state(root, state)
+            return snapshot
+
+
+def fail_projection_job(root: Path, claimed: dict, error: Exception) -> None:
+    with locked(root, recoverer=lambda _root, _state: None) as state:
+        job = state["projection_jobs"].get(claimed["id"])
+        if not job or job.get("lease_token") != claimed["lease_token"]:
+            return
+        job["status"] = "retry"
+        job["lease_token"] = None
+        job["last_error"] = str(error)
+        job["next_attempt_at"] = time.time() + RETRY_SECONDS
+        transaction = state["transactions"][job["transaction_id"]]
+        transaction.setdefault("view_errors", {})[job["view"]] = str(error)
+        update_transaction_status(state, job["transaction_id"])
+        save_state(root, state)
+
+
+def complete_projection_job(root: Path, claimed: dict, plan: dict) -> None:
+    with locked(root, recoverer=lambda _root, _state: None) as state:
+        job = state["projection_jobs"].get(claimed["id"])
+        if not job or job.get("lease_token") != claimed["lease_token"]:
+            raise ForgeError("projection job lease was lost")
+        if source_publication_pending(root, state, job["view"]):
+            job["status"] = "retry"
+            job["lease_token"] = None
+            job["last_error"] = "view started a receive transaction while projecting"
+            job["next_attempt_at"] = time.time() + RETRY_SECONDS
+            save_state(root, state)
+            return
+        job["status"] = "ready"
+        job["plan"] = plan
+        save_state(root, state)
+        publish_projection_plan(root, state, plan)
+        job["status"] = "completed"
+        job["lease_token"] = None
+        job["last_error"] = None
+        job.pop("plan", None)
+        transaction = state["transactions"][job["transaction_id"]]
+        transaction.get("view_errors", {}).pop(job["view"], None)
+        if job["view"] in transaction.get("pending_views", []):
+            transaction["pending_views"].remove(job["view"])
+        update_transaction_status(state, job["transaction_id"])
+        save_state(root, state)
+
+
+def run_projection_job(root: Path, now: float | None = None) -> bool:
+    claimed = claim_projection_job(root, now)
+    if not claimed:
+        return False
+    try:
+        plan = claimed.get("plan") or build_projection_plan(
+            root,
+            claimed["view"],
+            claimed["view_state"],
+            claimed["canonical_to"],
+        )
+        complete_projection_job(root, claimed, plan)
+    except Exception as error:
+        fail_projection_job(root, claimed, error)
+    return True
+
+
+def drain_projection_jobs(root: Path, limit: int | None = None) -> int:
+    completed = 0
+    while limit is None or completed < limit:
+        if not run_projection_job(root):
+            break
+        completed += 1
+    return completed

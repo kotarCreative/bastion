@@ -1,0 +1,247 @@
+{
+  "canonical_tip": "3d6d817622b0a9721e3cc404df3469171582be13",
+  "window": 10000,
+  "strategy": "oldest selected commit is projection root; parent edges outside the window are recorded",
+  "policies": [
+    {
+      "policy": "A",
+      "commits": 10000,
+      "placeholders": 562,
+      "placeholder_pct": 5.62,
+      "canonical_merges": 793,
+      "projected_merges": 749,
+      "cut_parent_edges": 365,
+      "runtime_seconds": 245.03669318102766,
+      "boundary_nodes": 20000,
+      "new_trees_created": 20000,
+      "object_counts": {
+        "blob": {
+          "new": 0,
+          "reused": 150299,
+          "reuse_pct": 100.0
+        },
+        "tree": {
+          "new": 10226,
+          "reused": 51589,
+          "reuse_pct": 83.45708970314648
+        },
+        "commit": {
+          "new": 10000,
+          "reused": 0,
+          "reuse_pct": 0.0
+        },
+        "tag": {
+          "new": 0,
+          "reused": 0,
+          "reuse_pct": 100
+        }
+      },
+      "incremental_seconds": {
+        "p50": 0.011354375979863107,
+        "p95": 0.027221063035540283,
+        "p99": 0.21605081402231008,
+        "max": 0.4402313589816913
+      }
+    },
+    {
+      "policy": "B",
+      "commits": 10000,
+      "placeholders": 7217,
+      "placeholder_pct": 72.17,
+      "canonical_merges": 793,
+      "projected_merges": 749,
+      "cut_parent_edges": 365,
+      "runtime_seconds": 159.37934804800898,
+      "boundary_nodes": 20000,
+      "new_trees_created": 20000,
+      "object_counts": {
+        "blob": {
+          "new": 0,
+          "reused": 26656,
+          "reuse_pct": 100.0
+        },
+        "tree": {
+          "new": 2198,
+          "reused": 8410,
+          "reuse_pct": 79.27978883861236
+        },
+        "commit": {
+          "new": 10000,
+          "reused": 0,
+          "reuse_pct": 0.0
+        },
+        "tag": {
+          "new": 0,
+          "reused": 0,
+          "reuse_pct": 100
+        }
+      },
+      "incremental_seconds": {
+        "p50": 0.009943886485416442,
+        "p95": 0.024629281018860638,
+        "p99": 0.21447242994327098,
+        "max": 0.4416375969303772
+      }
+    },
+    {
+      "policy": "C",
+      "commits": 10000,
+      "placeholders": 7082,
+      "placeholder_pct": 70.82000000000001,
+      "canonical_merges": 793,
+      "projected_merges": 749,
+      "cut_parent_edges": 365,
+      "runtime_seconds": 128.830991813913,
+      "boundary_nodes": 10000,
+      "new_trees_created": 10000,
+      "object_counts": {
+        "blob": {
+          "new": 0,
+          "reused": 17307,
+          "reuse_pct": 100.0
+        },
+        "tree": {
+          "new": 1926,
+          "reused": 6051,
+          "reuse_pct": 75.85558480631816
+        },
+        "commit": {
+          "new": 10000,
+          "reused": 0,
+          "reuse_pct": 0.0
+        },
+        "tag": {
+          "new": 0,
+          "reused": 0,
+          "reuse_pct": 100
+        }
+      },
+      "incremental_seconds": {
+        "p50": 0.007304661034140736,
+        "p95": 0.022581318044103682,
+        "p99": 0.21284714504145086,
+        "max": 0.4358487699646503
+      }
+    },
+    {
+      "policy": "D",
+      "commits": 10000,
+      "placeholders": 7877,
+      "placeholder_pct": 78.77,
+      "canonical_merges": 793,
+      "projected_merges": 749,
+      "cut_parent_edges": 365,
+      "runtime_seconds": 142.2246790640056,
+      "boundary_nodes": 20000,
+      "new_trees_created": 20000,
+      "object_counts": {
+        "blob": {
+          "new": 0,
+          "reused": 12397,
+          "reuse_pct": 100.0
+        },
+        "tree": {
+          "new": 1372,
+          "reused": 4297,
+          "reuse_pct": 75.79820074087141
+        },
+        "commit": {
+          "new": 10000,
+          "reused": 0,
+          "reuse_pct": 0.0
+        },
+        "tag": {
+          "new": 0,
+          "reused": 0,
+          "reuse_pct": 100
+        }
+      },
+      "incremental_seconds": {
+        "p50": 0.008797298010904342,
+        "p95": 0.024550535948947072,
+        "p99": 0.21528381702955812,
+        "max": 0.4368843670235947
+      }
+    },
+    {
+      "policy": "E",
+      "commits": 10000,
+      "placeholders": 639,
+      "placeholder_pct": 6.39,
+      "canonical_merges": 793,
+      "projected_merges": 749,
+      "cut_parent_edges": 365,
+      "runtime_seconds": 243.6450361959869,
+      "boundary_nodes": 20000,
+      "new_trees_created": 20000,
+      "object_counts": {
+        "blob": {
+          "new": 0,
+          "reused": 149242,
+          "reuse_pct": 100.0
+        },
+        "tree": {
+          "new": 10137,
+          "reused": 51228,
+          "reuse_pct": 83.48081153752139
+        },
+        "commit": {
+          "new": 10000,
+          "reused": 0,
+          "reuse_pct": 0.0
+        },
+        "tag": {
+          "new": 0,
+          "reused": 0,
+          "reuse_pct": 100
+        }
+      },
+      "incremental_seconds": {
+        "p50": 0.011283104482572526,
+        "p95": 0.02695144503377378,
+        "p99": 0.21602041693404317,
+        "max": 0.4328191700624302
+      }
+    },
+    {
+      "policy": "F",
+      "commits": 10000,
+      "placeholders": 5890,
+      "placeholder_pct": 58.9,
+      "canonical_merges": 793,
+      "projected_merges": 749,
+      "cut_parent_edges": 365,
+      "runtime_seconds": 285.6317705749534,
+      "boundary_nodes": 60000,
+      "new_trees_created": 60000,
+      "object_counts": {
+        "blob": {
+          "new": 0,
+          "reused": 60887,
+          "reuse_pct": 100.0
+        },
+        "tree": {
+          "new": 5354,
+          "reused": 18923,
+          "reuse_pct": 77.94620422622235
+        },
+        "commit": {
+          "new": 10000,
+          "reused": 0,
+          "reuse_pct": 0.0
+        },
+        "tag": {
+          "new": 0,
+          "reused": 0,
+          "reuse_pct": 100
+        }
+      },
+      "incremental_seconds": {
+        "p50": 0.019665572501253337,
+        "p95": 0.03472926397807896,
+        "p99": 0.22536896506790072,
+        "max": 0.4470653720200062
+      }
+    }
+  ]
+}
