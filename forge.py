@@ -12,6 +12,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 from errors import ForgeError
+from invariants import check_invariants
 from git import git, output, ref, run
 from layout import ZERO_OID, canonical_repo, view_repo
 from protocol import post_receive, pre_receive
@@ -47,6 +48,8 @@ def parser() -> argparse.ArgumentParser:
     sync = commands.add_parser("sync")
     sync.add_argument("root", type=Path)
     sync.add_argument("name")
+    check = commands.add_parser("check")
+    check.add_argument("root", type=Path)
     commands.add_parser("new-change-id")
     work = commands.add_parser("work")
     work.add_argument("root", type=Path)
@@ -73,6 +76,8 @@ def main() -> int:
             add_view(args.root, args.name, args.read, args.write, args.branch)
         elif args.command == "sync":
             sync_view(args.root, args.name)
+        elif args.command == "check":
+            check_invariants(args.root)
         elif args.command == "new-change-id":
             print(new_change_id())
         elif args.command == "work":

@@ -34,6 +34,7 @@ def init_forge(root: Path, source: Path, branch: str) -> None:
         raise ForgeError(f"forge root is not empty: {root}")
     root.mkdir(parents=True, exist_ok=True)
     (root / "views").mkdir()
+    (root / "state.lock").touch()
     run("git", "clone", "--bare", "--no-local", str(source), str(canonical_repo(root)))
     if output(canonical_repo(root), "rev-parse", "--show-object-format") != "sha1":
         raise ForgeError("this experiment currently supports SHA-1 repositories only")

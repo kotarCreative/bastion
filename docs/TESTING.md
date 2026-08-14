@@ -21,6 +21,7 @@ Git repositories, hooks, clones, fetches, rebases, and pushes.
 | `tests/test_service.py` | Initialization and canonical update validation |
 | `tests/test_forge.py` | Single-view ordinary Git behavior and security checks |
 | `tests/test_cross_view.py` | Overlapping views, fanout, concurrency barriers, recovery, and logical identity |
+| `tests/test_invariants.py` | Read-only global persisted-state and Git-history checks |
 
 Also run syntax and repository checks:
 
@@ -100,6 +101,13 @@ Limit a worker invocation to one ready job:
 
 ```bash
 python3 forge.py work /tmp/veil-forge --limit 1
+```
+
+Check all persisted state, refs, projected histories, and reachable view objects
+without modifying the forge:
+
+```bash
+python3 forge.py check /tmp/veil-forge
 ```
 
 ## Administrative Canonical Update

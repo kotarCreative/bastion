@@ -59,6 +59,11 @@ def clean_env() -> dict[str, str]:
         ):
             env.pop(name, None)
     env.pop("GIT_CONFIG_COUNT", None)
+    # Forge-created commits must not inherit encoding or other defaults from a
+    # user's Git installation.  Repository-local configuration remains active.
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
     return env
 
 

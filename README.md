@@ -65,6 +65,7 @@ ready secondary-view jobs. Jobs can also be processed explicitly:
 
 ```bash
 python3 forge.py work /tmp/veil-forge
+python3 forge.py check /tmp/veil-forge
 ```
 
 Run `python3 forge.py --help` for all experimental commands.

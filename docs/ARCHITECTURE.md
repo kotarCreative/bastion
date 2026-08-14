@@ -126,6 +126,7 @@ The implementation is under `src/`.
 | `state.py` | Durable JSON state, mappings, locking, and recovery |
 | `outbox.py` | Event dispatch, ordered jobs, leases, and completion rules |
 | `worker.py` | Projection job claim, build, publish, failure, and retry |
+| `invariants.py` | Read-only global persisted-state and Git-history verification |
 | `service.py` | Forge, view, synchronization, and canonical update use cases |
 | `protocol.py` | Receive-pack transaction orchestration |
 | `forge.py` | CLI and compatibility facade |
