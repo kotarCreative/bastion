@@ -17,6 +17,7 @@ The local prototype currently has:
 - crash recovery, leases, retries, and ref adoption;
 - serialized validated administrative canonical updates;
 - focused and real-Git black-box tests.
+- byte-exact tree-operation and unusual-path projection coverage.
 
 The roadmap is ordered by architectural risk, not product visibility.
 
@@ -34,7 +35,7 @@ operation sequences.
   persistence.
 - [done] Add named failpoints and terminate processes at every durable transaction
   boundary.
-- Add full tree-operation tests: delete, rename, mode, symlink, directory
+- [done] Add full tree-operation tests: delete, rename, mode, symlink, directory
   boundary, non-UTF-8 names, tabs, newlines, and long paths.
 - Add shared-visible conflict tests: modify/modify, delete/modify, and mode/content.
 - Verify every rejected operation leaves authoritative refs and mappings

@@ -53,6 +53,17 @@ def changed_entries(parent: TreeEntries, child: TreeEntries) -> TreeChanges:
     }
 
 
+def has_file_directory_conflict(entries: TreeEntries) -> bool:
+    """Return whether a flat leaf map contains a leaf and its descendant."""
+    paths = set(entries)
+    for path in sorted(paths):
+        parts = path.split(b"/")
+        for index in range(1, len(parts)):
+            if b"/".join(parts[:index]) in paths:
+                return True
+    return False
+
+
 def authorize_changes(changes: TreeChanges, read: list[str], write: list[str]) -> None:
     for path in changes:
         if not allowed(path, write) or not allowed(path, read):
@@ -86,12 +97,8 @@ def apply_changes(canonical: TreeEntries, changes: TreeChanges) -> TreeEntries:
         if changes[path] is not None:
             result[path] = changes[path]
 
-    paths = sorted(result)
-    for index, path in enumerate(paths):
-        if index and path.startswith(paths[index - 1] + b"/"):
-            raise ForgeError(
-                "tree transition crosses a file/directory authorization boundary"
-            )
+    if has_file_directory_conflict(result):
+        raise ForgeError("tree transition crosses a file/directory authorization boundary")
     return result
 
 

@@ -58,12 +58,42 @@ class TreeTransitionTest(unittest.TestCase):
             changed_entries(parent, child),
         )
 
+    def test_rename_mode_and_symlink_effects_are_exact(self) -> None:
+        renamed = changed_entries(
+            {b"shared/old": blob("1" * 40)},
+            {b"shared/new": blob("1" * 40)},
+        )
+        self.assertEqual({b"shared/old": None, b"shared/new": blob("1" * 40)}, renamed)
+        self.assertEqual(
+            {b"shared/file": blob("1" * 40, b"100755")},
+            changed_entries(
+                {b"shared/file": blob("1" * 40)},
+                {b"shared/file": blob("1" * 40, b"100755")},
+            ),
+        )
+        link = (b"120000", b"blob", "2" * 40)
+        self.assertEqual(
+            {b"shared/link": link},
+            changed_entries({b"shared/link": blob("1" * 40)}, {b"shared/link": link}),
+        )
+
     def test_authorization_requires_both_read_and_write(self) -> None:
         changes = {b"visible/file": blob()}
         authorize_changes(changes, ["visible"], ["visible"])
         for read, write in ((["other"], ["visible"]), (["visible"], ["other"])):
             with self.subTest(read=read, write=write), self.assertRaises(ForgeError):
                 authorize_changes(changes, read, write)
+
+    def test_rename_requires_both_endpoints_to_be_readable_and_writable(self) -> None:
+        changes = {b"team-a/old": None, b"shared/new": blob()}
+        with self.assertRaisesRegex(ForgeError, "outside current authorization"):
+            authorize_changes(changes, ["shared", "team-a"], ["shared"])
+        with self.assertRaisesRegex(ForgeError, "outside current authorization"):
+            authorize_changes(
+                {b"shared/old": None, b"team-a/new": blob()},
+                ["shared", "team-a"],
+                ["shared"],
+            )
 
     def test_apply_changes_preserves_unaffected_hidden_state(self) -> None:
         hidden = blob("a" * 40)
@@ -108,6 +138,35 @@ class TreeTransitionTest(unittest.TestCase):
                 ForgeError, "file/directory authorization boundary"
             ):
                 apply_changes(canonical, changes)
+
+    def test_complete_file_directory_conflict_detection(self) -> None:
+        for entries in (
+            {b"a": blob(), b"a-": blob(), b"a/b": blob()},
+            {b"a/b": blob(), b"a-": blob(), b"a": blob()},
+            {b"a": blob(), b"a/b": blob(), b"a0": blob()},
+        ):
+            with self.subTest(entries=entries), self.assertRaisesRegex(
+                ForgeError, "file/directory authorization boundary"
+            ):
+                apply_changes({}, entries)
+        self.assertEqual(
+            {b"a": blob(), b"a-": blob(), b"ab/c": blob()},
+            apply_changes({}, {b"a": blob(), b"a-": blob(), b"ab/c": blob()}),
+        )
+        self.assertEqual(
+            {b"visible": blob(), b"visible-secret/file": blob()},
+            apply_changes({}, {b"visible": blob(), b"visible-secret/file": blob()}),
+        )
+
+    def test_supported_mode_and_symlink_transitions_apply(self) -> None:
+        original = {b"shared/file": blob("1" * 40), b"shared/link": blob("2" * 40)}
+        symlink = (b"120000", b"blob", "3" * 40)
+        result = apply_changes(
+            original,
+            {b"shared/file": blob("1" * 40, b"100755"), b"shared/link": symlink},
+        )
+        self.assertEqual(blob("1" * 40, b"100755"), result[b"shared/file"])
+        self.assertEqual(symlink, result[b"shared/link"])
 
     def test_unsupported_old_and_new_entries_are_rejected(self) -> None:
         gitlink = (b"160000", b"commit", "1" * 40)

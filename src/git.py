@@ -9,7 +9,7 @@ from pathlib import Path
 
 from errors import ForgeError
 from layout import ZERO_OID
-from validation import TreeEntries
+from validation import TreeEntries, has_file_directory_conflict
 
 
 def run(
@@ -169,10 +169,8 @@ def write_tree(
     entries: TreeEntries,
     object_env: dict[str, str] | None = None,
 ) -> str:
-    paths = sorted(entries)
-    for index, path in enumerate(paths):
-        if index and path.startswith(paths[index - 1] + b"/"):
-            raise ForgeError("tree transition has a file/directory conflict")
+    if has_file_directory_conflict(entries):
+        raise ForgeError("tree transition has a file/directory conflict")
     env, index_path = temporary_index(repo, object_env)
     try:
         git(repo, "read-tree", "--empty", env=env)
@@ -182,6 +180,10 @@ def write_tree(
         ]
         if records:
             git(repo, "update-index", "-z", "--index-info", data=b"".join(records), env=env)
+        else:
+            # ``write-tree`` may return Git's well-known empty-tree ID without
+            # storing it, leaving an otherwise valid empty projected view unreadable.
+            return git(repo, "hash-object", "-w", "-t", "tree", "--stdin", data=b"", env=env).stdout.decode().strip()
         return output(repo, "write-tree", env=env)
     finally:
         index_path.unlink(missing_ok=True)
@@ -309,20 +311,16 @@ def verify_no_extra_objects(repo: Path, new: str, env: dict[str, str]) -> None:
     quarantined = quarantine_objects(env)
     if not quarantined:
         return
-    reachable = {
-        line.split()[0]
-        for line in output(repo, "rev-list", "--objects", new, env=env).splitlines()
-    }
+    reachable = set(
+        output(repo, "rev-list", "--objects", "--no-object-names", new, env=env).splitlines()
+    )
     if quarantined - reachable:
         raise ForgeError("push contains objects unreachable from the submitted tip")
 
 
 def copy_submitted_closure(repo: Path, old: str, new: str, env: dict[str, str]) -> None:
-    object_ids = [
-        line.split()[0]
-        for line in output(
-            repo, "rev-list", "--objects", new, f"^{old}", env=env
-        ).splitlines()
-    ]
+    object_ids = output(
+        repo, "rev-list", "--objects", "--no-object-names", new, f"^{old}", env=env
+    ).splitlines()
     for oid in object_ids:
         copy_object(repo, repo, oid, source_env=env)

@@ -414,10 +414,10 @@ def _synthetic(raw: bytes, projected: str, canonical: str, parent: str | None, c
     if raw != expected or parents != ([] if parent is None else [parent]): _fail(code, projected, "synthetic commit bytes or parent are not deterministic")
 
 
-def _projected(root: Path, state: dict, canonical_history: list[str]) -> tuple[dict[str, list[tuple[str, str, str | None]]], dict[str, tuple[set[str], set[str], set[tuple[bytes, str]]]]]:
+def _projected(root: Path, state: dict, canonical_history: list[str]) -> tuple[dict[str, list[tuple[str, str, str | None]]], dict[str, tuple[set[str], set[str], set[str]]]]:
     canonical = canonical_repo(root); index = {oid: i for i, oid in enumerate(canonical_history)}; revision_data: dict[str, list[tuple[str, str, str | None]]] = {}
     confirmed: dict[str, dict[str, tuple[str, str | None]]] = {name: {} for name in state["views"]}
-    view_closures: dict[str, tuple[set[str], set[str], set[tuple[bytes, str]]]] = {}
+    view_closures: dict[str, tuple[set[str], set[str], set[str]]] = {}
     for tx in state["transactions"].values():
         if tx.get("kind") is None and tx["status"] in {"fanout_pending", "published"}:
             for mapping in tx["mappings"]:
@@ -427,7 +427,7 @@ def _projected(root: Path, state: dict, canonical_history: list[str]) -> tuple[d
         repo = view_repo(root, name); actual = _history(repo, view["projected_tip"], "PROJECTION", name)
         allowed_commits: set[str] = set(actual)
         allowed_trees: set[str] = set()
-        allowed_leaves: set[tuple[bytes, str]] = set()
+        allowed_blobs: set[str] = set()
         expected: list[tuple[str, str, str | None]] = []; previous_visible: dict | None = None; actual_index = 0; previous_projected: str | None = None
         for canonical_oid in canonical_history[:index[view["canonical_frontier"]] + 1]:
             visible = _filtered(_flat(canonical, canonical_oid, "PROJECTION"), view["read"])
@@ -447,8 +447,7 @@ def _projected(root: Path, state: dict, canonical_history: list[str]) -> tuple[d
             if _flat(repo, projected, "PROJECTION") != visible: _fail("PROJECTION", projected, "projected tree differs from canonical filter")
             allowed_trees.add(_tree)
             allowed_trees.update(_no_empty(repo, projected, "PROJECTION"))
-            for path, (_mode, _kind, blob_oid) in visible.items():
-                allowed_leaves.add((path, blob_oid))
+            allowed_blobs.update(blob_oid for _mode, _kind, blob_oid in visible.values())
             if kind == "synthetic":
                 if set(anchor) != {"canonical", "kind", "change_id"} or anchor["change_id"] != change_id: _fail("ANCHOR", projected, "synthetic anchor has invalid Change-Id")
                 _synthetic(raw, projected, canonical_oid, previous_projected, change_id, "PROJECTION")
@@ -458,7 +457,7 @@ def _projected(root: Path, state: dict, canonical_history: list[str]) -> tuple[d
             previous_projected = projected; previous_visible = visible
         if [item[0] for item in expected] != actual or set(view["anchors"]) != set(actual): _fail("ANCHOR", name, "anchors and projected history differ")
         if _flat(repo, view["projected_tip"], "PROJECTION") != _filtered(_flat(canonical, view["canonical_frontier"], "PROJECTION"), view["read"]): _fail("PROJECTION", name, "tip tree differs from frontier filter")
-        view_closures[name] = (allowed_commits, allowed_trees, allowed_leaves)
+        view_closures[name] = (allowed_commits, allowed_trees, allowed_blobs)
     return revision_data, view_closures
 
 
@@ -587,33 +586,32 @@ def _outbox_jobs(state: dict, canonical_history: list[str]) -> None:
             if earlier["status"] != "completed" and later["status"] in {"running", "ready", "completed"}: _fail("JOB", view, "higher sequence passed incomplete work")
 
 
-def _reachability(root: Path, state: dict, view_closures: dict[str, tuple[set[str], set[str], set[tuple[bytes, str]]]]) -> None:
+def _reachability(root: Path, state: dict, view_closures: dict[str, tuple[set[str], set[str], set[str]]]) -> None:
     for name, view in sorted(state["views"].items()):
         repo = view_repo(root, name)
-        allowed_commits, allowed_trees, allowed_leaves = view_closures[name]
+        allowed_commits, allowed_trees, allowed_blobs = view_closures[name]
         if git(repo, "fsck", "--full", "--strict", "--no-reflogs", "--no-dangling", check=False).returncode: _fail("REACHABILITY", name, "strict fsck failed")
-        result = git(repo, "rev-list", "--objects", view["projected_tip"], check=False)
+        result = git(repo, "rev-list", "--objects", "--no-object-names", view["projected_tip"], check=False)
         if result.returncode: _fail("REACHABILITY", name, "cannot enumerate closure")
-        for line in result.stdout.splitlines():
-            parts = line.split(b" ", 1)
-            oid = parts[0].decode(errors="replace")
-            path = parts[1] if len(parts) > 1 else None
+        for raw_oid in result.stdout.splitlines():
+            try:
+                oid = raw_oid.decode("ascii")
+            except UnicodeDecodeError:
+                _fail("REACHABILITY", repr(raw_oid), "closure contains a non-ASCII object ID")
+            if not _oid(oid):
+                _fail("REACHABILITY", repr(raw_oid), "closure contains an invalid object ID")
             kind = git(repo, "cat-file", "-t", oid, check=False)
             if kind.returncode: _fail("REACHABILITY", oid, "missing local object")
             kind_str = kind.stdout.strip()
             if kind_str == b"commit":
-                if path is not None:
-                    _fail("REACHABILITY", oid, "commit appears with a path")
                 if oid not in allowed_commits:
                     _fail("REACHABILITY", oid, "reachable commit is not in anchored projected chain")
             elif kind_str == b"tree":
                 if oid not in allowed_trees:
                     _fail("REACHABILITY", oid, "reachable tree is not in projected snapshot")
             elif kind_str == b"blob":
-                if path is None:
-                    _fail("REACHABILITY", oid, "reachable blob has no path")
-                if (path, oid) not in allowed_leaves:
-                    _fail("REACHABILITY", _path(path), "reachable leaf is not an authorized blob")
+                if oid not in allowed_blobs:
+                    _fail("REACHABILITY", oid, "reachable blob is not in a projected leaf")
             else:
                 _fail("REACHABILITY", oid, "unsupported reachable object type")
 

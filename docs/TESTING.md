@@ -15,6 +15,8 @@ Git repositories, hooks, clones, fetches, rebases, and pushes.
 |---|---|
 | `tests/test_validation.py` | Prefix matching, authorization, modes, tree effects, refs, and `Change-Id` parsing |
 | `tests/test_git_adapter.py` | Git environment isolation |
+| `tests/test_tree_operations.py` | Directed source and administrative delete, rename, mode, symlink, directory-boundary, and rejection behavior |
+| `tests/test_unusual_paths.py` | Raw non-UTF-8, tab, newline, near-component-limit, and over-4096-byte path lifecycles |
 | `tests/test_state.py` | Mapping idempotency, frontier monotonicity, CAS abort, and receiver identity |
 | `tests/test_outbox.py` | Idempotent dispatch, per-view ordering, leases, and terminal states |
 | `tests/test_worker.py` | Claim/build/complete, ref adoption, retries, stale plans, and receive races |
@@ -92,6 +94,15 @@ The tests currently demonstrate:
 - process crash states around canonical and projected ref publication;
 - administrative canonical update validation;
 - canonical merge and non-fast-forward rejection.
+- exact tree snapshots for deletes, renames, mode-only transitions, symlink targets, and file/directory replacement;
+- byte-preserving source and administrative projection of non-UTF-8, tab, newline, and long paths;
+- OID-only closure validation, including quarantined extra-object rejection.
+
+The directed tree modules use `tests/tree_harness.py`, an independent binary Git
+plumbing helper. It reads `ls-tree -rz` records and writes temporary-index trees
+without decoding raw pathnames or materializing deep logical paths in a worktree.
+They complement, rather than expand, the generated state-machine and process
+crash matrices.
 
 Passing tests are evidence for the constrained model, not proof of production
 security.
