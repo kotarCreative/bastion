@@ -111,6 +111,9 @@ class WorkerTest(unittest.TestCase):
         complete_projection_job(self.forge, claimed, plan)
         state = self.state()
         self.assertEqual("completed", state["projection_jobs"][claimed["id"]]["status"])
+        self.assertIsNone(state["projection_jobs"][claimed["id"]]["lease_token"])
+        self.assertNotIn("lease_expires_at", state["projection_jobs"][claimed["id"]])
+        self.assertNotIn("plan", state["projection_jobs"][claimed["id"]])
         self.assertEqual("published", state["transactions"]["worker-tx"]["status"])
         self.assertEqual(
             claimed["canonical_to"], state["views"]["bob"]["canonical_frontier"]
@@ -175,6 +178,25 @@ class WorkerTest(unittest.TestCase):
         self.assertEqual(
             "completed", self.state()["projection_jobs"][claimed["id"]]["status"]
         )
+
+    def test_already_covered_completion_clears_active_lease_fields(self) -> None:
+        from state import load_state, recover
+
+        state = load_state(self.forge)
+        recover(self.forge, state)
+        job = next(iter(state["projection_jobs"].values()))
+        view = state["views"][job["view"]]
+        view["canonical_frontier"] = job["canonical_to"]
+        job["lease_token"] = "retained-token"
+        job["lease_expires_at"] = 123
+        job["plan"] = {"retained": "plan"}
+        save_state(self.forge, state)
+        self.assertIsNone(claim_projection_job(self.forge))
+        completed = self.state()["projection_jobs"][job["id"]]
+        self.assertEqual("completed", completed["status"])
+        self.assertIsNone(completed["lease_token"])
+        self.assertNotIn("lease_expires_at", completed)
+        self.assertNotIn("plan", completed)
 
     def test_canonical_rewrite_invalidates_plan(self) -> None:
         claimed = claim_projection_job(self.forge)

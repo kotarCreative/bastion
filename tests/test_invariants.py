@@ -88,6 +88,20 @@ class InvariantTest(unittest.TestCase):
         self.assertEqual(before_refs, self._refs())
         self.assertEqual(before_objects, {repo: command("git", "--git-dir", repo, "count-objects", "-v").stdout for repo in before_refs})
 
+    def test_failing_check_is_read_only(self) -> None:
+        state = json.loads((self.forge / "state.json").read_text())
+        state["next_transaction_sequence"] = 0
+        forge.save_state(self.forge, state)
+        before_state = (self.forge / "state.json").read_bytes()
+        before_refs = self._refs()
+        repos = [forge.canonical_repo(self.forge), forge.view_repo(self.forge, "alice"), forge.view_repo(self.forge, "bob")]
+        before_objects = {str(repo): command("git", "--git-dir", str(repo), "count-objects", "-v").stdout for repo in repos}
+        with self.assertRaisesRegex(ForgeError, r"invariant STATE_SCHEMA failed for state"):
+            check_invariants(self.forge)
+        self.assertEqual(before_state, (self.forge / "state.json").read_bytes())
+        self.assertEqual(before_refs, self._refs())
+        self.assertEqual(before_objects, {str(repo): command("git", "--git-dir", str(repo), "count-objects", "-v").stdout for repo in repos})
+
     def test_source_change_and_synthetic_fanout_pass(self) -> None:
         checkout = self.root / "alice"
         command("git", "clone", "-q", "--no-local", str(forge.view_repo(self.forge, "alice")), str(checkout))
@@ -385,6 +399,77 @@ class InvariantTest(unittest.TestCase):
         state["projection_jobs"][claimed["id"]]["status"] = "ready"
         forge.save_state(self.forge, state)
         with self.assertRaisesRegex(ForgeError, r"invariant JOB failed for project:"):
+            check_invariants(self.forge)
+
+    def test_ready_job_with_retained_plan_and_unchanged_ref_passes(self) -> None:
+        old_tip = self._canonical_tip()
+        new_tip = self._admin_commit("shared/x.txt", "x\n", "admin")
+        forge.update_canonical_ref(self.forge, old_tip, new_tip)
+        from state import recover, save_state
+        state = json.loads((self.forge / "state.json").read_text())
+        # Dispatch without changing the claimed job's durable ref boundary.
+        recover(self.forge, state)
+        save_state(self.forge, state)
+        from worker import claim_projection_job
+        from service import build_projection_plan
+        claimed = claim_projection_job(self.forge, now=1)
+        plan = build_projection_plan(self.forge, claimed["view"], claimed["view_state"], claimed["canonical_to"])
+        state = json.loads((self.forge / "state.json").read_text())
+        state["projection_jobs"][claimed["id"]]["status"] = "ready"
+        state["projection_jobs"][claimed["id"]]["plan"] = plan
+        forge.save_state(self.forge, state)
+        check_invariants(self.forge)
+
+    def test_ready_plan_change_id_must_match_canonical_commit(self) -> None:
+        old_tip = self._canonical_tip()
+        change_id = "Iabababababababababababababababababababab"
+        new_tip = self._admin_commit("shared/x.txt", "x\n", f"admin\n\nChange-Id: {change_id}")
+        forge.update_canonical_ref(self.forge, old_tip, new_tip)
+        from state import recover, save_state
+        state = json.loads((self.forge / "state.json").read_text())
+        recover(self.forge, state)
+        save_state(self.forge, state)
+        from worker import claim_projection_job
+        from service import build_projection_plan
+        claimed = claim_projection_job(self.forge, now=1)
+        plan = build_projection_plan(self.forge, claimed["view"], claimed["view_state"], claimed["canonical_to"])
+        old_projected, anchor = next(iter(plan["anchors"].items()))
+        wrong = "Icdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        raw = forge.git(forge.view_repo(self.forge, claimed["view"]), "cat-file", "commit", old_projected).stdout
+        replacement = raw.replace(change_id.encode(), wrong.encode())
+        self.assertNotEqual(raw, replacement)
+        new_projected = forge.git(forge.view_repo(self.forge, claimed["view"]), "hash-object", "-w", "-t", "commit", "--stdin", data=replacement).stdout.decode().strip()
+        plan["anchors"] = {new_projected: {**anchor, "change_id": wrong}}
+        plan["new_tip"] = new_projected
+        state = json.loads((self.forge / "state.json").read_text())
+        state["projection_jobs"][claimed["id"]]["status"] = "ready"
+        state["projection_jobs"][claimed["id"]]["plan"] = plan
+        forge.save_state(self.forge, state)
+        with self.assertRaisesRegex(ForgeError, r"invariant JOB failed for project:.*plan Change-Id differs from canonical commit"):
+            check_invariants(self.forge)
+
+    def test_completed_job_ahead_of_frontier_fails(self) -> None:
+        first_old = self._canonical_tip()
+        first_new = self._admin_commit("shared/first.txt", "first\n", "first")
+        forge.update_canonical_ref(self.forge, first_old, first_new)
+        second_new = self._admin_commit("shared/second.txt", "second\n", "second")
+        forge.update_canonical_ref(self.forge, first_new, second_new)
+        from state import recover, save_state
+        state = json.loads((self.forge / "state.json").read_text())
+        recover(self.forge, state)
+        save_state(self.forge, state)
+        state = json.loads((self.forge / "state.json").read_text())
+        first_tx = next(tx for tx in state["transactions"].values() if tx["canonical_new"] == first_new)
+        first_tx["pending_views"] = []
+        first_tx["status"] = "published"
+        for job in state["projection_jobs"].values():
+            if job["transaction_id"] == first_tx["id"]:
+                job["status"] = "completed"
+                job["lease_token"] = None
+                job.pop("lease_expires_at", None)
+                job.pop("plan", None)
+        forge.save_state(self.forge, state)
+        with self.assertRaisesRegex(ForgeError, r"invariant JOB failed for project:.*completed target is ahead of the view frontier"):
             check_invariants(self.forge)
 
     def test_invalid_prepared_administrative_history_fails(self) -> None:

@@ -2,7 +2,10 @@
 
 ## Status
 
-Ready for implementation.
+Implemented for the version-1 forge. The checker and its focused healthy,
+pending, retry, source-unconfirmed, read-only, and selected corruption tests
+are present. The full corruption matrix described by this specification remains
+an ongoing test-coverage target rather than a claim of exhaustive coverage.
 
 This specification covers the first item in Phase 1 of `ROADMAP.md`:
 

@@ -483,6 +483,13 @@ def _plans(root: Path, state: dict, canonical_history: list[str]) -> None:
                 if len(candidates) != 1: _fail("JOB", identifier, "plan anchors do not replay canonically")
                 projected = candidates[0]; anchor = plan["anchors"][projected]
                 if set(anchor) != {"canonical", "kind", "change_id"} or anchor["kind"] != "synthetic": _fail("JOB", identifier, "plan has non-synthetic anchor")
+                canonical_change_id = parse_change_id(
+                    _commit_parts(
+                        _raw_commit(canonical, oid, "JOB", oid), "JOB", oid
+                    )[3]
+                )
+                if anchor["change_id"] != canonical_change_id:
+                    _fail("JOB", identifier, "plan Change-Id differs from canonical commit")
                 raw = _raw_commit(view_repo(root, job["view"]), projected, "JOB", projected); _synthetic(raw, projected, oid, previous_tip, anchor["change_id"], "JOB")
                 if _flat(view_repo(root, job["view"]), projected, "JOB") != visible: _fail("JOB", identifier, "plan tree differs from filter")
                 expected_keys.append(projected); previous_tip = projected
@@ -527,7 +534,7 @@ def _changes(state: dict, revisions: dict[str, list[tuple[str, str, str | None]]
             _fail("CHANGE", change_id, "unbacked ownership reservation")
 
 
-def _outbox_jobs(state: dict) -> None:
+def _outbox_jobs(state: dict, canonical_history: list[str]) -> None:
     events_by_tx: dict[str, dict] = {}
     for identifier, event in sorted(state["outbox"].items()):
         tx = state["transactions"].get(event["transaction_id"])
@@ -570,6 +577,11 @@ def _outbox_jobs(state: dict) -> None:
         if not set(errors).issubset(incomplete): _fail("JOB", identifier, "view error is not backed by incomplete job")
     for view in sorted(state["views"]):
         jobs = sorted((job for job in state["projection_jobs"].values() if job["view"] == view), key=lambda item: item["sequence"])
+        frontier = state["views"][view]["canonical_frontier"]
+        frontier_index = canonical_history.index(frontier)
+        for job in jobs:
+            if job["status"] == "completed" and canonical_history.index(job["canonical_to"]) > frontier_index:
+                _fail("JOB", job["id"], "completed target is ahead of the view frontier")
         if sum(job["status"] in {"running", "ready"} for job in jobs) > 1: _fail("JOB", view, "more than one active job")
         for earlier, later in zip(jobs, jobs[1:]):
             if earlier["status"] != "completed" and later["status"] in {"running", "ready", "completed"}: _fail("JOB", view, "higher sequence passed incomplete work")
@@ -638,5 +650,5 @@ def check_invariants(root: Path) -> None:
     revisions, view_closures = _phase("PROJECTION", lambda: _projected(root, state, canonical_history))
     _phase("JOB", lambda: _plans(root, state, canonical_history))
     _phase("CHANGE", lambda: _changes(state, revisions))
-    _phase("OUTBOX", lambda: _outbox_jobs(state))
+    _phase("OUTBOX", lambda: _outbox_jobs(state, canonical_history))
     _phase("REACHABILITY", lambda: _reachability(root, state, view_closures))

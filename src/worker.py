@@ -51,7 +51,10 @@ def claim_projection_job(root: Path, now: float | None = None) -> dict | None:
                 canonical_repo(root), job["canonical_to"], view["canonical_frontier"]
             ):
                 job["status"] = "completed"
+                job["lease_token"] = None
+                job.pop("lease_expires_at", None)
                 job["last_error"] = None
+                job.pop("plan", None)
                 transaction = state["transactions"][job["transaction_id"]]
                 transaction.get("view_errors", {}).pop(job["view"], None)
                 if job["view"] in transaction.get("pending_views", []):
@@ -104,6 +107,7 @@ def complete_projection_job(root: Path, claimed: dict, plan: dict) -> None:
         publish_projection_plan(root, state, plan)
         job["status"] = "completed"
         job["lease_token"] = None
+        job.pop("lease_expires_at", None)
         job["last_error"] = None
         job.pop("plan", None)
         transaction = state["transactions"][job["transaction_id"]]

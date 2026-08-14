@@ -22,6 +22,7 @@ Git repositories, hooks, clones, fetches, rebases, and pushes.
 | `tests/test_forge.py` | Single-view ordinary Git behavior and security checks |
 | `tests/test_cross_view.py` | Overlapping views, fanout, concurrency barriers, recovery, and logical identity |
 | `tests/test_invariants.py` | Read-only global persisted-state and Git-history checks |
+| `tests/test_state_machine.py` | Deterministic real-Git state-machine, replay, crash/recovery, and independent tree-model checks |
 
 Also run syntax and repository checks:
 
@@ -29,6 +30,46 @@ Also run syntax and repository checks:
 python3 -m py_compile forge.py tests/*.py src/*.py
 git diff --check
 ```
+
+## Deterministic State Machine
+
+`tests/test_state_machine.py` runs two fixed smoke seeds (`0x5eed` and
+`0xc0ffee`) with 24 generated steps. Each step records an automatic recovery
+and outbox-dispatch checkpoint followed by a selected operation. The harness
+uses a separate byte-level tree model and Git plumbing reader, then calls the
+global invariant checker after every stable checkpoint.
+
+Replay one or more seeds, optionally with a longer run, without editing tests:
+
+```bash
+VEIL_STATE_MACHINE_SEEDS=0xc0ffee \
+VEIL_STATE_MACHINE_STEPS=80 \
+python3 -m unittest -v tests.test_state_machine
+```
+
+Seeds accept Python integer syntax, including hexadecimal. Invalid seed lists
+or non-positive step counts fail before creating a fixture. An explicit seed or
+step override is intended for replay and does not enforce aggregate smoke
+coverage.
+
+On failure, the test prints a replayable structured trace:
+
+```text
+state-machine failure
+seed: 12648430
+steps: 24
+failed step: 7
+operation: authorized_push {"...": "..."}
+trace:
+0000 recover_dispatch {"before_step": 0}
+0001 admin_edit {"...": "..."}
+```
+
+`tests/state_machine.py` also exposes `replay_scenario(seed, operations)` for
+direct execution of a recorded trace without selecting new random operations.
+The version-1 permission-change operation only adds one of the fixed immutable
+view descriptors. It does not mutate, revoke, expand, or contract any existing
+view policy, so it is not revocation coverage.
 
 ## Demonstrated Behavior
 
