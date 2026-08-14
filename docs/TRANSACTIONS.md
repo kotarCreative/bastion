@@ -13,7 +13,7 @@ The transaction model must provide:
 - isolation when one projected view is unavailable.
 
 Git refs and the state store cannot participate in one atomic transaction.
-Veil therefore records durable intent, observes Git state during recovery, and
+Bastion therefore records durable intent, observes Git state during recovery, and
 only advances transaction status forward.
 
 ## Source Push Lifecycle
@@ -158,7 +158,9 @@ views completes immediately.
 ## Locking Rules
 
 The filesystem state lock serializes short state and ref critical sections.
-It is not held while traversing history or constructing projection objects.
+Source `pre_receive` currently performs history traversal and candidate
+construction while holding the lock; projection workers build plans outside the
+lock and only reacquire it for durable plan, ref, and completion updates.
 
 The current lock order is:
 
@@ -172,5 +174,25 @@ single state lock. Production should preserve per-canonical-ref ordering and
 per-view ordering while allowing unrelated repositories and views to execute
 concurrently.
 
+## Tested Process-Crash Windows
+
+The real-process suite terminates processes at the following durable boundaries:
+
+- source validation complete, prepared persisted, canonical ref published,
+  canonical state persisted, source ref published, confirmation persisted, and
+  receiver cleanup persisted;
+- administrative prepared persisted, canonical ref published, and canonical
+  state persisted;
+- worker claim persisted, plan persisted, completion persisted, and retry
+  persisted;
+- projection ref published;
+- recovery state persisted;
+- atomic state-save temporary fsync, replace, and directory fsync.
+
+These tests prove forward-only recovery and idempotency for the current local
+filesystem endpoint.  They are evidence of process-crash behavior, not power-loss
+or production-security guarantees.
+
 Receiver liveness markers store both PID and Linux process start identity to
-avoid treating a reused PID as an active receive-pack process.
+avoid treating a reused PID as an active receive-pack process. Recovery removes
+stale markers for aborted, confirmed, and terminal transactions.

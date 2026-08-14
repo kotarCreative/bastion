@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Veil tests whether one canonical Git repository can safely support multiple
+Bastion tests whether one canonical Git repository can safely support multiple
 writable repositories with different path visibility while clients continue to
 use ordinary Git.
 
@@ -97,7 +97,7 @@ Bob remote: B1 -> B2
 ## Reconciliation
 
 Only linear submitted chains rooted at the advertised projected tip are
-accepted. For every submitted commit, Veil:
+accepted. For every submitted commit, Bastion:
 
 1. Reads the projected parent and child trees.
 2. Computes exact add, modify, delete, and mode effects.

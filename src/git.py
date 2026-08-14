@@ -200,10 +200,10 @@ def author_environment(
 ) -> dict[str, str]:
     if projected:
         return {
-            "GIT_AUTHOR_NAME": "Veil Projection",
+            "GIT_AUTHOR_NAME": "Bastion Projection",
             "GIT_AUTHOR_EMAIL": "projection@localhost",
             "GIT_AUTHOR_DATE": "2000-01-01T00:00:00 +0000",
-            "GIT_COMMITTER_NAME": "Veil Projection",
+            "GIT_COMMITTER_NAME": "Bastion Projection",
             "GIT_COMMITTER_EMAIL": "projection@localhost",
             "GIT_COMMITTER_DATE": "2000-01-01T00:00:00 +0000",
         }
@@ -221,7 +221,7 @@ def author_environment(
         "GIT_AUTHOR_NAME": name,
         "GIT_AUTHOR_EMAIL": email,
         "GIT_AUTHOR_DATE": date,
-        "GIT_COMMITTER_NAME": "Veil Forge",
+        "GIT_COMMITTER_NAME": "Bastion Forge",
         "GIT_COMMITTER_EMAIL": "forge@localhost",
         "GIT_COMMITTER_DATE": date,
     }

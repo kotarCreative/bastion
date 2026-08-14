@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Callable, Iterator
 
 from errors import ForgeError
+from failpoints import checkpoint
 from git import git, ref
 from layout import ZERO_OID, canonical_repo, view_repo
 
@@ -32,12 +33,15 @@ def save_state(root: Path, state: dict) -> None:
         output_file.write(json.dumps(state, indent=2, sort_keys=True) + "\n")
         output_file.flush()
         os.fsync(output_file.fileno())
+    checkpoint(root, "state.temporary_fsynced")
     os.replace(temporary, target)
+    checkpoint(root, "state.replaced")
     directory = os.open(root, os.O_RDONLY)
     try:
         os.fsync(directory)
     finally:
         os.close(directory)
+    checkpoint(root, "state.directory_fsynced")
 
 
 def apply_transaction_state(state: dict, transaction: dict) -> None:
@@ -277,6 +281,7 @@ def recover(root: Path, state: dict) -> None:
                 enqueue_canonical_committed(state, transaction, ready=True)
                 transaction["status"] = "fanout_pending"
                 transaction.pop("source_error", None)
+                (root / "receivers" / transaction["id"]).unlink(missing_ok=True)
                 changed = True
             elif not receiver_active(root, transaction["id"]):
                 transaction["status"] = "source_unconfirmed"
@@ -289,6 +294,14 @@ def recover(root: Path, state: dict) -> None:
         ):
             transaction["status"] = "published"
             changed = True
+    receivers = root / "receivers"
+    for marker in receivers.glob("*") if receivers.exists() else ():
+        txid = marker.name
+        tx = state.get("transactions", {}).get(txid)
+        if tx and tx["status"] in {"aborted", "fanout_pending", "published"}:
+            marker.unlink(missing_ok=True)
+            changed = True
+
     before = json.dumps(
         (state.get("outbox", {}), state.get("projection_jobs", {})), sort_keys=True
     )
@@ -298,6 +311,7 @@ def recover(root: Path, state: dict) -> None:
     )
     if changed:
         save_state(root, state)
+        checkpoint(root, "recovery.state_persisted")
 
 
 @contextlib.contextmanager

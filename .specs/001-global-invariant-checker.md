@@ -127,7 +127,7 @@ python3 forge.py check FORGE_ROOT
 CLI behavior:
 
 - success: no stdout or stderr, exit code `0`;
-- failure: `veil: <diagnostic>` on stderr, exit code `1` through the existing
+- failure: `bastion: <diagnostic>` on stderr, exit code `1` through the existing
   `ForgeError` handling;
 - the command never repairs state, runs recovery, moves a ref, creates a Git
   object, dispatches an event, requeues a job, or changes a lease.
@@ -402,7 +402,7 @@ Validate the full submitted and canonical chains, not just their tips:
 Also validate the canonical commit metadata produced by reconciliation:
 
 - author name, email, and timestamp equal the submitted commit author;
-- committer is `Veil Forge <forge@localhost>`;
+- committer is `Bastion Forge <forge@localhost>`;
 - committer timestamp equals the submitted author timestamp;
 - there are no merge, signature, or replacement-object effects.
 
@@ -548,7 +548,7 @@ For a synthetic commit require:
 
 - `change_id == parse_change_id(canonical_commit_message)`;
 - author and committer are exactly
-  `Veil Projection <projection@localhost>`;
+  `Bastion Projection <projection@localhost>`;
 - both timestamps are exactly `946684800 +0000`;
 - the message is exactly `projected canonical change\n`, followed only by
   `\nChange-Id: <id>\n` when an ID exists;
@@ -915,7 +915,7 @@ The roadmap item is complete when all of the following are true:
 - A successful or failed check leaves state bytes, refs, and object counts
   unchanged.
 - `python3 forge.py check FORGE_ROOT` exits `0` silently for a healthy forge and
-  exits `1` through the existing `veil: ...` error path for an unhealthy forge.
+  exits `1` through the existing `bastion: ...` error path for an unhealthy forge.
 - All existing tests continue to pass.
 - These commands pass:
 

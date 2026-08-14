@@ -29,10 +29,10 @@ operation sequences.
   representation, and reachable object.
 - Add deterministic property/state-machine tests generating canonical updates,
   user pushes, sync, retries, permission changes, worker crashes, and recovery.
-- Add real parallel-process push tests with barriers around validation,
+- [done] Add real parallel-process push tests with barriers around validation,
   canonical CAS, source publication, worker claim, ref publication, and state
   persistence.
-- Add named failpoints and terminate processes at every durable transaction
+- [done] Add named failpoints and terminate processes at every durable transaction
   boundary.
 - Add full tree-operation tests: delete, rename, mode, symlink, directory
   boundary, non-UTF-8 names, tabs, newlines, and long paths.

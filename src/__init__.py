@@ -1,1 +1,1 @@
-"""Testable components for the Veil experimental Git forge."""
+"""Testable components for the Bastion experimental Git forge."""

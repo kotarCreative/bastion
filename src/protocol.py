@@ -8,6 +8,7 @@ import shutil
 from pathlib import Path
 
 from errors import ForgeError
+from failpoints import checkpoint
 from git import (
     clean_env,
     copy_submitted_closure,
@@ -138,6 +139,7 @@ def pre_receive(root: Path, name: str, updates: bytes) -> None:
             promote_objects(transaction_objects, canonical_repo(root))
         finally:
             shutil.rmtree(transaction_objects, ignore_errors=True)
+        checkpoint(root, "source.validation_complete")
         txid = transaction_id(name, old, new)
         sequence = state.setdefault("next_transaction_sequence", 1)
         state["next_transaction_sequence"] = sequence + 1
@@ -162,20 +164,24 @@ def pre_receive(root: Path, name: str, updates: bytes) -> None:
         write_receiver_marker(root, txid, os.getppid())
         state["transactions"][txid] = transaction
         save_state(root, state)
+        checkpoint(root, "source.prepared_persisted")
         from service import update_canonical_ref_locked
 
         update_canonical_ref_locked(
             root, state, canonical_old, canonical_new, create_event=False
         )
+        checkpoint(root, "source.canonical_ref_published")
         reserve_change_ids(state, name, view["canonical_ref"], mappings)
         transaction["status"] = "canonical_committed"
         from outbox import enqueue_canonical_committed
 
         enqueue_canonical_committed(state, transaction)
         save_state(root, state)
+        checkpoint(root, "source.canonical_state_persisted")
 
 
 def post_receive(root: Path, name: str, updates: bytes) -> None:
+    checkpoint(root, "source.ref_published")
     parsed = parse_updates(updates)
     with locked(root) as state:
         for old, new, updated_ref in parsed:
@@ -184,6 +190,8 @@ def post_receive(root: Path, name: str, updates: bytes) -> None:
             if transaction and transaction["projected_ref"] == updated_ref:
                 (root / "receivers" / txid).unlink(missing_ok=True)
         save_state(root, state)
+        checkpoint(root, "source.receiver_cleanup_persisted")
+    checkpoint(root, "source.confirmation_persisted")
     from worker import drain_projection_jobs
 
     drain_projection_jobs(root)

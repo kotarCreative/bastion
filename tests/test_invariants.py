@@ -587,7 +587,7 @@ class InvariantTest(unittest.TestCase):
         tip = state["views"]["encoded"]["projected_tip"]
         raw = forge.git(forge.view_repo(self.forge, "encoded"), "cat-file", "commit", tip).stdout
         self.assertNotIn(b"encoding ", raw)
-        self.assertIn(b"author Veil Projection <projection@localhost> 946684800 +0000", raw)
+        self.assertIn(b"author Bastion Projection <projection@localhost> 946684800 +0000", raw)
         check_invariants(self.forge)
 
     def test_bad_persisted_tip_reports_view_ref(self) -> None:
@@ -609,7 +609,7 @@ class InvariantTest(unittest.TestCase):
         failed = command("python3", str(script), "check", str(self.forge), check=False)
         self.assertEqual(1, failed.returncode)
         self.assertEqual("", failed.stdout)
-        self.assertIn("veil: invariant STATE_SCHEMA failed for state", failed.stderr)
+        self.assertIn("bastion: invariant STATE_SCHEMA failed for state", failed.stderr)
 
 
 if __name__ == "__main__":

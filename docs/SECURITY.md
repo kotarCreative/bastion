@@ -2,7 +2,7 @@
 
 ## Status
 
-Veil is an architecture and correctness prototype. Its local filesystem layout
+Bastion is an architecture and correctness prototype. Its local filesystem layout
 is not a production security boundary: a user with direct access to the forge
 root can read `canonical.git` regardless of Git protocol policy.
 

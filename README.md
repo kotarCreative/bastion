@@ -1,6 +1,6 @@
-# Veil
+# Bastion
 
-Veil is an experimental permission-aware Git forge. It maintains one complete
+Bastion is an experimental permission-aware Git forge. It maintains one complete
 canonical Git repository and exposes writable Git repositories containing only
 the files each permission view may read. Users work with an unmodified Git
 client.
@@ -45,11 +45,11 @@ python3 -m unittest discover -v tests 'test_*.py'
 Create a local forge and one view:
 
 ```bash
-python3 forge.py init /tmp/veil-forge /path/to/source --branch main
-python3 forge.py add-view /tmp/veil-forge alice \
+python3 forge.py init /tmp/bastion-forge /path/to/source --branch main
+python3 forge.py add-view /tmp/bastion-forge alice \
   --read shared --read team-a \
   --write shared --write team-a
-git clone --no-local /tmp/veil-forge/views/alice.git alice
+git clone --no-local /tmp/bastion-forge/views/alice.git alice
 ```
 
 Use normal Git inside `alice`:
@@ -64,8 +64,8 @@ Receive hooks synchronously validate and reconcile the source push, then drain
 ready secondary-view jobs. Jobs can also be processed explicitly:
 
 ```bash
-python3 forge.py work /tmp/veil-forge
-python3 forge.py check /tmp/veil-forge
+python3 forge.py work /tmp/bastion-forge
+python3 forge.py check /tmp/bastion-forge
 ```
 
 Run `python3 forge.py --help` for all experimental commands.

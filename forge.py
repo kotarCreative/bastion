@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI and compatibility facade for the Veil experimental Git forge."""
+"""CLI and compatibility facade for the Bastion experimental Git forge."""
 
 from __future__ import annotations
 
@@ -90,7 +90,7 @@ def main() -> int:
             post_receive(args.root, args.name, sys.stdin.buffer.read())
         return 0
     except ForgeError as error:
-        print(f"veil: {error}", file=sys.stderr)
+        print(f"bastion: {error}", file=sys.stderr)
         return 1
 
 

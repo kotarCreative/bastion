@@ -1,4 +1,4 @@
-"""Read-only global invariant checks for a version-1 Veil forge."""
+"""Read-only global invariant checks for a version-1 Bastion forge."""
 
 from __future__ import annotations
 
@@ -373,7 +373,7 @@ def _source_transactions(root: Path, state: dict, canonical_history: list[str], 
             if _identity(submitted_lines, b"author ", "MAPPING", submitted) != _identity(canonical_lines, b"author ", "MAPPING", canon): _fail("MAPPING", identifier, "canonical author differs from submission")
             _name, _email, author_date = _identity(submitted_lines, b"author ", "MAPPING", submitted)
             committer = _identity(canonical_lines, b"committer ", "MAPPING", canon)
-            if committer != (b"Veil Forge", b"forge@localhost", author_date): _fail("MAPPING", identifier, "canonical committer metadata differs")
+            if committer != (b"Bastion Forge", b"forge@localhost", author_date): _fail("MAPPING", identifier, "canonical committer metadata differs")
             submitted_parent = submitted; canonical_parent = canon
         if submitted_parent != tx["projected_new"] or canonical_parent != tx["canonical_new"]: _fail("MAPPING", identifier, "mapping endpoints differ")
         actual = ref(submitted_repo, tx["projected_ref"])
@@ -410,7 +410,7 @@ def _admin_transactions(root: Path, state: dict, canonical_history: list[str], t
 
 def _synthetic(raw: bytes, projected: str, canonical: str, parent: str | None, change_id: str | None, code: str) -> None:
     tree, parents, _lines, _message = _commit_parts(raw, code, projected)
-    expected = f"tree {tree}\n".encode() + (f"parent {parent}\n".encode() if parent else b"") + b"author Veil Projection <projection@localhost> 946684800 +0000\ncommitter Veil Projection <projection@localhost> 946684800 +0000\n\nprojected canonical change\n" + (f"\nChange-Id: {change_id}\n".encode() if change_id else b"")
+    expected = f"tree {tree}\n".encode() + (f"parent {parent}\n".encode() if parent else b"") + b"author Bastion Projection <projection@localhost> 946684800 +0000\ncommitter Bastion Projection <projection@localhost> 946684800 +0000\n\nprojected canonical change\n" + (f"\nChange-Id: {change_id}\n".encode() if change_id else b"")
     if raw != expected or parents != ([] if parent is None else [parent]): _fail(code, projected, "synthetic commit bytes or parent are not deterministic")
 
 

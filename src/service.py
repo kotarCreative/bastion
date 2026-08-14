@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 from errors import ForgeError
+from failpoints import checkpoint
 from git import clean_env, git, output, ref, run, tree_entries
 from layout import ZERO_OID, canonical_repo, view_repo
 from projection import project_history
@@ -175,6 +176,7 @@ def publish_projection_plan(root: Path, state: dict, plan: dict) -> None:
             )
         else:
             raise ForgeError("projected ref changed outside synchronization")
+    checkpoint(root, "projection.ref_published")
     view["anchors"].update(plan["anchors"])
     for projected_oid, anchor in plan["anchors"].items():
         if anchor["change_id"]:
@@ -289,7 +291,9 @@ def update_canonical_ref_locked(
         }
         state["transactions"][transaction_id] = transaction
         save_state(root, state)
+        checkpoint(root, "admin.prepared_persisted")
     git(canonical, "update-ref", canonical_ref, new, expected)
+    checkpoint(root, "admin.canonical_ref_published")
     if transaction:
         from outbox import enqueue_canonical_committed
 
@@ -298,6 +302,7 @@ def update_canonical_ref_locked(
             "fanout_pending" if transaction["pending_views"] else "published"
         )
         save_state(root, state)
+        checkpoint(root, "admin.canonical_state_persisted")
 
 
 def update_canonical_ref(root: Path, expected: str, new: str) -> None:

@@ -915,7 +915,7 @@ steps. Focused test methods for the crash operations are still required.
 
 Coverage counters are aggregated across the committed smoke and regression
 seeds in the default profile. They are not enforced when
-`VEIL_STATE_MACHINE_SEEDS` or `VEIL_STATE_MACHINE_STEPS` is set; an explicit
+`BASTION_STATE_MACHINE_SEEDS` or `BASTION_STATE_MACHINE_STEPS` is set; an explicit
 one-seed replay may intentionally be shorter than the mandatory schedule.
 
 ## Stable Checkpoints
@@ -1006,17 +1006,17 @@ trace replay exists to test and diagnose the trace contract itself.
 
 `tests/test_state_machine.py` must support:
 
-- `VEIL_STATE_MACHINE_SEEDS`: comma-separated integers accepted by
+- `BASTION_STATE_MACHINE_SEEDS`: comma-separated integers accepted by
   `int(value, 0)`. When set, run these seeds instead of the smoke seeds, while
   still running permanent regression seeds.
-- `VEIL_STATE_MACHINE_STEPS`: positive integer overriding generated sequence
+- `BASTION_STATE_MACHINE_STEPS`: positive integer overriding generated sequence
   length.
 
 Example replay:
 
 ```bash
-VEIL_STATE_MACHINE_SEEDS=0xc0ffee \
-VEIL_STATE_MACHINE_STEPS=80 \
+BASTION_STATE_MACHINE_SEEDS=0xc0ffee \
+BASTION_STATE_MACHINE_STEPS=80 \
 python3 -m unittest -v tests.test_state_machine
 ```
 
@@ -1178,7 +1178,7 @@ git diff --check
 Also run one non-default replay:
 
 ```bash
-VEIL_STATE_MACHINE_SEEDS=0x1234 VEIL_STATE_MACHINE_STEPS=40 \
+BASTION_STATE_MACHINE_SEEDS=0x1234 BASTION_STATE_MACHINE_STEPS=40 \
 python3 -m unittest -v tests.test_state_machine
 ```
 

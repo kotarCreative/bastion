@@ -25,8 +25,8 @@ DEFAULT_STEPS = 24
 
 
 def profile_from_environment() -> tuple[tuple[int, ...], int, bool]:
-    seeds_text = os.environ.get("VEIL_STATE_MACHINE_SEEDS")
-    steps_text = os.environ.get("VEIL_STATE_MACHINE_STEPS")
+    seeds_text = os.environ.get("BASTION_STATE_MACHINE_SEEDS")
+    steps_text = os.environ.get("BASTION_STATE_MACHINE_STEPS")
     overridden = seeds_text is not None or steps_text is not None
     if seeds_text is None:
         seeds = SMOKE_SEEDS
@@ -34,18 +34,18 @@ def profile_from_environment() -> tuple[tuple[int, ...], int, bool]:
         try:
             seeds = tuple(int(value.strip(), 0) for value in seeds_text.split(",") if value.strip())
         except ValueError as error:
-            raise AssertionError("VEIL_STATE_MACHINE_SEEDS must be comma-separated integers") from error
+            raise AssertionError("BASTION_STATE_MACHINE_SEEDS must be comma-separated integers") from error
         if not seeds:
-            raise AssertionError("VEIL_STATE_MACHINE_SEEDS must contain at least one integer")
+            raise AssertionError("BASTION_STATE_MACHINE_SEEDS must contain at least one integer")
     if steps_text is None:
         steps = DEFAULT_STEPS
     else:
         try:
             steps = int(steps_text)
         except ValueError as error:
-            raise AssertionError("VEIL_STATE_MACHINE_STEPS must be a positive integer") from error
+            raise AssertionError("BASTION_STATE_MACHINE_STEPS must be a positive integer") from error
         if steps <= 0:
-            raise AssertionError("VEIL_STATE_MACHINE_STEPS must be a positive integer")
+            raise AssertionError("BASTION_STATE_MACHINE_STEPS must be a positive integer")
     return tuple(dict.fromkeys((*seeds, *REGRESSION_SEEDS))), steps, overridden
 
 
@@ -128,12 +128,12 @@ class StateMachineTest(unittest.TestCase):
         self.assertTrue(any(not edit.get("change_id") for operation in operations if operation.kind == "source_crash" for edit in [operation.arguments["edit"]]))
 
     def test_environment_profile_validation_and_explicit_replay(self) -> None:
-        with patch.dict(os.environ, {"VEIL_STATE_MACHINE_SEEDS": "0x1234", "VEIL_STATE_MACHINE_STEPS": "2"}, clear=False):
+        with patch.dict(os.environ, {"BASTION_STATE_MACHINE_SEEDS": "0x1234", "BASTION_STATE_MACHINE_STEPS": "2"}, clear=False):
             seeds, steps, overridden = profile_from_environment()
         self.assertEqual((0x1234,), seeds)
         self.assertEqual(2, steps)
         self.assertTrue(overridden)
-        with patch.dict(os.environ, {"VEIL_STATE_MACHINE_STEPS": "0"}, clear=False):
+        with patch.dict(os.environ, {"BASTION_STATE_MACHINE_STEPS": "0"}, clear=False):
             with self.assertRaisesRegex(AssertionError, "positive integer"):
                 profile_from_environment()
 
