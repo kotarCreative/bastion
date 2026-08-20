@@ -2,7 +2,7 @@
 
 ## Status
 
-Ready for implementation.
+Implemented.
 
 This specification covers the next Phase 1 item not already covered by an
 existing numbered specification:

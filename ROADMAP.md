@@ -16,8 +16,14 @@ The local prototype currently has:
 - ordered at-least-once projection jobs;
 - crash recovery, leases, retries, and ref adoption;
 - serialized validated administrative canonical updates;
-- focused and real-Git black-box tests.
-- byte-exact tree-operation and unusual-path projection coverage.
+- focused and real-Git black-box tests;
+- a read-only global invariant checker covering every view, ref, frontier, anchor,
+  representation, and reachable object;
+- deterministic property/state-machine tests with replayable seeds and an
+  independent tree model;
+- byte-exact tree-operation and unusual-path projection coverage;
+- shared-visible modify/modify, delete/modify, and mode/content conflict tests;
+- systematic rejection immutability for every major validation and barrier path.
 
 The roadmap is ordered by architectural risk, not product visibility.
 
@@ -26,9 +32,9 @@ The roadmap is ordered by architectural risk, not product visibility.
 Goal: make broader manual testing useful by checking invariants after arbitrary
 operation sequences.
 
-- Add one global invariant checker covering every view, ref, frontier, anchor,
+- [done] Add one global invariant checker covering every view, ref, frontier, anchor,
   representation, and reachable object.
-- Add deterministic property/state-machine tests generating canonical updates,
+- [done] Add deterministic property/state-machine tests generating canonical updates,
   user pushes, sync, retries, permission changes, worker crashes, and recovery.
 - [done] Add real parallel-process push tests with barriers around validation,
   canonical CAS, source publication, worker claim, ref publication, and state
@@ -37,8 +43,8 @@ operation sequences.
   boundary.
 - [done] Add full tree-operation tests: delete, rename, mode, symlink, directory
   boundary, non-UTF-8 names, tabs, newlines, and long paths.
-- Add shared-visible conflict tests: modify/modify, delete/modify, and mode/content.
-- Verify every rejected operation leaves authoritative refs and mappings
+- [done] Add shared-visible conflict tests: modify/modify, delete/modify, and mode/content.
+- [done] Verify every rejected operation leaves authoritative refs and mappings
   unchanged.
 
 Exit criteria:

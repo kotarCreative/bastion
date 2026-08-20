@@ -2,7 +2,7 @@
 
 ## Status
 
-Ready for implementation.
+Implemented.
 
 This specification covers the second item in Phase 1 of `ROADMAP.md`:
 

@@ -28,6 +28,8 @@ Git repositories, hooks, clones, fetches, rebases, and pushes.
 | `tests/test_failpoints.py` | Inert-by-default checkpoint primitive and marker identity |
 | `tests/test_process_concurrency.py` | Real-process competing push, worker, and receive/worker barrier schedules |
 | `tests/test_process_failpoints.py` | Source, administrative, worker, projection, recovery, and state-file crash matrix |
+| `tests/test_shared_conflicts.py` | Shared-visible modify/modify, delete/modify, and mode/content conflict resolution |
+| `tests/test_rejection_immutability.py` | Systematic verification that rejected operations leave authoritative state unchanged |
 
 Also run syntax and repository checks:
 
@@ -96,7 +98,9 @@ The tests currently demonstrate:
 - canonical merge and non-fast-forward rejection.
 - exact tree snapshots for deletes, renames, mode-only transitions, symlink targets, and file/directory replacement;
 - byte-preserving source and administrative projection of non-UTF-8, tab, newline, and long paths;
-- OID-only closure validation, including quarantined extra-object rejection.
+- OID-only closure validation, including quarantined extra-object rejection;
+- shared-visible modify/modify, delete/modify, and mode/content conflicts serialized through fetch/rebase;
+- rejection immutability for force pushes, stale updates, merge commits, non-linear history, unauthorized paths, unsupported entries, structural conflicts, duplicate `Change-Id` ownership, administrative validation failures, and sync barriers.
 
 The directed tree modules use `tests/tree_harness.py`, an independent binary Git
 plumbing helper. It reads `ls-tree -rz` records and writes temporary-index trees
