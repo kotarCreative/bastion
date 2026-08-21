@@ -20,6 +20,7 @@ import unittest
 from pathlib import Path
 
 import forge
+from tests import identity_harness
 from errors import ForgeError
 from state import locked
 from tests.tree_harness import TreeFixture, build_commit, clean_environment, command, empty_subtree_commit, git, gitlink_commit, oid, tree_at
@@ -213,7 +214,7 @@ class RejectionImmutabilityTest(unittest.TestCase):
         """A hidden canonical file conflicting with a submitted descendant is rejected."""
         # Add a hidden file that will collide with a visible descendant path.
         self.fixture.admin_update([{b"container": (b"100644", b"hidden boundary\n")}])
-        forge.add_view(self.fixture.root, "narrow", ["container/visible"], ["container/visible"], "main")
+        identity_harness.add_view(self.fixture.root, "narrow", ["container/visible"], ["container/visible"], "main")
         checkout = self.fixture.directory / "client-narrow"
         command("git", "clone", "-q", "--no-local", os.fsdecode(forge.view_repo(self.fixture.root, "narrow")), os.fsdecode(checkout))
         self.fixture.policies["narrow"] = (["container/visible"], ["container/visible"])
@@ -246,7 +247,7 @@ class RejectionImmutabilityTest(unittest.TestCase):
         self.assertIn(b"belongs to another principal", result.stderr)
         self.fixture.assert_rejection(before)
         self.assertEqual(canonical_before, oid(forge.canonical_repo(self.fixture.root), "refs/heads/main"))
-        self.assertEqual("alice", self.fixture.state()["changes"][change_id]["owner"])
+        self.assertEqual("alice", self.fixture.state()["changes"][change_id]["owner_principal_id"])
 
     def test_administrative_stale_expected_oid_rejected(self) -> None:
         """An administrative update with a stale expected OID is rejected."""
@@ -349,8 +350,8 @@ class SyncBarrierImmutabilityTest(unittest.TestCase):
         command("git", "-C", os.fsdecode(self.source), "commit", "-q", "-m", "initial", env={"GIT_AUTHOR_DATE": "1700000000 +0000", "GIT_COMMITTER_DATE": "1700000000 +0000"})
         forge.init_forge(self.root / "forge", self.source, "main")
         self.forge = self.root / "forge"
-        forge.add_view(self.forge, "alice", ["shared", "team-a"], ["shared", "team-a"], "main")
-        forge.add_view(self.forge, "bob", ["shared", "team-b"], ["shared", "team-b"], "main")
+        identity_harness.add_view(self.forge, "alice", ["shared", "team-a"], ["shared", "team-a"], "main")
+        identity_harness.add_view(self.forge, "bob", ["shared", "team-b"], ["shared", "team-b"], "main")
         self.alice_remote = forge.view_repo(self.forge, "alice")
         self.bob_remote = forge.view_repo(self.forge, "bob")
         self.alice = self._clone("alice", self.alice_remote)

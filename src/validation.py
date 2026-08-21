@@ -64,7 +64,9 @@ def has_file_directory_conflict(entries: TreeEntries) -> bool:
     return False
 
 
-def authorize_changes(changes: TreeChanges, read: list[str], write: list[str]) -> None:
+def authorize_changes(changes: TreeChanges, descriptor: dict) -> None:
+    read = descriptor["read"]
+    write = descriptor["write"]
     for path in changes:
         if not allowed(path, write) or not allowed(path, read):
             raise ForgeError("submission changes a path outside current authorization")

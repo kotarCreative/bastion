@@ -11,6 +11,7 @@ from pathlib import Path
 from urllib.parse import unquote
 
 import forge
+from tests import identity_harness
 from errors import ForgeError
 from http_server import (
     add_token,
@@ -159,7 +160,7 @@ class TokenTest(unittest.TestCase):
         )
         command("git", "-C", str(source), "commit", "-q", "--allow-empty", "-m", "initial", env=environment)
         forge.init_forge(self.root / "forge", source, "main")
-        forge.add_view(self.root / "forge", "alice", ["visible"], ["visible"], "main")
+        identity_harness.add_view(self.root / "forge", "alice", ["visible"], ["visible"], "main")
         self.forge = self.root / "forge"
 
     def tearDown(self) -> None:

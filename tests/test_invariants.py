@@ -9,6 +9,7 @@ from unittest.mock import patch
 from pathlib import Path
 
 import forge
+from tests import identity_harness
 from errors import ForgeError
 from invariants import check_invariants
 
@@ -40,8 +41,8 @@ class InvariantTest(unittest.TestCase):
         command("git", "commit", "-q", "-m", "initial", cwd=source)
         self.forge = self.root / "forge"
         forge.init_forge(self.forge, source, "main")
-        forge.add_view(self.forge, "alice", ["shared", "private"], ["shared", "private"], "main")
-        forge.add_view(self.forge, "bob", ["shared", "other"], ["shared", "other"], "main")
+        identity_harness.add_view(self.forge, "alice", ["shared", "private"], ["shared", "private"], "main")
+        identity_harness.add_view(self.forge, "bob", ["shared", "other"], ["shared", "other"], "main")
         self._admin_counter = 0
 
     def tearDown(self) -> None:
@@ -220,6 +221,7 @@ class InvariantTest(unittest.TestCase):
                 "canonical_ref": "refs/heads/main",
                 "canonical_old": oid * 40,
                 "canonical_new": (oid * 40)[:39] + ("c" if oid == "a" else "d"),
+                "target_descriptors": {},
                 "pending_views": [],
                 "status": "published",
             }
@@ -360,7 +362,7 @@ class InvariantTest(unittest.TestCase):
         from worker import claim_projection_job, fail_projection_job
         claimed = claim_projection_job(self.forge)
         self.assertIsNotNone(claimed)
-        plan = build_projection_plan(self.forge, claimed["view"], claimed["view_state"], claimed["canonical_to"])
+        plan = build_projection_plan(self.forge, claimed["view"], claimed["view_state"], claimed["descriptor"], claimed["canonical_to"])
         state = load_state(self.forge)
         state["projection_jobs"][claimed["id"]]["plan"] = plan
         save_state(self.forge, state)
@@ -413,7 +415,7 @@ class InvariantTest(unittest.TestCase):
         from worker import claim_projection_job
         from service import build_projection_plan
         claimed = claim_projection_job(self.forge, now=1)
-        plan = build_projection_plan(self.forge, claimed["view"], claimed["view_state"], claimed["canonical_to"])
+        plan = build_projection_plan(self.forge, claimed["view"], claimed["view_state"], claimed["descriptor"], claimed["canonical_to"])
         state = json.loads((self.forge / "state.json").read_text())
         state["projection_jobs"][claimed["id"]]["status"] = "ready"
         state["projection_jobs"][claimed["id"]]["plan"] = plan
@@ -432,7 +434,7 @@ class InvariantTest(unittest.TestCase):
         from worker import claim_projection_job
         from service import build_projection_plan
         claimed = claim_projection_job(self.forge, now=1)
-        plan = build_projection_plan(self.forge, claimed["view"], claimed["view_state"], claimed["canonical_to"])
+        plan = build_projection_plan(self.forge, claimed["view"], claimed["view_state"], claimed["descriptor"], claimed["canonical_to"])
         old_projected, anchor = next(iter(plan["anchors"].items()))
         wrong = "Icdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
         raw = forge.git(forge.view_repo(self.forge, claimed["view"]), "cat-file", "commit", old_projected).stdout
@@ -491,6 +493,13 @@ class InvariantTest(unittest.TestCase):
             "canonical_ref": "refs/heads/main",
             "canonical_old": parent,
             "canonical_new": candidate,
+            "target_descriptors": {
+                name: {
+                    "descriptor_id": view["descriptor_id"],
+                    "descriptor_generation": view["descriptor_generation"],
+                }
+                for name, view in state["views"].items()
+            },
             "pending_views": sorted(state["views"]),
             "status": "prepared",
         }
@@ -525,7 +534,7 @@ class InvariantTest(unittest.TestCase):
         command("git", "--git-dir", gitdir, "update-ref", "refs/heads/main", bad_commit)
         bad_forge = self.root / "bad-forge"
         forge.init_forge(bad_forge, source, "main")
-        forge.add_view(bad_forge, "alice", ["shared"], ["shared"], "main")
+        identity_harness.add_view(bad_forge, "alice", ["shared"], ["shared"], "main")
         with self.assertRaisesRegex(ForgeError, r"invariant CANONICAL_GRAPH failed for .*gitlink"):
             check_invariants(bad_forge)
 
@@ -559,8 +568,15 @@ class InvariantTest(unittest.TestCase):
 
     def test_extra_anchor_fails(self) -> None:
         state = json.loads((self.forge / "state.json").read_text())
+        alice = state["views"]["alice"]
         fake_oid = "c" * 40
-        state["views"]["alice"]["anchors"][fake_oid] = {"canonical": fake_oid, "kind": "synthetic", "change_id": None}
+        state["views"]["alice"]["anchors"][fake_oid] = {
+            "canonical": fake_oid,
+            "kind": "synthetic",
+            "change_id": None,
+            "descriptor_id": alice["descriptor_id"],
+            "descriptor_generation": alice["descriptor_generation"],
+        }
         forge.save_state(self.forge, state)
         with self.assertRaisesRegex(ForgeError, r"invariant ANCHOR failed for alice"):
             check_invariants(self.forge)
@@ -582,7 +598,7 @@ class InvariantTest(unittest.TestCase):
             self.assertIn(b"encoding ", probe_raw)
 
             # Forge-generated commits must ignore the hostile config.
-            forge.add_view(self.forge, "encoded", ["shared"], ["shared"], "main")
+            identity_harness.add_view(self.forge, "encoded", ["shared"], ["shared"], "main")
         state = json.loads((self.forge / "state.json").read_text())
         tip = state["views"]["encoded"]["projected_tip"]
         raw = forge.git(forge.view_repo(self.forge, "encoded"), "cat-file", "commit", tip).stdout

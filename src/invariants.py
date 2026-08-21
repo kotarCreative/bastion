@@ -1,4 +1,4 @@
-"""Read-only global invariant checks for a version-1 Bastion forge."""
+"""Read-only global invariant checks for version-1 and version-2 Bastion forges."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+import identity
 from errors import ForgeError
 from git import clean_env, git, ref, tree_entries
 from layout import ZERO_OID, canonical_repo, view_repo
@@ -33,6 +34,13 @@ SOURCE_STATUSES = {"prepared", "canonical_committed", "source_unconfirmed", "fan
 ADMIN_STATUSES = {"prepared", "fanout_pending", "published", "aborted"}
 EVENT_STATUSES = {"blocked", "pending", "dispatched"}
 JOB_STATUSES = {"pending", "running", "ready", "retry", "completed"}
+VERSION_1_KEYS = {
+    "version", "canonical_branch", "views", "transactions", "changes", "outbox",
+    "projection_jobs", "next_transaction_sequence",
+}
+VERSION_2_KEYS = VERSION_1_KEYS | {
+    "principals", "teams", "roles", "role_bindings", "view_descriptors",
+}
 
 
 def _fail(code: str, subject: object, detail: str) -> None:
@@ -64,59 +72,49 @@ def _string(record: dict, field: str, subject: str, nullable: bool = False) -> N
     _fail("STATE_SCHEMA", subject, f"{field} has the wrong type")
 
 
-def _record_maps(state: dict) -> None:
-    required = {
-        "version", "canonical_branch", "views", "transactions", "changes", "outbox", "projection_jobs", "next_transaction_sequence"
-    }
-    if set(state) != required:
-        _fail("STATE_SCHEMA", "state", "top-level keys do not match version 1")
-    if state["version"] != 1 or isinstance(state["version"], bool):
-        _fail("STATE_SCHEMA", "state", "version must be integer 1")
-    if not isinstance(state["canonical_branch"], str) or not state["canonical_branch"]:
-        _fail("STATE_SCHEMA", "state", "canonical_branch must be a non-empty string")
-    if not _is_int(state["next_transaction_sequence"], 1):
-        _fail("STATE_SCHEMA", "state", "next_transaction_sequence must be a positive integer")
-    for name in ("views", "transactions", "changes", "outbox", "projection_jobs"):
-        if not isinstance(state[name], dict):
-            _fail("STATE_SCHEMA", "state", f"{name} must be a dictionary")
-        for key, value in state[name].items():
-            if not isinstance(key, str) or not isinstance(value, dict):
-                _fail("STATE_SCHEMA", name, "record identifiers and records must be strings and dictionaries")
+def _string_list(record: dict, field: str, subject: str) -> None:
+    if not isinstance(record[field], list) or not all(isinstance(item, str) for item in record[field]):
+        _fail("STATE_SCHEMA", subject, f"{field} must be a list of strings")
 
 
-def _schema(state: dict) -> None:
-    _record_maps(state)
-    if git(Path("."), "check-ref-format", "--branch", state["canonical_branch"], check=False).returncode:
-        _fail("STATE_SCHEMA", "state", "canonical_branch is not a valid branch")
-    for name, view in sorted(state["views"].items()):
-        try:
-            validate_view_name(name)
-        except ForgeError:
-            _fail("STATE_SCHEMA", name, "invalid view name")
-        _required(view, {"principal", "canonical_ref", "projected_ref", "read", "write", "canonical_frontier", "projected_tip", "anchors"}, name)
-        for field in ("principal", "canonical_ref", "projected_ref", "canonical_frontier", "projected_tip"):
-            _string(view, field, name)
-        for field in ("read", "write"):
-            if not isinstance(view[field], list) or not all(isinstance(item, str) for item in view[field]):
-                _fail("STATE_SCHEMA", name, f"{field} must be a list of strings")
-        if not isinstance(view["anchors"], dict):
-            _fail("STATE_SCHEMA", name, "anchors must be a dictionary")
-        for projected, anchor in view["anchors"].items():
-            if not isinstance(projected, str) or not isinstance(anchor, dict):
-                _fail("STATE_SCHEMA", name, "anchors must map strings to dictionaries")
-            if not _oid(projected):
-                _fail("STATE_SCHEMA", name, "anchor key is not a full object ID")
-            _required(anchor, {"canonical", "kind"}, projected)
-            if not _oid(anchor["canonical"]) or anchor["kind"] not in {"submitted", "synthetic"}:
-                _fail("STATE_SCHEMA", projected, "invalid anchor")
-            if anchor["kind"] == "submitted" and set(anchor) != {"canonical", "kind"}:
-                _fail("STATE_SCHEMA", projected, "submitted anchor has unexpected fields")
-            if anchor["kind"] == "synthetic":
-                _required(anchor, {"canonical", "kind", "change_id"}, projected)
-                if anchor["change_id"] is not None and not isinstance(anchor["change_id"], str):
-                    _fail("STATE_SCHEMA", projected, "synthetic change_id must be string or null")
+def _anchor_schema(anchor: dict, projected: str, version: int) -> None:
+    extra = {"descriptor_id", "descriptor_generation"} if version == 2 else set()
+    _required(anchor, {"canonical", "kind"} | extra, projected)
+    if not _oid(anchor["canonical"]) or anchor["kind"] not in {"submitted", "synthetic"}:
+        _fail("STATE_SCHEMA", projected, "invalid anchor")
+    if anchor["kind"] == "submitted":
+        expected = {"canonical", "kind"} | extra
+        if set(anchor) != expected:
+            _fail("STATE_SCHEMA", projected, "submitted anchor has unexpected fields")
+    else:
+        _required(anchor, {"canonical", "kind", "change_id"} | extra, projected)
+        allowed_fields = {"canonical", "kind", "change_id"} | extra
+        if set(anchor) != allowed_fields:
+            _fail("STATE_SCHEMA", projected, "synthetic anchor has unexpected fields")
+        if anchor["change_id"] is not None and not isinstance(anchor["change_id"], str):
+            _fail("STATE_SCHEMA", projected, "synthetic change_id must be string or null")
+    if version == 2:
+        if not isinstance(anchor["descriptor_id"], str) or anchor["descriptor_generation"] != 1:
+            _fail("STATE_SCHEMA", projected, "anchor descriptor assignment is invalid")
+
+
+def _assignment(record: dict, subject: str, code: str = "STATE_SCHEMA") -> None:
+    value = record.get("target_descriptors")
+    if not isinstance(value, dict):
+        _fail(code, subject, "target_descriptors must be a dictionary")
+    for name, assignment in value.items():
+        if not isinstance(name, str) or not isinstance(assignment, dict):
+            _fail(code, subject, "target_descriptors must map names to assignments")
+        if set(assignment) != {"descriptor_id", "descriptor_generation"}:
+            _fail(code, subject, "target descriptor assignment has invalid shape")
+        if not isinstance(assignment["descriptor_id"], str) or assignment["descriptor_generation"] != 1:
+            _fail(code, subject, "target descriptor assignment is invalid")
+
+
+def _transaction_schema(state: dict, version: int) -> None:
     sequences: set[int] = set()
     max_sequence = 0
+    extra_source = {"principal_id", "descriptor_id", "descriptor_generation"} if version == 2 else {"principal"}
     for identifier, transaction in sorted(state["transactions"].items()):
         _required(transaction, {"id", "sequence", "canonical_ref", "canonical_old", "canonical_new", "pending_views", "status"}, identifier)
         if transaction["id"] != identifier:
@@ -133,17 +131,31 @@ def _schema(state: dict) -> None:
         if transaction.get("kind") == "canonical_update":
             if transaction["status"] not in ADMIN_STATUSES:
                 _fail("STATE_SCHEMA", identifier, "invalid administrative status")
+            if version == 2:
+                _assignment(transaction, identifier)
+                if not set(transaction["pending_views"]) <= set(transaction["target_descriptors"]):
+                    _fail("STATE_SCHEMA", identifier, "administrative pending views exceed captured targets")
         elif "kind" in transaction:
             _fail("STATE_SCHEMA", identifier, "unknown transaction kind")
         else:
-            _required(transaction, {"view", "principal", "projected_ref", "canonical_frontier_old", "projected_old", "projected_new", "mappings"}, identifier)
+            _required(transaction, {"view", "projected_ref", "canonical_frontier_old", "projected_old", "projected_new", "mappings"} | extra_source, identifier)
             if transaction["status"] not in SOURCE_STATUSES:
                 _fail("STATE_SCHEMA", identifier, "invalid source status")
-            for field in ("view", "principal", "projected_ref", "canonical_frontier_old", "projected_old", "projected_new"):
+            for field in ("view", "projected_ref", "canonical_frontier_old", "projected_old", "projected_new"):
                 _string(transaction, field, identifier)
                 if field.endswith("old") or field.endswith("new"):
                     if not _oid(transaction[field]):
                         _fail("STATE_SCHEMA", identifier, f"{field} must be a nonzero full object ID")
+            if version == 2:
+                _string(transaction, "principal_id", identifier)
+                _string(transaction, "descriptor_id", identifier)
+                if transaction["descriptor_generation"] != 1:
+                    _fail("STATE_SCHEMA", identifier, "source descriptor generation must be 1")
+                _assignment(transaction, identifier)
+                if set(transaction["target_descriptors"]) < set(transaction["pending_views"]):
+                    _fail("STATE_SCHEMA", identifier, "pending views exceed captured targets")
+            else:
+                _string(transaction, "principal", identifier)
             if not isinstance(transaction["mappings"], list):
                 _fail("STATE_SCHEMA", identifier, "mappings must be a list")
             for mapping in transaction["mappings"]:
@@ -160,16 +172,157 @@ def _schema(state: dict) -> None:
             _fail("STATE_SCHEMA", identifier, "view_errors must map strings to strings")
     if state["next_transaction_sequence"] <= max_sequence:
         _fail("STATE_SCHEMA", "state", "next_transaction_sequence does not exceed transactions")
+
+
+def _schema_v1(state: dict) -> None:
+    if set(state) != VERSION_1_KEYS:
+        _fail("STATE_SCHEMA", "state", "top-level keys do not match version 1")
+    if state["version"] != 1 or isinstance(state["version"], bool):
+        _fail("STATE_SCHEMA", "state", "version must be integer 1")
+    _common_map_skeleton(state, VERSION_1_KEYS - {"version"})
+    _schema_views(state, 1)
+    _transaction_schema(state, 1)
+    _outbox_job_schema(state, 1)
+
+
+def _schema_v2(state: dict) -> None:
+    if set(state) != VERSION_2_KEYS:
+        _fail("STATE_SCHEMA", "state", "top-level keys do not match version 2")
+    if state["version"] != 2 or isinstance(state["version"], bool):
+        _fail("STATE_SCHEMA", "state", "version must be integer 2")
+    catalog_keys = VERSION_2_KEYS - VERSION_1_KEYS - {"version"}
+    _common_map_skeleton(state, VERSION_2_KEYS - {"version"})
+    for name in sorted(catalog_keys):
+        for key, value in state[name].items():
+            if not isinstance(key, str) or not isinstance(value, dict):
+                _fail("STATE_SCHEMA", name, "catalog identifiers and records must be strings and dictionaries")
+    _schema_catalog(state)
+    _schema_views(state, 2)
+    _transaction_schema(state, 2)
+    _outbox_job_schema(state, 2)
+
+
+def _schema_catalog(state: dict) -> None:
+    for identifier, principal in sorted(state["principals"].items()):
+        try:
+            identity.validate_identifier(identifier)
+        except ForgeError:
+            _fail("IDENTITY", identifier, "invalid principal identifier")
+        if principal["id"] != identifier:
+            _fail("IDENTITY", identifier, "principal key does not match id")
+        kind = principal.get("kind")
+        if kind == "user":
+            if set(principal) != {"id", "kind"}:
+                _fail("IDENTITY", identifier, "user record has unexpected fields")
+        elif kind == "service_account":
+            if set(principal) != {"id", "kind", "owner_principal_id"}:
+                _fail("IDENTITY", identifier, "service account has unexpected fields")
+            owner = principal["owner_principal_id"]
+            if not isinstance(owner, str) or state["principals"].get(owner, {}).get("kind") != "user":
+                _fail("IDENTITY", identifier, "service-account owner must be an existing user")
+        else:
+            _fail("IDENTITY", identifier, "principal kind is invalid")
+    for identifier, team in sorted(state["teams"].items()):
+        try:
+            identity.validate_identifier(identifier)
+        except ForgeError:
+            _fail("IDENTITY", identifier, "invalid team identifier")
+        if team["id"] != identifier or set(team) != {"id", "members"}:
+            _fail("IDENTITY", identifier, "team record does not match its id or shape")
+        members = team["members"]
+        if not isinstance(members, list) or members != sorted(set(members)) or not all(isinstance(member, str) for member in members):
+            _fail("IDENTITY", identifier, "team members must be sorted and unique")
+        if any(member not in state["principals"] for member in members):
+            _fail("IDENTITY", identifier, "team member is not an existing principal")
+    for role_id, role in sorted(state["roles"].items()):
+        try:
+            identity.validate_identifier(role_id)
+        except ForgeError:
+            _fail("IDENTITY", role_id, "invalid role identifier")
+        if role["id"] != role_id or set(role) != {"id", "read", "write"}:
+            _fail("IDENTITY", role_id, "role record does not match its id or shape")
+        for field in ("read", "write"):
+            _string_list(role, field, role_id)
+            try:
+                normalized = [normalize_prefix(value) for value in role[field]]
+            except ForgeError:
+                _fail("IDENTITY", role_id, f"invalid {field} prefix")
+            if role[field] != normalized or role[field] != sorted(set(role[field])):
+                _fail("IDENTITY", role_id, f"{field} grants are not normalized, sorted, and unique")
+            if identity.minimize_prefixes(role[field]) != role[field]:
+                _fail("IDENTITY", role_id, f"{field} grants are not minimized")
+        if not role["read"] and not role["write"]:
+            _fail("IDENTITY", role_id, "role has no grants")
+    for identifier, binding in sorted(state["role_bindings"].items()):
+        if binding["id"] != identifier or set(binding) != {"id", "subject_kind", "subject_id", "role_id"}:
+            _fail("IDENTITY", identifier, "binding record does not match its id or shape")
+        if binding["subject_kind"] not in {"principal", "team"}:
+            _fail("IDENTITY", identifier, "binding subject kind is invalid")
+        expected = identity.binding_identifier(binding["subject_kind"], binding["subject_id"], binding["role_id"])
+        if identifier != expected:
+            _fail("IDENTITY", identifier, "binding identifier is not deterministic")
+        subject_map = "principals" if binding["subject_kind"] == "principal" else "teams"
+        if binding["subject_id"] not in state[subject_map]:
+            _fail("IDENTITY", identifier, "binding subject does not exist")
+        if binding["role_id"] not in state["roles"]:
+            _fail("IDENTITY", identifier, "binding role does not exist")
+
+
+def _schema_views(state: dict, version: int) -> None:
+    if git(Path("."), "check-ref-format", "--branch", state["canonical_branch"], check=False).returncode:
+        _fail("STATE_SCHEMA", "state", "canonical_branch is not a valid branch")
+    for name, view in sorted(state["views"].items()):
+        try:
+            validate_view_name(name)
+        except ForgeError:
+            _fail("STATE_SCHEMA", name, "invalid view name")
+        base = {"canonical_ref", "projected_ref", "canonical_frontier", "projected_tip", "anchors"}
+        policy = {"principal", "read", "write"} if version == 1 else {"principal_id", "descriptor_id", "descriptor_generation"}
+        _required(view, base | policy, name)
+        if version == 2:
+            unexpected = set(view) - (base | policy)
+            if unexpected:
+                _fail("STATE_SCHEMA", name, f"unexpected view fields {sorted(unexpected)[0]}")
+        for field in ("canonical_ref", "projected_ref", "canonical_frontier", "projected_tip"):
+            _string(view, field, name)
+        if version == 1:
+            _string(view, "principal", name)
+            for field in ("read", "write"):
+                _string_list(view, field, name)
+        else:
+            _string(view, "principal_id", name)
+            _string(view, "descriptor_id", name)
+            if view["descriptor_generation"] != 1:
+                _fail("STATE_SCHEMA", name, "descriptor generation must be integer 1")
+        if not isinstance(view["anchors"], dict):
+            _fail("STATE_SCHEMA", name, "anchors must be a dictionary")
+        for projected, anchor in view["anchors"].items():
+            if not isinstance(projected, str) or not isinstance(anchor, dict):
+                _fail("STATE_SCHEMA", name, "anchors must map strings to dictionaries")
+            if not _oid(projected):
+                _fail("STATE_SCHEMA", name, "anchor key is not a full object ID")
+            _anchor_schema(anchor, projected, version)
+
+
+def _outbox_job_schema(state: dict, version: int) -> None:
     for identifier, event in sorted(state["outbox"].items()):
         _required(event, {"id", "type", "transaction_id", "sequence", "canonical_to", "target_views", "status"}, identifier)
         if event["id"] != identifier or not isinstance(event["id"], str): _fail("STATE_SCHEMA", identifier, "event key does not match id")
         if not isinstance(event["transaction_id"], str) or not _is_int(event["sequence"], 1) or not _oid(event["canonical_to"]) or not isinstance(event["target_views"], list) or not all(isinstance(value, str) for value in event["target_views"]) or event["status"] not in EVENT_STATUSES or not isinstance(event["type"], str):
             _fail("STATE_SCHEMA", identifier, "event has invalid field types")
+        if version == 2:
+            _assignment(event, identifier)
+            if event["target_views"] != sorted(event["target_descriptors"]):
+                _fail("STATE_SCHEMA", identifier, "event target views do not match captured targets")
     for identifier, job in sorted(state["projection_jobs"].items()):
         _required(job, {"id", "event_id", "transaction_id", "view", "sequence", "canonical_to", "status", "attempts", "last_error", "next_attempt_at"}, identifier)
         if job["id"] != identifier or not isinstance(job["id"], str): _fail("STATE_SCHEMA", identifier, "job key does not match id")
         if not all(isinstance(job[field], str) for field in ("event_id", "transaction_id", "view", "status")) or not _is_int(job["sequence"], 1) or not _oid(job["canonical_to"]) or job["status"] not in JOB_STATUSES or not _is_int(job["attempts"], 0) or (job["last_error"] is not None and not isinstance(job["last_error"], str)) or not isinstance(job["next_attempt_at"], (int, float)):
             _fail("STATE_SCHEMA", identifier, "job has invalid field types")
+        if version == 2:
+            _string(job, "descriptor_id", identifier)
+            if job["descriptor_generation"] != 1:
+                _fail("STATE_SCHEMA", identifier, "job descriptor generation must be 1")
         for field in ("expected_frontier", "expected_projected_tip"):
             if field in job and not _oid(job[field]): _fail("STATE_SCHEMA", identifier, f"{field} is invalid")
         for field in ("lease_token",):
@@ -181,6 +334,88 @@ def _schema(state: dict) -> None:
     for change_id, change in sorted(state["changes"].items()):
         if not isinstance(change_id, str) or not isinstance(change.get("revisions"), list):
             _fail("STATE_SCHEMA", str(change_id), "change has invalid shape")
+        if version == 2:
+            for revision in change["revisions"]:
+                if not isinstance(revision, dict):
+                    _fail("STATE_SCHEMA", str(change_id), "revision is not a dictionary")
+                _string(revision, "descriptor_id", str(change_id))
+                if revision.get("descriptor_generation") != 1:
+                    _fail("STATE_SCHEMA", str(change_id), "revision descriptor generation must be 1")
+        owned = "owner_principal_id" if version == 2 else "owner"
+        for field in (owned, "canonical_ref"):
+            if field in change and not isinstance(change[field], str):
+                _fail("STATE_SCHEMA", str(change_id), f"{field} must be a string")
+
+
+_MAP_FIELDS = ("principals", "teams", "roles", "role_bindings", "view_descriptors", "views", "transactions", "changes", "outbox", "projection_jobs")
+
+
+def _common_map_skeleton(state: dict, names: set[str]) -> None:
+    if not isinstance(state["canonical_branch"], str) or not state["canonical_branch"]:
+        _fail("STATE_SCHEMA", "state", "canonical_branch must be a non-empty string")
+    if not _is_int(state["next_transaction_sequence"], 1):
+        _fail("STATE_SCHEMA", "state", "next_transaction_sequence must be a positive integer")
+    for name in sorted(names & set(_MAP_FIELDS)):
+        if not isinstance(state[name], dict):
+            _fail("STATE_SCHEMA", "state", f"{name} must be a dictionary")
+        if name in {"views", "transactions", "changes", "outbox", "projection_jobs"}:
+            for key, value in state[name].items():
+                if not isinstance(key, str) or not isinstance(value, dict):
+                    _fail("STATE_SCHEMA", name, "record identifiers and records must be strings and dictionaries")
+
+
+def _identity_resolution_checks(state: dict) -> None:
+    """Every view descriptor must equal a fresh resolution of the frozen catalog."""
+    for identifier, descriptor in sorted(state["view_descriptors"].items()):
+        payload = {
+            key: value for key, value in descriptor.items() if key != "id"
+        }
+        if set(payload) != {
+            "algorithm", "principal_id", "principal_kind", "canonical_ref",
+            "team_ids", "role_ids", "binding_ids", "read", "write",
+        }:
+            _fail("DESCRIPTOR", identifier, "descriptor has invalid shape")
+        if payload["algorithm"] != identity.DESCRIPTOR_ALGORITHM:
+            _fail("DESCRIPTOR", identifier, "unknown descriptor algorithm")
+        principal = state["principals"].get(payload["principal_id"])
+        if principal is None or principal["kind"] != payload["principal_kind"]:
+            _fail("DESCRIPTOR", identifier, "descriptor principal does not match catalog")
+        if payload["canonical_ref"] != f"refs/heads/{state['canonical_branch']}":
+            _fail("DESCRIPTOR", identifier, "descriptor canonical ref is not configured")
+        try:
+            team_ids, binding_ids, role_ids = identity.resolve_principal(
+                state, payload["principal_id"]
+            )
+            read, write = identity.effective_grants(state, role_ids)
+        except ForgeError as error:
+            _fail("DESCRIPTOR", identifier, f"cannot resolve principal: {error}")
+        fresh = identity.descriptor_payload(
+            state, payload["principal_id"], payload["canonical_ref"], team_ids, binding_ids, role_ids
+        )
+        if (team_ids, binding_ids, role_ids) != (
+            payload["team_ids"], payload["binding_ids"], payload["role_ids"]
+        ):
+            _fail("DESCRIPTOR", identifier, "descriptor provenance differs from fresh resolution")
+        if [read, write] != [payload["read"], payload["write"]]:
+            _fail("DESCRIPTOR", identifier, "descriptor effective grants differ from resolution")
+        computed = identity.compute_descriptor_id(fresh)
+        if computed != identifier:
+            _fail("DESCRIPTOR", identifier, "descriptor identity does not match canonical serialization")
+        if fresh != payload:
+            _fail("DESCRIPTOR", identifier, "descriptor payload differs from recomputed content")
+    owners: dict[str, str] = {}
+    for name, view in sorted(state["views"].items()):
+        principal_id = view["principal_id"]
+        if principal_id not in state["principals"]:
+            _fail("DESCRIPTOR", name, "view principal does not exist")
+        descriptor = state["view_descriptors"].get(view["descriptor_id"])
+        if descriptor is None:
+            _fail("DESCRIPTOR", name, "view references an unknown descriptor")
+        if descriptor["principal_id"] != principal_id or descriptor["canonical_ref"] != view["canonical_ref"]:
+            _fail("DESCRIPTOR", name, "view and descriptor disagree")
+        previous = owners.setdefault(principal_id, view["descriptor_id"])
+        if previous != view["descriptor_id"]:
+            _fail("DESCRIPTOR", principal_id, "one principal has views bound to different descriptors")
 
 
 def _refs(repo: Path, code: str, subject: str) -> dict[str, tuple[str, str]]:
@@ -317,16 +552,24 @@ def _filtered(entries: dict, prefixes: list[str]) -> dict:
     return {path: entry for path, entry in entries.items() if allowed(path, prefixes)}
 
 
-def _policy_frontiers(root: Path, state: dict, canonical_history: list[str], tip: str) -> None:
+def _view_read_policy(state: dict, name: str, version: int) -> list[str]:
+    if version == 1:
+        return state["views"][name]["read"]
+    descriptor = state["view_descriptors"][state["views"][name]["descriptor_id"]]
+    return descriptor["read"]
+
+
+def _policy_frontiers(root: Path, state: dict, canonical_history: list[str], tip: str, version: int) -> None:
     index = {oid: position for position, oid in enumerate(canonical_history)}
     for name, view in sorted(state["views"].items()):
-        if view["principal"] != name: _fail("FRONTIER", name, "principal differs from view name")
-        for field in ("read", "write"):
-            values = view[field]
-            try: normalized = [normalize_prefix(value) for value in values]
-            except ForgeError: _fail("FRONTIER", name, f"invalid {field} prefix")
-            if values != normalized or values != sorted(set(values)): _fail("FRONTIER", name, f"{field} prefixes are not normalized, sorted, and unique")
-        if not view["read"]: _fail("FRONTIER", name, "read policy is empty")
+        if version == 1:
+            if view["principal"] != name: _fail("FRONTIER", name, "principal differs from view name")
+            for field in ("read", "write"):
+                values = view[field]
+                try: normalized = [normalize_prefix(value) for value in values]
+                except ForgeError: _fail("FRONTIER", name, f"invalid {field} prefix")
+                if values != normalized or values != sorted(set(values)): _fail("FRONTIER", name, f"{field} prefixes are not normalized, sorted, and unique")
+            if not view["read"]: _fail("FRONTIER", name, "read policy is empty")
         if view["canonical_frontier"] not in index: _fail("FRONTIER", name, "frontier is not on canonical history")
         if view["canonical_frontier"] != tip:
             explain = [tx for tx in state["transactions"].values() if tx["status"] != "aborted" and tx.get("canonical_new") == tip and ((name in tx.get("pending_views", [])) or (tx.get("kind") != "canonical_update" and tx["status"] in {"prepared", "canonical_committed", "source_unconfirmed"}))]
@@ -341,18 +584,28 @@ def _identity(lines: list[bytes], prefix: bytes, code: str, subject: str) -> tup
     return match.group(1), match.group(2), match.group(3)
 
 
-def _source_transactions(root: Path, state: dict, canonical_history: list[str], tip: str) -> None:
+def _source_transactions(root: Path, state: dict, canonical_history: list[str], tip: str, version: int) -> None:
     canonical = canonical_repo(root); index = {oid: number for number, oid in enumerate(canonical_history)}
     for identifier, tx in sorted(state["transactions"].items(), key=lambda item: (item[1]["sequence"], item[0])):
         if tx.get("kind") == "canonical_update": continue
         view = state["views"].get(tx["view"])
-        if not view or tx["principal"] != tx["view"] or tx["principal"] != view["principal"]: _fail("MAPPING", identifier, "source view or principal is invalid")
+        if version == 1:
+            if not view or tx["principal"] != tx["view"] or tx["principal"] != view["principal"]: _fail("MAPPING", identifier, "source view or principal is invalid")
+            read_policy, write_policy = view["read"], view["write"]
+        else:
+            if not view: _fail("MAPPING", identifier, "source view is invalid")
+            if tx["principal_id"] != view["principal_id"]: _fail("MAPPING", identifier, "source principal differs from view")
+            if tx["descriptor_id"] != view["descriptor_id"] or tx["descriptor_generation"] != view["descriptor_generation"]:
+                _fail("DESCRIPTOR", identifier, "source descriptor differs from view assignment")
+            descriptor = state["view_descriptors"].get(tx["descriptor_id"])
+            if descriptor is None: _fail("DESCRIPTOR", identifier, "source descriptor is unknown")
+            read_policy, write_policy = descriptor["read"], descriptor["write"]
         if tx["canonical_ref"] != view["canonical_ref"] or tx["projected_ref"] != view["projected_ref"] or tx["id"] != transaction_id(tx["view"], tx["projected_old"], tx["projected_new"]): _fail("MAPPING", identifier, "source transaction identity or refs differ")
         if not tx["mappings"]: _fail("MAPPING", identifier, "source transaction has no mappings")
         if len(tx["pending_views"]) != len(set(tx["pending_views"])) or tx["view"] in tx["pending_views"] or any(value not in state["views"] for value in tx["pending_views"]): _fail("MAPPING", identifier, "invalid pending views")
         if tx["canonical_frontier_old"] not in index or tx["canonical_old"] not in index or index[tx["canonical_frontier_old"]] > index[tx["canonical_old"]]: _fail("MAPPING", identifier, "invalid canonical frontier range")
         for oid in canonical_history[index[tx["canonical_frontier_old"]]:index[tx["canonical_old"]] + 1]:
-            if _filtered(_flat(canonical, oid, "MAPPING"), view["read"]) != _flat(view_repo(root, tx["view"]), tx["projected_old"], "MAPPING"): _fail("MAPPING", identifier, "canonical prehistory was not hidden-only")
+            if _filtered(_flat(canonical, oid, "MAPPING"), read_policy) != _flat(view_repo(root, tx["view"]), tx["projected_old"], "MAPPING"): _fail("MAPPING", identifier, "canonical prehistory was not hidden-only")
         submitted_parent = tx["projected_old"]; canonical_parent = tx["canonical_old"]; submitted_repo = view_repo(root, tx["view"])
         for mapping in tx["mappings"]:
             submitted = mapping["submitted"]; canon = mapping["canonical"]
@@ -366,9 +619,11 @@ def _source_transactions(root: Path, state: dict, canonical_history: list[str], 
                 _fail("MAPPING", identifier, "canonical mapping commit has unsupported metadata")
             submitted_parent_entries = _flat(submitted_repo, submitted_parent, "MAPPING"); submitted_entries = _flat(submitted_repo, submitted, "MAPPING")
             changes = changed_entries(submitted_parent_entries, submitted_entries)
-            try: authorize_changes(changes, view["read"], view["write"]); applied = apply_changes(_flat(canonical, canonical_parent, "MAPPING"), changes)
+            try:
+                authorize_changes(changes, {"read": read_policy, "write": write_policy})
+                applied = apply_changes(_flat(canonical, canonical_parent, "MAPPING"), changes)
             except ForgeError: _fail("MAPPING", identifier, "mapping contains unauthorized or invalid changes")
-            if applied != _flat(canonical, canon, "MAPPING") or _filtered(_flat(canonical, canon, "MAPPING"), view["read"]) != submitted_entries: _fail("MAPPING", identifier, "mapping tree does not reconcile exactly")
+            if applied != _flat(canonical, canon, "MAPPING") or _filtered(_flat(canonical, canon, "MAPPING"), read_policy) != submitted_entries: _fail("MAPPING", identifier, "mapping tree does not reconcile exactly")
             if message != canonical_message or mapping["change_id"] != parse_change_id(message): _fail("MAPPING", identifier, "mapping message or Change-Id differs")
             if _identity(submitted_lines, b"author ", "MAPPING", submitted) != _identity(canonical_lines, b"author ", "MAPPING", canon): _fail("MAPPING", identifier, "canonical author differs from submission")
             _name, _email, author_date = _identity(submitted_lines, b"author ", "MAPPING", submitted)
@@ -381,6 +636,11 @@ def _source_transactions(root: Path, state: dict, canonical_history: list[str], 
         if tx["status"] in {"canonical_committed", "source_unconfirmed"} and (actual != tx["projected_old"] or view["canonical_frontier"] != tx["canonical_frontier_old"]): _fail("MAPPING", identifier, "unconfirmed source cursor moved")
         if tx["status"] in {"canonical_committed", "source_unconfirmed", "fanout_pending", "published"} and tx["canonical_new"] not in index: _fail("CANONICAL_REF", identifier, "committed canonical endpoint is not published")
         if tx["status"] == "prepared" and tip not in {tx["canonical_old"], tx["canonical_new"]}: _fail("CANONICAL_REF", identifier, "prepared transaction has unrelated canonical tip")
+        if version == 2 and tx["status"] in {"fanout_pending", "published"}:
+            for mapping in tx["mappings"]:
+                anchor = view["anchors"].get(mapping["submitted"])
+                if not anchor or anchor.get("descriptor_id") != tx["descriptor_id"] or anchor.get("descriptor_generation") != tx["descriptor_generation"]:
+                    _fail("DESCRIPTOR", identifier, "confirmed anchor lacks the source descriptor assignment")
 
 
 def _admin_transactions(root: Path, state: dict, canonical_history: list[str], tip: str) -> None:
@@ -399,6 +659,12 @@ def _admin_transactions(root: Path, state: dict, canonical_history: list[str], t
                 previous = oid
             if previous != tx["canonical_new"]: _fail("CANONICAL_REF", identifier, "administrative history does not reach endpoint")
             if len(tx["pending_views"]) != len(set(tx["pending_views"])) or any(view not in state["views"] for view in tx["pending_views"]): _fail("MAPPING", identifier, "invalid administrative pending views")
+            if state.get("version") == 2:
+                if not set(tx["pending_views"]) <= set(tx.get("target_descriptors", {})): _fail("DESCRIPTOR", identifier, "administrative pending views exceed captured targets")
+                for name, assignment in tx["target_descriptors"].items():
+                    view_assignment = state["views"][name]
+                    if assignment != {"descriptor_id": view_assignment["descriptor_id"], "descriptor_generation": view_assignment["descriptor_generation"]}:
+                        _fail("DESCRIPTOR", identifier, "administrative target assignment differs from the view")
             if tx["status"] in {"fanout_pending", "published"} and tx["canonical_new"] not in index: _fail("CANONICAL_REF", identifier, "administrative endpoint is not published")
         active = (tx.get("kind") == "canonical_update" and tx["status"] in {"fanout_pending", "published"}) or (tx.get("kind") != "canonical_update" and tx["status"] in {"canonical_committed", "source_unconfirmed", "fanout_pending", "published"}) or (tx["status"] == "prepared" and tx["canonical_new"] == tip)
         if active: selected.append(tx)
@@ -414,8 +680,13 @@ def _synthetic(raw: bytes, projected: str, canonical: str, parent: str | None, c
     if raw != expected or parents != ([] if parent is None else [parent]): _fail(code, projected, "synthetic commit bytes or parent are not deterministic")
 
 
-def _projected(root: Path, state: dict, canonical_history: list[str]) -> tuple[dict[str, list[tuple[str, str, str | None]]], dict[str, tuple[set[str], set[str], set[str]]]]:
-    canonical = canonical_repo(root); index = {oid: i for i, oid in enumerate(canonical_history)}; revision_data: dict[str, list[tuple[str, str, str | None]]] = {}
+def _anchor_assignment_matches(anchor: dict, descriptor_id: str, generation: int, code: str, subject: str) -> None:
+    if anchor.get("descriptor_id") != descriptor_id or anchor.get("descriptor_generation") != generation:
+        _fail(code, subject, "anchor descriptor assignment differs from the view")
+
+
+def _projected(root: Path, state: dict, canonical_history: list[str], version: int) -> tuple[dict[str, list[tuple]], dict[str, tuple[set[str], set[str], set[str]]]]:
+    canonical = canonical_repo(root); index = {oid: i for i, oid in enumerate(canonical_history)}; revision_data: dict[str, list[tuple]] = {}
     confirmed: dict[str, dict[str, tuple[str, str | None]]] = {name: {} for name in state["views"]}
     view_closures: dict[str, tuple[set[str], set[str], set[str]]] = {}
     for tx in state["transactions"].values():
@@ -425,12 +696,15 @@ def _projected(root: Path, state: dict, canonical_history: list[str]) -> tuple[d
                 confirmed[tx["view"]][mapping["canonical"]] = (mapping["submitted"], mapping["change_id"])
     for name, view in sorted(state["views"].items()):
         repo = view_repo(root, name); actual = _history(repo, view["projected_tip"], "PROJECTION", name)
+        read_policy = _view_read_policy(state, name, version)
+        descriptor_id = view.get("descriptor_id") if version == 2 else None
+        generation = view.get("descriptor_generation") if version == 2 else None
         allowed_commits: set[str] = set(actual)
         allowed_trees: set[str] = set()
         allowed_blobs: set[str] = set()
         expected: list[tuple[str, str, str | None]] = []; previous_visible: dict | None = None; actual_index = 0; previous_projected: str | None = None
         for canonical_oid in canonical_history[:index[view["canonical_frontier"]] + 1]:
-            visible = _filtered(_flat(canonical, canonical_oid, "PROJECTION"), view["read"])
+            visible = _filtered(_flat(canonical, canonical_oid, "PROJECTION"), read_policy)
             mapping = confirmed[name].get(canonical_oid)
             if mapping: projected, kind, change_id = mapping[0], "submitted", mapping[1]
             elif visible != previous_visible:
@@ -441,6 +715,7 @@ def _projected(root: Path, state: dict, canonical_history: list[str]) -> tuple[d
             expected.append((projected, canonical_oid, kind)); actual_index += 1
             anchor = view["anchors"].get(projected)
             if not anchor or anchor["canonical"] != canonical_oid or anchor["kind"] != kind: _fail("ANCHOR", projected, "anchor does not match canonical replay")
+            if version == 2: _anchor_assignment_matches(anchor, descriptor_id, generation, "DESCRIPTOR", projected)
             raw = _raw_commit(repo, projected, "PROJECTION", projected)
             _tree, parents, _lines, _message = _commit_parts(raw, "PROJECTION", projected)
             if parents != ([] if previous_projected is None else [previous_projected]): _fail("PROJECTION", projected, "projected history parent differs")
@@ -449,19 +724,19 @@ def _projected(root: Path, state: dict, canonical_history: list[str]) -> tuple[d
             allowed_trees.update(_no_empty(repo, projected, "PROJECTION"))
             allowed_blobs.update(blob_oid for _mode, _kind, blob_oid in visible.values())
             if kind == "synthetic":
-                if set(anchor) != {"canonical", "kind", "change_id"} or anchor["change_id"] != change_id: _fail("ANCHOR", projected, "synthetic anchor has invalid Change-Id")
+                if set(anchor) != {"canonical", "kind", "change_id"} | ({"descriptor_id", "descriptor_generation"} if version == 2 else set()) or anchor["change_id"] != change_id: _fail("ANCHOR", projected, "synthetic anchor has invalid Change-Id")
                 _synthetic(raw, projected, canonical_oid, previous_projected, change_id, "PROJECTION")
-                if change_id: revision_data.setdefault(change_id, []).append((name, projected, canonical_oid, "synthetic"))
+                if change_id: revision_data.setdefault(change_id, []).append((name, projected, canonical_oid, "synthetic", descriptor_id, generation))
             else:
-                if set(anchor) != {"canonical", "kind"}: _fail("ANCHOR", projected, "submitted anchor has invalid shape")
+                if set(anchor) != {"canonical", "kind"} | ({"descriptor_id", "descriptor_generation"} if version == 2 else set()): _fail("ANCHOR", projected, "submitted anchor has invalid shape")
             previous_projected = projected; previous_visible = visible
         if [item[0] for item in expected] != actual or set(view["anchors"]) != set(actual): _fail("ANCHOR", name, "anchors and projected history differ")
-        if _flat(repo, view["projected_tip"], "PROJECTION") != _filtered(_flat(canonical, view["canonical_frontier"], "PROJECTION"), view["read"]): _fail("PROJECTION", name, "tip tree differs from frontier filter")
+        if _flat(repo, view["projected_tip"], "PROJECTION") != _filtered(_flat(canonical, view["canonical_frontier"], "PROJECTION"), read_policy): _fail("PROJECTION", name, "tip tree differs from frontier filter")
         view_closures[name] = (allowed_commits, allowed_trees, allowed_blobs)
     return revision_data, view_closures
 
 
-def _plans(root: Path, state: dict, canonical_history: list[str]) -> None:
+def _plans(root: Path, state: dict, canonical_history: list[str], version: int) -> None:
     canonical = canonical_repo(root); index = {oid: i for i, oid in enumerate(canonical_history)}
     for identifier, job in sorted(state["projection_jobs"].items()):
         if "plan" not in job:
@@ -469,19 +744,29 @@ def _plans(root: Path, state: dict, canonical_history: list[str]) -> None:
             continue
         plan = job["plan"]
         needed = {"view", "canonical_ref", "projected_ref", "old_frontier", "new_frontier", "old_tip", "new_tip", "anchors"}
+        if version == 2:
+            needed |= {"descriptor_id", "descriptor_generation"}
+            if plan.get("descriptor_id") != job.get("descriptor_id") or plan.get("descriptor_generation") != job.get("descriptor_generation"):
+                _fail("DESCRIPTOR", identifier, "retained plan differs from the job assignment")
+            view = state["views"].get(job["view"])
+            if view and (plan.get("descriptor_id") != view.get("descriptor_id") or plan.get("descriptor_generation") != view.get("descriptor_generation")):
+                _fail("DESCRIPTOR", identifier, "retained plan differs from the view assignment")
         if set(plan) != needed or job["status"] not in {"running", "ready", "retry"}: _fail("JOB", identifier, "plan is invalid for job state")
         view = state["views"].get(job["view"])
-        if not view or any(not isinstance(plan[field], str) for field in needed - {"anchors"}) or not isinstance(plan["anchors"], dict): _fail("JOB", identifier, "plan has invalid shape")
+        if not view or any(not isinstance(plan[field], str) for field in needed - {"anchors", "descriptor_generation"}) or not isinstance(plan["anchors"], dict): _fail("JOB", identifier, "plan has invalid shape")
+        if version == 2 and plan["descriptor_generation"] != 1: _fail("JOB", identifier, "plan descriptor generation must be 1")
         if plan["view"] != job["view"] or plan["canonical_ref"] != view["canonical_ref"] or plan["projected_ref"] != view["projected_ref"] or plan["old_frontier"] != job.get("expected_frontier") or plan["old_tip"] != job.get("expected_projected_tip") or plan["new_frontier"] != job["canonical_to"] or plan["old_frontier"] != view["canonical_frontier"] or plan["old_tip"] != view["projected_tip"]: _fail("JOB", identifier, "plan cursors do not match job and view")
         if plan["old_frontier"] not in index or plan["new_frontier"] not in index or index[plan["old_frontier"]] > index[plan["new_frontier"]]: _fail("JOB", identifier, "plan frontier range is invalid")
-        previous_tip = plan["old_tip"]; previous_visible = _filtered(_flat(canonical, plan["old_frontier"], "JOB"), view["read"]); expected_keys: list[str] = []
+        read_policy = _view_read_policy(state, job["view"], version)
+        previous_tip = plan["old_tip"]; previous_visible = _filtered(_flat(canonical, plan["old_frontier"], "JOB"), read_policy); expected_keys: list[str] = []
+        anchor_fields = {"canonical", "kind", "change_id"} | ({"descriptor_id", "descriptor_generation"} if version == 2 else set())
         for oid in canonical_history[index[plan["old_frontier"]] + 1:index[plan["new_frontier"]] + 1]:
-            visible = _filtered(_flat(canonical, oid, "JOB"), view["read"])
+            visible = _filtered(_flat(canonical, oid, "JOB"), read_policy)
             if visible != previous_visible:
                 candidates = [key for key, anchor in plan["anchors"].items() if isinstance(anchor, dict) and anchor.get("canonical") == oid]
                 if len(candidates) != 1: _fail("JOB", identifier, "plan anchors do not replay canonically")
                 projected = candidates[0]; anchor = plan["anchors"][projected]
-                if set(anchor) != {"canonical", "kind", "change_id"} or anchor["kind"] != "synthetic": _fail("JOB", identifier, "plan has non-synthetic anchor")
+                if set(anchor) != anchor_fields or anchor["kind"] != "synthetic": _fail("JOB", identifier, "plan has non-synthetic anchor")
                 canonical_change_id = parse_change_id(
                     _commit_parts(
                         _raw_commit(canonical, oid, "JOB", oid), "JOB", oid
@@ -496,18 +781,22 @@ def _plans(root: Path, state: dict, canonical_history: list[str]) -> None:
         if set(expected_keys) != set(plan["anchors"]) or previous_tip != plan["new_tip"]: _fail("JOB", identifier, "plan tip or anchors differ from replay")
 
 
-def _changes(state: dict, revisions: dict[str, list[tuple[str, str, str | None]]]) -> None:
+def _changes(state: dict, revisions: dict[str, list[tuple]], version: int) -> None:
     # A source publication barrier reserves its Change-Id before the submitted
     # ref and its submitted representation become durable.
+    owned_field = "owner_principal_id" if version == 2 else "owner"
+    status_set = {"canonical_committed", "source_unconfirmed"}
     for tx in state["transactions"].values():
-        if tx.get("kind") is None and tx["status"] in {"canonical_committed", "source_unconfirmed"}:
+        if tx.get("kind") is None and tx["status"] in status_set:
             for mapping in tx["mappings"]:
                 if mapping["change_id"]:
                     revisions.setdefault(mapping["change_id"], [])
     for tx in state["transactions"].values():
         if tx.get("kind") is None and tx["status"] in {"fanout_pending", "published"}:
+            descriptor_id = tx.get("descriptor_id") if version == 2 else None
+            generation = tx.get("descriptor_generation") if version == 2 else None
             for mapping in tx["mappings"]:
-                if mapping["change_id"]: revisions.setdefault(mapping["change_id"], []).append((tx["view"], mapping["submitted"], mapping["canonical"], "submitted"))
+                if mapping["change_id"]: revisions.setdefault(mapping["change_id"], []).append((tx["view"], mapping["submitted"], mapping["canonical"], "submitted", descriptor_id, generation))
     if set(state["changes"]) != set(revisions): _fail("CHANGE", "changes", "logical Change-Id inventory differs from representations")
     active: dict[str, list[dict]] = {}
     for tx in state["transactions"].values():
@@ -516,28 +805,47 @@ def _changes(state: dict, revisions: dict[str, list[tuple[str, str, str | None]]
                 if mapping["change_id"]: active.setdefault(mapping["change_id"], []).append(tx)
     for change_id, change in sorted(state["changes"].items()):
         actual: set[tuple] = set()
+        expected_assignments: dict[tuple, tuple[str | None, int | None]] = {}
+        for entry in revisions[change_id]:
+            expected_assignments[entry[:4]] = (entry[4], entry[5])
         for revision in change["revisions"]:
             if not isinstance(revision, dict): _fail("CHANGE", change_id, "revision is not a dictionary")
             required = {"view", "projected", "canonical", "kind"}
-            if not required <= set(revision) or revision["kind"] not in {"submitted", "synthetic"}: _fail("CHANGE", change_id, "invalid revision shape")
+            if version == 2:
+                required |= {"descriptor_id", "descriptor_generation"}
+                if set(revision) != required | ({"submitted"} if revision["kind"] == "submitted" else set()):
+                    _fail("CHANGE", change_id, "invalid revision shape")
+            else:
+                if not required <= set(revision) or revision["kind"] not in {"submitted", "synthetic"}: _fail("CHANGE", change_id, "invalid revision shape")
+            if revision["kind"] not in {"submitted", "synthetic"}: _fail("CHANGE", change_id, "invalid revision kind")
             if revision["kind"] == "submitted" and revision.get("submitted") != revision["projected"]: _fail("CHANGE", change_id, "submitted revision lacks matching submitted ID")
             if revision["kind"] == "synthetic" and "submitted" in revision: _fail("CHANGE", change_id, "synthetic revision has submitted ID")
             key = (revision["view"], revision["projected"], revision["canonical"], revision["kind"])
             if key in actual: _fail("CHANGE", change_id, "duplicate revision")
             actual.add(key)
-        if actual != set(revisions[change_id]): _fail("CHANGE", change_id, "revisions differ from anchors and mappings")
+            if version == 2 and key in expected_assignments:
+                descriptor_id, generation = expected_assignments[key]
+                if revision["descriptor_id"] != descriptor_id or revision["descriptor_generation"] != generation:
+                    _fail("CHANGE", change_id, "revision descriptor differs from its anchor")
+        if actual != {entry[:4] for entry in revisions[change_id]}: _fail("CHANGE", change_id, "revisions differ from anchors and mappings")
         owners = active.get(change_id, [])
         if owners:
-            if change.get("owner") is None or change.get("canonical_ref") is None or any(change["owner"] != tx["principal"] or change["canonical_ref"] != tx["canonical_ref"] for tx in owners): _fail("CHANGE", change_id, "ownership differs from source transaction")
-        elif "owner" in change or "canonical_ref" in change:
+            if change.get(owned_field) is None or change.get("canonical_ref") is None or any(change[owned_field] != tx["principal_id" if version == 2 else "principal"] or change["canonical_ref"] != tx["canonical_ref"] for tx in owners): _fail("CHANGE", change_id, "ownership differs from source transaction")
+        elif owned_field in change or "canonical_ref" in change:
             _fail("CHANGE", change_id, "unbacked ownership reservation")
 
 
-def _outbox_jobs(state: dict, canonical_history: list[str]) -> None:
+def _outbox_jobs(state: dict, canonical_history: list[str], version: int) -> None:
     events_by_tx: dict[str, dict] = {}
     for identifier, event in sorted(state["outbox"].items()):
         tx = state["transactions"].get(event["transaction_id"])
-        if not tx or event["id"] != event_id(event["transaction_id"]) or event["type"] != "canonical.committed" or event["sequence"] != tx["sequence"] or event["canonical_to"] != tx["canonical_new"] or len(event["target_views"]) != len(set(event["target_views"])) or any(view not in state["views"] for view in event["target_views"]) or (tx.get("kind") is None and tx["view"] in event["target_views"]) or not set(tx["pending_views"]).issubset(event["target_views"]): _fail("OUTBOX", identifier, "event does not match transaction")
+        mismatch = not tx or event["id"] != event_id(event["transaction_id"]) or event["type"] != "canonical.committed" or event["sequence"] != tx["sequence"] or event["canonical_to"] != tx["canonical_new"] or len(event["target_views"]) != len(set(event["target_views"])) or any(view not in state["views"] for view in event["target_views"]) or (tx.get("kind") is None and tx["view"] in event["target_views"]) or not set(tx["pending_views"]).issubset(event["target_views"])
+        if version == 2 and not mismatch:
+            mismatch = (
+                event.get("target_descriptors") != tx.get("target_descriptors")
+                or event["target_views"] != sorted(event["target_descriptors"])
+            )
+        if mismatch: _fail("OUTBOX", identifier, "event does not match transaction")
         if event["transaction_id"] in events_by_tx or tx.get("event_id") != identifier: _fail("OUTBOX", identifier, "event identity is not one-to-one")
         events_by_tx[event["transaction_id"]] = event
     for identifier, tx in sorted(state["transactions"].items()):
@@ -550,7 +858,11 @@ def _outbox_jobs(state: dict, canonical_history: list[str]) -> None:
     jobs_by_event: dict[str, list[dict]] = {}
     for identifier, job in sorted(state["projection_jobs"].items()):
         event = state["outbox"].get(job["event_id"]); tx = state["transactions"].get(job["transaction_id"])
-        if not event or not tx or event["transaction_id"] != job["transaction_id"] or job["id"] != job_id(job["transaction_id"], job["view"]) or job["event_id"] != event["id"] or job["view"] not in event["target_views"] or job["sequence"] != event["sequence"] or job["sequence"] != tx["sequence"] or job["canonical_to"] != event["canonical_to"] or job["canonical_to"] != tx["canonical_new"]: _fail("JOB", identifier, "job does not match event and transaction")
+        mismatch = not event or not tx or event["transaction_id"] != job["transaction_id"] or job["id"] != job_id(job["transaction_id"], job["view"]) or job["event_id"] != event["id"] or job["view"] not in event["target_views"] or job["sequence"] != event["sequence"] or job["sequence"] != tx["sequence"] or job["canonical_to"] != event["canonical_to"] or job["canonical_to"] != tx["canonical_new"]
+        if version == 2 and not mismatch:
+            assignment = event.get("target_descriptors", {}).get(job["view"], {})
+            mismatch = job.get("descriptor_id") != assignment.get("descriptor_id") or job.get("descriptor_generation") != assignment.get("descriptor_generation")
+        if mismatch: _fail("JOB", identifier, "job does not match event and transaction")
         if job["status"] in {"running", "ready"} and (not isinstance(job.get("lease_token"), str) or not job["lease_token"] or not isinstance(job.get("lease_expires_at"), (int, float)) or not _oid(job.get("expected_frontier")) or not _oid(job.get("expected_projected_tip"))): _fail("JOB", identifier, "active job lease fields are invalid")
         if job["status"] == "pending" and (job.get("lease_token") is not None or "plan" in job): _fail("JOB", identifier, "pending job has active fields")
         if job["status"] == "retry" and job.get("lease_token") is not None: _fail("JOB", identifier, "retry job retains lease token")
@@ -627,6 +939,53 @@ def _phase(code: str, function: Any) -> Any:
         _fail(code, "forge", str(error))
 
 
+def _schema_dispatch(state: dict) -> None:
+    version = state.get("version")
+    if version == 1 and not isinstance(version, bool):
+        _schema_v1(state)
+    elif version == 2 and not isinstance(version, bool):
+        _schema_v2(state)
+    else:
+        _fail("STATE_SCHEMA", "state", f"unsupported forge state version: {version!r}")
+
+
+def _identity_and_descriptor_checks(state: dict) -> None:
+    _phase("IDENTITY", lambda: _schema_catalog(state))
+    _phase("DESCRIPTOR", lambda: _identity_resolution_checks(state))
+
+
+def _history_phases(
+    root: Path, state: dict, canonical_refs: dict, view_refs: dict
+) -> None:
+    version = state["version"]
+    tip = _phase("CANONICAL_REF", lambda: _check_refs(root, state, canonical_refs, view_refs))
+    canonical_history = _phase("CANONICAL_GRAPH", lambda: _canonical_graph(root, tip))
+    _phase("FRONTIER", lambda: _policy_frontiers(root, state, canonical_history, tip, version))
+    _phase("MAPPING", lambda: _source_transactions(root, state, canonical_history, tip, version))
+    _phase("CANONICAL_REF", lambda: _admin_transactions(root, state, canonical_history, tip))
+    revisions, view_closures = _phase("PROJECTION", lambda: _projected(root, state, canonical_history, version))
+    _phase("JOB", lambda: _plans(root, state, canonical_history, version))
+    _phase("CHANGE", lambda: _changes(state, revisions, version))
+    _phase("OUTBOX", lambda: _outbox_jobs(state, canonical_history, version))
+    _phase("REACHABILITY", lambda: _reachability(root, state, view_closures))
+
+
+def check_loaded(root: Path, state: dict, canonical_refs: dict, view_refs: dict) -> None:
+    """Full invariant check of an already-loaded state against collected refs.
+
+    Used by migration: acquires no lock and never reloads ``state.json``.
+    """
+    _phase("STATE_SCHEMA", lambda: _schema_dispatch(state))
+    if state["version"] == 2:
+        _identity_and_descriptor_checks(state)
+    _history_phases(root, state, canonical_refs, view_refs)
+
+
+def collect_layout(root: Path, state: dict) -> tuple[dict, dict]:
+    """Collect the repository and ref inventory without checking schemas."""
+    return _layout_and_refs(root, state)
+
+
 def check_invariants(root: Path) -> None:
     """Raise ForgeError if the forge violates a global invariant."""
     lock_path = root / "state.lock"
@@ -634,19 +993,12 @@ def check_invariants(root: Path) -> None:
         with lock_path.open("r") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             state = copy.deepcopy(load_state(root))
-            _phase("STATE_SCHEMA", lambda: _schema(state))
+            _phase("STATE_SCHEMA", lambda: _schema_dispatch(state))
+            if state["version"] == 2:
+                _identity_and_descriptor_checks(state)
             canonical_refs, view_refs = _phase("FORGE_LAYOUT", lambda: _layout_and_refs(root, state))
     except ForgeError:
         raise
     except OSError as error:
         _fail("STATE_SCHEMA", "state", f"cannot acquire snapshot: {error}")
-    tip = _phase("CANONICAL_REF", lambda: _check_refs(root, state, canonical_refs, view_refs))
-    canonical_history = _phase("CANONICAL_GRAPH", lambda: _canonical_graph(root, tip))
-    _phase("FRONTIER", lambda: _policy_frontiers(root, state, canonical_history, tip))
-    _phase("MAPPING", lambda: _source_transactions(root, state, canonical_history, tip))
-    _phase("CANONICAL_REF", lambda: _admin_transactions(root, state, canonical_history, tip))
-    revisions, view_closures = _phase("PROJECTION", lambda: _projected(root, state, canonical_history))
-    _phase("JOB", lambda: _plans(root, state, canonical_history))
-    _phase("CHANGE", lambda: _changes(state, revisions))
-    _phase("OUTBOX", lambda: _outbox_jobs(state, canonical_history))
-    _phase("REACHABILITY", lambda: _reachability(root, state, view_closures))
+    _history_phases(root, state, canonical_refs, view_refs)

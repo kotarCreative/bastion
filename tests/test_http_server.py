@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 import forge
+from tests import identity_harness
 from errors import ForgeError
 from git import ref
 from http_server import add_token, make_server
@@ -55,8 +56,8 @@ class HttpForgeTest(unittest.TestCase):
 
         self.forge = self.root / "forge"
         forge.init_forge(self.forge, self.source, "main")
-        forge.add_view(self.forge, "alice", ["visible"], ["visible"], "main")
-        forge.add_view(self.forge, "bob", ["visible"], ["visible"], "main")
+        identity_harness.add_view(self.forge, "alice", ["visible"], ["visible"], "main")
+        identity_harness.add_view(self.forge, "bob", ["visible"], ["visible"], "main")
         self.initial_canonical = ref(canonical_repo(self.forge), "refs/heads/main")
 
         self.alice_token = add_token(self.forge, "alice")

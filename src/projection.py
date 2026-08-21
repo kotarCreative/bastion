@@ -25,10 +25,11 @@ def project_tree(
     canonical: Path,
     destination: Path,
     canonical_treeish: str,
-    read_prefixes: list[str],
+    descriptor: dict,
     source_env: dict[str, str] | None = None,
     destination_env: dict[str, str] | None = None,
 ) -> str:
+    read_prefixes = descriptor["read"]
     visible = {}
     validate_no_empty_subtrees(canonical, canonical_treeish, source_env)
     for path, entry in tree_entries(canonical, canonical_treeish, source_env).items():
@@ -69,12 +70,12 @@ def visible_advance(
     frontier: str,
     tip: str,
     destination: Path,
-    read_prefixes: list[str],
+    descriptor: dict,
     expected_tree: str,
 ) -> None:
     previous_tree = expected_tree
     for oid in first_parent_commits(canonical, frontier, tip):
-        projected = project_tree(canonical, destination, oid, read_prefixes)
+        projected = project_tree(canonical, destination, oid, descriptor)
         if projected != previous_tree:
             raise ForgeError(
                 "visible history advanced; synchronize the view, fetch, and rebase"
@@ -88,16 +89,17 @@ def project_history(
     frontier: str,
     canonical_tip: str,
     projected_tip: str,
-    read_prefixes: list[str],
+    descriptor: dict,
 ) -> tuple[str, str, dict[str, dict[str, str]]]:
     """Project canonical commits, eliding commits whose visible tree is unchanged."""
+    read_prefixes = descriptor["read"]
     previous_tree = (
         tree_oid(destination, projected_tip) if projected_tip != ZERO_OID else None
     )
     anchors: dict[str, dict[str, str]] = {}
     for canonical_oid in first_parent_commits(canonical, frontier, canonical_tip):
         projected_tree = project_tree(
-            canonical, destination, canonical_oid, read_prefixes
+            canonical, destination, canonical_oid, descriptor
         )
         if projected_tree != previous_tree:
             change_id = parse_change_id(commit_message(canonical, canonical_oid))

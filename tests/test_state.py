@@ -20,6 +20,8 @@ class TransactionStateTest(unittest.TestCase):
         state = {
             "views": {
                 "alice": {
+                    "descriptor_id": "vdesc-test",
+                    "descriptor_generation": 1,
                     "canonical_frontier": "old-canonical",
                     "projected_tip": "old-projected",
                     "anchors": {},
@@ -29,6 +31,8 @@ class TransactionStateTest(unittest.TestCase):
         }
         transaction = {
             "view": "alice",
+            "descriptor_id": "vdesc-test",
+            "descriptor_generation": 1,
             "canonical_new": "new-canonical",
             "projected_new": "new-projected",
             "mappings": [
@@ -48,7 +52,12 @@ class TransactionStateTest(unittest.TestCase):
         )
         self.assertEqual("new-projected", state["views"]["alice"]["projected_tip"])
         self.assertEqual(
-            {"canonical": "new-canonical", "kind": "submitted"},
+            {
+                "canonical": "new-canonical",
+                "kind": "submitted",
+                "descriptor_id": "vdesc-test",
+                "descriptor_generation": 1,
+            },
             state["views"]["alice"]["anchors"]["submitted"],
         )
         self.assertEqual(1, len(state["changes"]["Ichange"]["revisions"]))
@@ -57,6 +66,8 @@ class TransactionStateTest(unittest.TestCase):
         state = {
             "views": {
                 "alice": {
+                    "descriptor_id": "vdesc-test",
+                    "descriptor_generation": 1,
                     "canonical_frontier": "old",
                     "projected_tip": "old",
                     "anchors": {},
@@ -66,6 +77,8 @@ class TransactionStateTest(unittest.TestCase):
         }
         transaction = {
             "view": "alice",
+            "descriptor_id": "vdesc-test",
+            "descriptor_generation": 1,
             "canonical_new": "canonical",
             "projected_new": "submitted",
             "mappings": [
@@ -84,6 +97,8 @@ class TransactionStateTest(unittest.TestCase):
         state = {
             "views": {
                 "alice": {
+                    "descriptor_id": "vdesc-test",
+                    "descriptor_generation": 1,
                     "canonical_frontier": "canonical-2",
                     "projected_tip": "projected-2",
                     "anchors": {},
@@ -93,6 +108,8 @@ class TransactionStateTest(unittest.TestCase):
         }
         older = {
             "view": "alice",
+            "descriptor_id": "vdesc-test",
+            "descriptor_generation": 1,
             "canonical_frontier_old": "canonical-0",
             "canonical_old": "canonical-0",
             "canonical_new": "canonical-1",
@@ -118,6 +135,10 @@ class TransactionStateTest(unittest.TestCase):
                     "tx": {
                         "id": "tx",
                         "view": "alice",
+                        "principal_id": "alice",
+                        "descriptor_id": "vdesc-tx",
+                        "descriptor_generation": 1,
+                        "target_descriptors": {},
                         "canonical_ref": "refs/heads/main",
                         "projected_ref": "refs/heads/main",
                         "canonical_old": "1" * 40,

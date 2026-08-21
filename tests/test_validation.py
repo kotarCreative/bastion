@@ -21,6 +21,10 @@ def blob(oid: str = "1" * 40, mode: bytes = b"100644") -> tuple[bytes, bytes, st
     return mode, b"blob", oid
 
 
+def descriptor(read: list[str], write: list[str]) -> dict:
+    return {"read": read, "write": write}
+
+
 class PathPolicyTest(unittest.TestCase):
     def test_prefix_matches_only_whole_path_component(self) -> None:
         self.assertTrue(allowed(b"visible", ["visible"]))
@@ -79,20 +83,19 @@ class TreeTransitionTest(unittest.TestCase):
 
     def test_authorization_requires_both_read_and_write(self) -> None:
         changes = {b"visible/file": blob()}
-        authorize_changes(changes, ["visible"], ["visible"])
+        authorize_changes(changes, descriptor(["visible"], ["visible"]))
         for read, write in ((["other"], ["visible"]), (["visible"], ["other"])):
             with self.subTest(read=read, write=write), self.assertRaises(ForgeError):
-                authorize_changes(changes, read, write)
+                authorize_changes(changes, descriptor(read, write))
 
     def test_rename_requires_both_endpoints_to_be_readable_and_writable(self) -> None:
         changes = {b"team-a/old": None, b"shared/new": blob()}
         with self.assertRaisesRegex(ForgeError, "outside current authorization"):
-            authorize_changes(changes, ["shared", "team-a"], ["shared"])
+            authorize_changes(changes, descriptor(["shared", "team-a"], ["shared"]))
         with self.assertRaisesRegex(ForgeError, "outside current authorization"):
             authorize_changes(
                 {b"shared/old": None, b"team-a/new": blob()},
-                ["shared", "team-a"],
-                ["shared"],
+                descriptor(["shared", "team-a"], ["shared"]),
             )
 
     def test_apply_changes_preserves_unaffected_hidden_state(self) -> None:

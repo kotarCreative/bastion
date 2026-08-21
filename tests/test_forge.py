@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 import forge
+from tests import identity_harness
 
 
 def command(*args: str, cwd: Path | None = None, check: bool = True,
@@ -52,7 +53,7 @@ class ForgeTest(unittest.TestCase):
 
         self.forge = self.root / "forge"
         forge.init_forge(self.forge, self.source, "main")
-        forge.add_view(self.forge, "alice", ["visible"], ["visible"], "main")
+        identity_harness.add_view(self.forge, "alice", ["visible"], ["visible"], "main")
         self.remote = forge.view_repo(self.forge, "alice")
         self.alice = self.root / "alice"
         command("git", "clone", "-q", "--no-local", str(self.remote), str(self.alice))
@@ -250,7 +251,7 @@ class ForgeTest(unittest.TestCase):
         self.assertIn("linear chain", rejected.stderr)
 
     def test_hidden_file_directory_collision_is_rejected(self) -> None:
-        forge.add_view(
+        identity_harness.add_view(
             self.forge,
             "collision",
             ["container/visible"],

@@ -9,6 +9,7 @@ import tempfile
 from pathlib import Path
 
 import forge
+from tests import identity_harness
 
 
 Tree = dict[bytes, tuple[bytes, str, bytes]]
@@ -192,7 +193,7 @@ class TreeFixture:
         initial_tip = build_commit(self.source, None, initial, b"initial fixture\n", 1_700_000_000)
         forge.init_forge(self.root, self.source, "main")
         for name, (read, write) in self.policies.items():
-            forge.add_view(self.root, name, read, write, "main")
+            identity_harness.add_view(self.root, name, read, write, "main")
             checkout = self.directory / f"client-{name}"
             command("git", "clone", "-q", "--no-local", os.fsdecode(forge.view_repo(self.root, name)), os.fsdecode(checkout))
             self.clients[name] = checkout

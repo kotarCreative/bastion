@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import forge
+from tests import identity_harness
 import worker
 from errors import ForgeError
 from invariants import check_invariants
@@ -153,8 +154,8 @@ class Scenario:
             target.write_bytes(contents)
         initial_oid = self._commit(self.source, "initial fixture", 0)
         forge.init_forge(self.root, self.source, "main")
-        forge.add_view(self.root, "alice", ["shared", "team-a"], ["shared", "team-a"], "main")
-        forge.add_view(self.root, "bob", ["shared", "team-b"], ["shared", "team-b"], "main")
+        identity_harness.add_view(self.root, "alice", ["shared", "team-a"], ["shared", "team-a"], "main")
+        identity_harness.add_view(self.root, "bob", ["shared", "team-b"], ["shared", "team-b"], "main")
         self.canonical_tree = tree_at(forge.canonical_repo(self.root), initial_oid)
         self.trees[initial_oid] = dict(self.canonical_tree)
         for name, read, write in (("alice", ["shared", "team-a"], ["shared", "team-a"]),
@@ -335,7 +336,7 @@ class Scenario:
                     client.update(oid=oid, tree=tree_at(checkout, oid), unpushed=False, clean=True)
         elif kind == "add_view":
             name = str(arguments["name"]); read = list(arguments["read"]); write = list(arguments["write"])
-            forge.add_view(self.root, name, read, write, "main")
+            identity_harness.add_view(self.root, name, read, write, "main")
             self.views[name] = {"read": read, "write": write}
             self.addable = [descriptor for descriptor in self.addable if descriptor[0] != name]
             if write:
@@ -368,7 +369,7 @@ class Scenario:
             claimed = worker.claim_projection_job(self.root, self.logical_now)
             if not claimed:
                 raise AssertionError("expected claimable crash job")
-            plan = build_projection_plan(self.root, claimed["view"], claimed["view_state"], claimed["canonical_to"])
+            plan = build_projection_plan(self.root, claimed["view"], claimed["view_state"], claimed["descriptor"], claimed["canonical_to"])
             with locked(self.root, recoverer=lambda _root, _state: None) as state:
                 job = state["projection_jobs"][claimed["id"]]
                 job["status"] = "ready"; job["plan"] = plan

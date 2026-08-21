@@ -4,6 +4,7 @@ import os
 import unittest
 
 import forge
+from tests import identity_harness
 from errors import ForgeError
 from tests.tree_harness import TreeFixture, command, empty_subtree_commit, git, gitlink_commit, oid
 
@@ -115,7 +116,7 @@ class TreeOperationsTest(unittest.TestCase):
         self._reject_source("limited", {b"team-a/link": (b"120000", b"../secret")}, "outside current authorization")
 
         self.fixture.admin_update([{b"container": (b"100644", b"hidden container\n")}])
-        forge.add_view(self.fixture.root, "narrow", ["container/visible"], ["container/visible"], "main")
+        identity_harness.add_view(self.fixture.root, "narrow", ["container/visible"], ["container/visible"], "main")
         checkout = self.fixture.directory / "client-narrow"
         command("git", "clone", "-q", "--no-local", os.fsdecode(forge.view_repo(self.fixture.root, "narrow")), os.fsdecode(checkout))
         self.fixture.policies["narrow"] = (["container/visible"], ["container/visible"])

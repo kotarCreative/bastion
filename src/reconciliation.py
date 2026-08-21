@@ -66,8 +66,7 @@ def reconcile_commits(
     commits: list[str],
     canonical_parent: str,
     projected_parent: str,
-    read_prefixes: list[str],
-    write_prefixes: list[str],
+    descriptor: dict,
     submitted_env: dict[str, str],
     candidate_env: dict[str, str],
 ) -> tuple[str, list[dict[str, str | None]]]:
@@ -76,7 +75,7 @@ def reconcile_commits(
         parent_entries = tree_entries(submitted, projected_parent, submitted_env)
         child_entries = tree_entries(submitted, submitted_oid, submitted_env)
         changes = changed_entries(parent_entries, child_entries)
-        authorize_changes(changes, read_prefixes, write_prefixes)
+        authorize_changes(changes, descriptor)
         candidate_tree = materialize_transition(
             canonical,
             submitted,
@@ -98,7 +97,7 @@ def reconcile_commits(
             canonical,
             canonical,
             canonical_oid,
-            read_prefixes,
+            descriptor,
             candidate_env,
             candidate_env,
         )

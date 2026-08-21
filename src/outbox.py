@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import time
 
 
@@ -26,7 +27,10 @@ def enqueue_canonical_committed(
             "transaction_id": transaction["id"],
             "sequence": transaction["sequence"],
             "canonical_to": transaction["canonical_new"],
-            "target_views": list(transaction.get("pending_views", [])),
+            "target_views": sorted(transaction.get("target_descriptors", {})),
+            "target_descriptors": copy.deepcopy(
+                transaction.get("target_descriptors", {})
+            ),
             "status": "pending" if ready else "blocked",
         },
     )
@@ -43,7 +47,11 @@ def dispatch_outbox(state: dict) -> None:
     ):
         if event["status"] != "pending":
             continue
+        assignments = event.get("target_descriptors", {})
         for view in event["target_views"]:
+            assignment = assignments.get(view)
+            if not assignment:
+                raise KeyError(f"event target lacks a descriptor assignment: {view}")
             identifier = job_id(event["transaction_id"], view)
             jobs.setdefault(
                 identifier,
@@ -52,6 +60,8 @@ def dispatch_outbox(state: dict) -> None:
                     "event_id": event["id"],
                     "transaction_id": event["transaction_id"],
                     "view": view,
+                    "descriptor_id": assignment["descriptor_id"],
+                    "descriptor_generation": assignment["descriptor_generation"],
                     "sequence": event["sequence"],
                     "canonical_to": event["canonical_to"],
                     "status": "pending",

@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 import forge
+from tests import identity_harness
 from errors import ForgeError
 
 
@@ -76,14 +77,14 @@ class CrossViewForgeTest(unittest.TestCase):
 
         self.forge = self.root / "forge"
         forge.init_forge(self.forge, source, "main")
-        forge.add_view(
+        identity_harness.add_view(
             self.forge,
             "alice",
             ["shared", "team-a"],
             ["shared", "team-a"],
             "main",
         )
-        forge.add_view(
+        identity_harness.add_view(
             self.forge,
             "bob",
             ["shared", "team-b"],
@@ -322,7 +323,7 @@ class CrossViewForgeTest(unittest.TestCase):
         )
 
     def test_broken_secondary_does_not_block_source_or_other_operations(self) -> None:
-        forge.add_view(
+        identity_harness.add_view(
             self.forge,
             "broken",
             ["shared"],

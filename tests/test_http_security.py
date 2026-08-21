@@ -12,6 +12,7 @@ import urllib.request
 from pathlib import Path
 
 import forge
+from tests import identity_harness
 from git import git as repo_git, ref
 from http_server import add_token, make_server
 from layout import ZERO_OID, canonical_repo, view_repo
@@ -60,8 +61,8 @@ class HttpSecurityTest(unittest.TestCase):
 
         self.forge = self.root / "forge"
         forge.init_forge(self.forge, self.source, "main")
-        forge.add_view(self.forge, "alice", ["visible"], ["visible"], "main")
-        forge.add_view(self.forge, "bob", ["visible"], ["visible"], "main")
+        identity_harness.add_view(self.forge, "alice", ["visible"], ["visible"], "main")
+        identity_harness.add_view(self.forge, "bob", ["visible"], ["visible"], "main")
 
         self.alice_token = add_token(self.forge, "alice")
         self.bob_token = add_token(self.forge, "bob")

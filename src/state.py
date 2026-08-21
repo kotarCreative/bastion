@@ -12,6 +12,7 @@ from typing import Callable, Iterator
 from errors import ForgeError
 from failpoints import checkpoint
 from git import git, ref
+from identity import require_matching_descriptor
 from layout import ZERO_OID, canonical_repo, view_repo
 
 
@@ -45,14 +46,17 @@ def save_state(root: Path, state: dict) -> None:
 
 
 def apply_transaction_state(state: dict, transaction: dict) -> None:
-    if transaction.get("principal"):
+    if transaction.get("principal_id"):
         reserve_change_ids(
             state,
-            transaction["principal"],
+            transaction["principal_id"],
             transaction["canonical_ref"],
             transaction["mappings"],
         )
     view = state["views"][transaction["view"]]
+    require_matching_descriptor(
+        view, transaction["descriptor_id"], transaction["descriptor_generation"]
+    )
     if view["canonical_frontier"] == transaction.get(
         "canonical_frontier_old",
         transaction.get("canonical_old", view["canonical_frontier"]),
@@ -66,6 +70,8 @@ def apply_transaction_state(state: dict, transaction: dict) -> None:
         view["anchors"][mapping["submitted"]] = {
             "canonical": mapping["canonical"],
             "kind": "submitted",
+            "descriptor_id": transaction["descriptor_id"],
+            "descriptor_generation": transaction["descriptor_generation"],
         }
         change_id = mapping["change_id"]
         if not change_id:
@@ -77,6 +83,8 @@ def apply_transaction_state(state: dict, transaction: dict) -> None:
             mapping["submitted"],
             mapping["canonical"],
             "submitted",
+            transaction["descriptor_id"],
+            transaction["descriptor_generation"],
         )
 
 
@@ -87,6 +95,8 @@ def record_change_representation(
     projected: str,
     canonical: str,
     kind: str,
+    descriptor_id: str,
+    descriptor_generation: int,
 ) -> None:
     change = state["changes"].setdefault(change_id, {"revisions": []})
     revision = {
@@ -94,6 +104,8 @@ def record_change_representation(
         "projected": projected,
         "canonical": canonical,
         "kind": kind,
+        "descriptor_id": descriptor_id,
+        "descriptor_generation": descriptor_generation,
     }
     if kind == "submitted":
         revision["submitted"] = projected
@@ -103,11 +115,11 @@ def record_change_representation(
 
 def reserve_change_ids(
     state: dict,
-    principal: str,
+    principal_id: str,
     canonical_ref: str,
     mappings: list[dict[str, str | None]],
 ) -> None:
-    validate_change_ids(state, principal, canonical_ref, mappings)
+    validate_change_ids(state, principal_id, canonical_ref, mappings)
     for mapping in mappings:
         change_id = mapping["change_id"]
         if not change_id:
@@ -115,7 +127,7 @@ def reserve_change_ids(
         existing = state["changes"].get(change_id)
         if not existing:
             state["changes"][change_id] = {
-                "owner": principal,
+                "owner_principal_id": principal_id,
                 "canonical_ref": canonical_ref,
                 "revisions": [],
             }
@@ -123,7 +135,7 @@ def reserve_change_ids(
 
 def validate_change_ids(
     state: dict,
-    principal: str,
+    principal_id: str,
     canonical_ref: str,
     mappings: list[dict[str, str | None]],
 ) -> None:
@@ -133,7 +145,7 @@ def validate_change_ids(
             continue
         existing = state["changes"].get(change_id)
         if existing and (
-            existing.get("owner") != principal
+            existing.get("owner_principal_id") != principal_id
             or existing.get("canonical_ref") != canonical_ref
         ):
             raise ForgeError("Change-Id belongs to another principal or branch")
@@ -254,10 +266,10 @@ def recover(root: Path, state: dict) -> None:
             and is_ancestor(canonical, transaction["canonical_new"], canonical_tip)
         )
         if contains_new and transaction["status"] == "prepared":
-            if transaction.get("principal"):
+            if transaction.get("principal_id"):
                 reserve_change_ids(
                     state,
-                    transaction["principal"],
+                    transaction["principal_id"],
                     transaction["canonical_ref"],
                     transaction["mappings"],
                 )
@@ -321,5 +333,10 @@ def locked(
     with (root / "state.lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         state = load_state(root)
+        version = state.get("version")
+        if version != 2:
+            if version == 1:
+                raise ForgeError("forge state version 1 requires migrate-identities")
+            raise ForgeError(f"unsupported forge state version: {version!r}")
         recoverer(root, state)
         yield state

@@ -7,6 +7,7 @@ import os
 import shutil
 from pathlib import Path
 
+import identity
 from errors import ForgeError
 from failpoints import checkpoint
 from git import (
@@ -57,6 +58,7 @@ def prepare_submission(
     root: Path,
     name: str,
     view: dict,
+    descriptor: dict,
     old: str,
     new: str,
     hook_env: dict[str, str],
@@ -80,7 +82,7 @@ def prepare_submission(
         view["canonical_frontier"],
         canonical_old,
         destination,
-        view["read"],
+        descriptor,
         tree_oid(destination, old, hook_env),
     )
 
@@ -95,8 +97,7 @@ def prepare_submission(
             commits,
             canonical_old,
             old,
-            view["read"],
-            view["write"],
+            descriptor,
             hook_env,
             candidate_env,
         )
@@ -113,6 +114,7 @@ def pre_receive(root: Path, name: str, updates: bytes) -> None:
         view = state["views"].get(name)
         if not view:
             raise ForgeError("exactly one authorized branch may be updated")
+        descriptor = identity.descriptor_for_view(state, name)
         from outbox import view_has_unfinished_jobs
         from state import has_unconfirmed_source, source_publication_pending
 
@@ -120,6 +122,11 @@ def pre_receive(root: Path, name: str, updates: bytes) -> None:
         retry_id = transaction_id(name, old, new)
         retry = state["transactions"].get(retry_id)
         if retry and retry["status"] == "source_unconfirmed":
+            identity.require_matching_descriptor(
+                view, retry["descriptor_id"], retry["descriptor_generation"]
+            )
+            if retry.get("principal_id") != view["principal_id"]:
+                raise ForgeError("projection descriptor changed")
             write_receiver_marker(root, retry_id, os.getppid())
             retry.pop("source_error", None)
             save_state(root, state)
@@ -132,10 +139,12 @@ def pre_receive(root: Path, name: str, updates: bytes) -> None:
             raise ForgeError("view has pending projection work; retry after synchronization")
         hook_env = os.environ.copy()
         canonical_old, canonical_new, mappings, transaction_objects = prepare_submission(
-            root, name, view, old, new, hook_env
+            root, name, view, descriptor, old, new, hook_env
         )
         try:
-            validate_change_ids(state, name, view["canonical_ref"], mappings)
+            validate_change_ids(
+                state, view["principal_id"], view["canonical_ref"], mappings
+            )
             promote_objects(transaction_objects, canonical_repo(root))
         finally:
             shutil.rmtree(transaction_objects, ignore_errors=True)
@@ -146,7 +155,17 @@ def pre_receive(root: Path, name: str, updates: bytes) -> None:
         transaction = {
             "id": txid,
             "view": name,
-            "principal": name,
+            "principal_id": view["principal_id"],
+            "descriptor_id": descriptor["id"],
+            "descriptor_generation": view["descriptor_generation"],
+            "target_descriptors": {
+                other_name: {
+                    "descriptor_id": other["descriptor_id"],
+                    "descriptor_generation": other["descriptor_generation"],
+                }
+                for other_name, other in sorted(state["views"].items())
+                if other_name != name
+            },
             "canonical_ref": view["canonical_ref"],
             "projected_ref": view["projected_ref"],
             "canonical_frontier_old": view["canonical_frontier"],
@@ -171,7 +190,9 @@ def pre_receive(root: Path, name: str, updates: bytes) -> None:
             root, state, canonical_old, canonical_new, create_event=False
         )
         checkpoint(root, "source.canonical_ref_published")
-        reserve_change_ids(state, name, view["canonical_ref"], mappings)
+        reserve_change_ids(
+            state, view["principal_id"], view["canonical_ref"], mappings
+        )
         transaction["status"] = "canonical_committed"
         from outbox import enqueue_canonical_committed
 

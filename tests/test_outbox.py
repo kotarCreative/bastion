@@ -16,6 +16,10 @@ def transaction(identifier: str, sequence: int, views: list[str]) -> dict:
         "id": identifier,
         "sequence": sequence,
         "canonical_new": f"canonical-{sequence}",
+        "target_descriptors": {
+            view: {"descriptor_id": f"vdesc-{view}", "descriptor_generation": 1}
+            for view in views
+        },
         "pending_views": views.copy(),
         "status": "fanout_pending",
     }
@@ -34,6 +38,23 @@ class OutboxTest(unittest.TestCase):
         self.assertTrue(
             all(event["status"] == "dispatched" for event in state["outbox"].values())
         )
+
+    def test_events_copy_target_assignments_into_jobs(self) -> None:
+        tx = transaction("tx-1", 1, ["alice"])
+        state = {"transactions": {"tx-1": tx}, "outbox": {}, "projection_jobs": {}}
+        enqueue_canonical_committed(state, tx, ready=True)
+        event = next(iter(state["outbox"].values()))
+        self.assertEqual(
+            {
+                "alice": {"descriptor_id": "vdesc-alice", "descriptor_generation": 1}
+            },
+            event["target_descriptors"],
+        )
+        self.assertEqual(["alice"], event["target_views"])
+        dispatch_outbox(state)
+        job = state["projection_jobs"]["project:tx-1:alice"]
+        self.assertEqual("vdesc-alice", job["descriptor_id"])
+        self.assertEqual(1, job["descriptor_generation"])
 
     def test_jobs_are_ordered_independently_per_view(self) -> None:
         first = transaction("tx-1", 1, ["alice", "bob"])

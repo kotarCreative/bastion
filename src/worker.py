@@ -7,6 +7,7 @@ import time
 import uuid
 from pathlib import Path
 
+import identity
 from errors import ForgeError
 from failpoints import checkpoint
 from layout import canonical_repo
@@ -49,6 +50,12 @@ def claim_projection_job(root: Path, now: float | None = None) -> dict | None:
                     job["next_attempt_at"] = now + RETRY_SECONDS
                     excluded.add(job["id"])
                     continue
+                if (
+                    view.get("descriptor_id") != job.get("descriptor_id")
+                    or view.get("descriptor_generation")
+                    != job.get("descriptor_generation")
+                ):
+                    raise ForgeError("projection descriptor changed")
                 if job["canonical_to"] == view["canonical_frontier"] or is_ancestor(
                     canonical_repo(root), job["canonical_to"], view["canonical_frontier"]
                 ):
@@ -72,6 +79,9 @@ def claim_projection_job(root: Path, now: float | None = None) -> dict | None:
                 job["expected_projected_tip"] = view["projected_tip"]
                 snapshot = copy.deepcopy(job)
                 snapshot["view_state"] = copy.deepcopy(view)
+                snapshot["descriptor"] = copy.deepcopy(
+                    identity.descriptor_for_view(state, job["view"])
+                )
                 save_state(root, state)
                 claimed_snapshot = snapshot
                 break
@@ -114,6 +124,15 @@ def complete_projection_job(
             job["next_attempt_at"] = now + RETRY_SECONDS
             save_state(root, state)
             return
+        view = state["views"][job["view"]]
+        identity.require_matching_descriptor(
+            view, job["descriptor_id"], job["descriptor_generation"]
+        )
+        if (
+            plan.get("descriptor_id") != job.get("descriptor_id")
+            or plan.get("descriptor_generation") != job.get("descriptor_generation")
+        ):
+            raise ForgeError("projection descriptor changed")
         job["status"] = "ready"
         job["plan"] = plan
         save_state(root, state)
@@ -142,6 +161,7 @@ def run_projection_job(root: Path, now: float | None = None) -> bool:
             root,
             claimed["view"],
             claimed["view_state"],
+            claimed["descriptor"],
             claimed["canonical_to"],
         )
         complete_projection_job(root, claimed, plan, now=now)

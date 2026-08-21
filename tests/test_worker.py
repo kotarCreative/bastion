@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 import forge
+from tests import identity_harness
 from service import build_projection_plan
 from state import save_state
 from worker import (
@@ -47,8 +48,8 @@ class WorkerTest(unittest.TestCase):
         command("git", "commit", "-q", "-m", "initial", cwd=source)
         self.forge = self.root / "forge"
         forge.init_forge(self.forge, source, "main")
-        forge.add_view(self.forge, "alice", ["shared"], ["shared"], "main")
-        forge.add_view(self.forge, "bob", ["shared"], ["shared"], "main")
+        identity_harness.add_view(self.forge, "alice", ["shared"], ["shared"], "main")
+        identity_harness.add_view(self.forge, "bob", ["shared"], ["shared"], "main")
 
         canonical = forge.canonical_repo(self.forge)
         admin = self.root / "admin"
@@ -63,10 +64,20 @@ class WorkerTest(unittest.TestCase):
         state = self.state()
         canonical_tip = forge.ref(canonical, "refs/heads/main")
         alice = state["views"]["alice"]
+        bob = state["views"]["bob"]
+        targets = {
+            "bob": {
+                "descriptor_id": bob["descriptor_id"],
+                "descriptor_generation": bob["descriptor_generation"],
+            }
+        }
         tx = {
             "id": "worker-tx",
             "view": "alice",
-            "principal": "alice",
+            "principal_id": alice["principal_id"],
+            "descriptor_id": alice["descriptor_id"],
+            "descriptor_generation": alice["descriptor_generation"],
+            "target_descriptors": targets,
             "sequence": 1,
             "canonical_ref": alice["canonical_ref"],
             "projected_ref": alice["projected_ref"],
@@ -88,6 +99,7 @@ class WorkerTest(unittest.TestCase):
                 "sequence": 1,
                 "canonical_to": canonical_tip,
                 "target_views": ["bob"],
+                "target_descriptors": targets,
                 "status": "pending",
             }
         }
@@ -106,6 +118,7 @@ class WorkerTest(unittest.TestCase):
             self.forge,
             claimed["view"],
             claimed["view_state"],
+            claimed["descriptor"],
             claimed["canonical_to"],
         )
         complete_projection_job(self.forge, claimed, plan)
@@ -125,6 +138,7 @@ class WorkerTest(unittest.TestCase):
             self.forge,
             claimed["view"],
             claimed["view_state"],
+            claimed["descriptor"],
             claimed["canonical_to"],
         )
         remote = forge.view_repo(self.forge, "bob")
@@ -172,6 +186,7 @@ class WorkerTest(unittest.TestCase):
             self.forge,
             claimed["view"],
             claimed["view_state"],
+            claimed["descriptor"],
             claimed["canonical_to"],
         )
         complete_projection_job(self.forge, claimed, plan)
@@ -204,6 +219,7 @@ class WorkerTest(unittest.TestCase):
             self.forge,
             claimed["view"],
             claimed["view_state"],
+            claimed["descriptor"],
             claimed["canonical_to"],
         )
         canonical = forge.canonical_repo(self.forge)
@@ -219,6 +235,7 @@ class WorkerTest(unittest.TestCase):
             self.forge,
             claimed["view"],
             claimed["view_state"],
+            claimed["descriptor"],
             claimed["canonical_to"],
         )
         state = self.state()
@@ -226,6 +243,10 @@ class WorkerTest(unittest.TestCase):
         state["transactions"]["active-bob"] = {
             "id": "active-bob",
             "view": "bob",
+            "principal_id": view["principal_id"],
+            "descriptor_id": view["descriptor_id"],
+            "descriptor_generation": view["descriptor_generation"],
+            "target_descriptors": {},
             "canonical_ref": view["canonical_ref"],
             "projected_ref": view["projected_ref"],
             "canonical_old": claimed["canonical_to"],

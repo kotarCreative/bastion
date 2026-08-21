@@ -16,16 +16,25 @@ from invariants import check_invariants
 from git import git, output, ref, run
 from layout import ZERO_OID, canonical_repo, view_repo
 from protocol import post_receive, pre_receive
-from service import add_view as _add_view
-from service import init_forge, sync_view, update_canonical_ref
+from service import (
+    add_principal as _add_principal,
+    add_role as _add_role,
+    add_service_account as _add_service_account,
+    add_team as _add_team,
+    add_view as _add_view,
+    bind_role as _bind_role,
+    init_forge,
+    sync_view,
+    update_canonical_ref,
+)
 from state import save_state
 from worker import drain_projection_jobs
 
 
 def add_view(
-    root: Path, name: str, read: list[str], write: list[str], branch: str
+    root: Path, name: str, principal: str, branch: str
 ) -> None:
-    _add_view(root, name, read, write, branch, Path(__file__))
+    _add_view(root, name, principal, branch, Path(__file__))
 
 
 def new_change_id() -> str:
@@ -39,11 +48,32 @@ def parser() -> argparse.ArgumentParser:
     init.add_argument("root", type=Path)
     init.add_argument("source", type=Path)
     init.add_argument("--branch", default="main")
+    principal = commands.add_parser("add-principal")
+    principal.add_argument("root", type=Path)
+    principal.add_argument("principal")
+    service = commands.add_parser("add-service-account")
+    service.add_argument("root", type=Path)
+    service.add_argument("service")
+    service.add_argument("--owner", required=True)
+    team = commands.add_parser("add-team")
+    team.add_argument("root", type=Path)
+    team.add_argument("team")
+    team.add_argument("--member", action="append", default=[])
+    role = commands.add_parser("add-role")
+    role.add_argument("root", type=Path)
+    role.add_argument("role")
+    role.add_argument("--read", action="append", default=[])
+    role.add_argument("--write", action="append", default=[])
+    bind = commands.add_parser("bind-role")
+    bind.add_argument("root", type=Path)
+    bind.add_argument("role")
+    subjects = bind.add_mutually_exclusive_group(required=True)
+    subjects.add_argument("--principal")
+    subjects.add_argument("--team")
     add = commands.add_parser("add-view")
     add.add_argument("root", type=Path)
     add.add_argument("name")
-    add.add_argument("--read", action="append", required=True)
-    add.add_argument("--write", action="append", default=[])
+    add.add_argument("--principal", required=True)
     add.add_argument("--branch", default="main")
     sync = commands.add_parser("sync")
     sync.add_argument("root", type=Path)
@@ -58,6 +88,8 @@ def parser() -> argparse.ArgumentParser:
     canonical.add_argument("root", type=Path)
     canonical.add_argument("expected")
     canonical.add_argument("new")
+    migrate = commands.add_parser("migrate-identities")
+    migrate.add_argument("root", type=Path)
     pre = commands.add_parser("pre-receive")
     pre.add_argument("root", type=Path)
     pre.add_argument("name")
@@ -79,8 +111,21 @@ def main() -> int:
     try:
         if args.command == "init":
             init_forge(args.root, args.source, args.branch)
+        elif args.command == "add-principal":
+            _add_principal(args.root, args.principal)
+        elif args.command == "add-service-account":
+            _add_service_account(args.root, args.service, args.owner)
+        elif args.command == "add-team":
+            _add_team(args.root, args.team, args.member)
+        elif args.command == "add-role":
+            _add_role(args.root, args.role, args.read, args.write)
+        elif args.command == "bind-role":
+            if args.principal is not None:
+                _bind_role(args.root, args.role, "principal", args.principal)
+            else:
+                _bind_role(args.root, args.role, "team", args.team)
         elif args.command == "add-view":
-            add_view(args.root, args.name, args.read, args.write, args.branch)
+            add_view(args.root, args.name, args.principal, args.branch)
         elif args.command == "sync":
             sync_view(args.root, args.name)
         elif args.command == "check":
@@ -91,6 +136,10 @@ def main() -> int:
             drain_projection_jobs(args.root, args.limit)
         elif args.command == "update-canonical":
             update_canonical_ref(args.root, args.expected, args.new)
+        elif args.command == "migrate-identities":
+            from migration import migrate_identities
+
+            migrate_identities(args.root)
         elif args.command == "pre-receive":
             pre_receive(args.root, args.name, sys.stdin.buffer.read())
         elif args.command == "post-receive":

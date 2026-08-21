@@ -22,6 +22,7 @@ from typing import Any, Iterator
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import forge
+from tests import identity_harness
 import worker
 from errors import ForgeError
 from git import clean_env
@@ -110,10 +111,10 @@ class Fixture:
             target.write_bytes(contents)
         self._commit(self.source, "initial fixture", 1_700_000_000)
         forge.init_forge(self.forge, self.source, "main")
-        forge.add_view(
+        identity_harness.add_view(
             self.forge, "alice", ["shared", "team-a"], ["shared", "team-a"], "main"
         )
-        forge.add_view(
+        identity_harness.add_view(
             self.forge, "bob", ["shared", "team-b"], ["shared", "team-b"], "main"
         )
         self.alice = self._clone("alice")
@@ -548,11 +549,13 @@ def authoritative_snapshot(root: Path, losing: tuple[str, str, str] | None = Non
                 rev.get("projected"),
                 rev.get("canonical"),
                 rev.get("kind"),
+                rev.get("descriptor_id"),
+                rev.get("descriptor_generation"),
             )
             for rev in change.get("revisions", [])
         ]
         snapshot["changes"][change_id] = {
-            "owner": change.get("owner"),
+            "owner": change.get("owner_principal_id"),
             "canonical_ref": change.get("canonical_ref"),
             "revisions": sorted(revisions),
         }

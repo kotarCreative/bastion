@@ -5,9 +5,11 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import shutil
 import sys
 from pathlib import Path
 
+import identity
 from errors import ForgeError
 from failpoints import checkpoint
 from git import clean_env, git, output, ref, run, tree_entries
@@ -21,7 +23,7 @@ from state import (
     save_state,
     source_publication_pending,
 )
-from validation import normalize_prefix, validate_view_name
+from validation import validate_view_name
 
 
 def init_forge(root: Path, source: Path, branch: str) -> None:
@@ -45,8 +47,13 @@ def init_forge(root: Path, source: Path, branch: str) -> None:
     save_state(
         root,
         {
-            "version": 1,
+            "version": 2,
             "canonical_branch": branch,
+            "principals": {},
+            "teams": {},
+            "roles": {},
+            "role_bindings": {},
+            "view_descriptors": {},
             "views": {},
             "transactions": {},
             "changes": {},
@@ -84,6 +91,7 @@ def sync_view_locked(
     view = state["views"].get(name)
     if not view:
         raise ForgeError(f"unknown view: {name}")
+    descriptor = identity.descriptor_for_view(state, name)
     if check_active and source_publication_pending(root, state, name):
         raise ForgeError("view has an active receive transaction")
     if check_active and has_unconfirmed_source(state):
@@ -93,7 +101,7 @@ def sync_view_locked(
 
         if view_has_unfinished_jobs(state, name):
             raise ForgeError("view has pending projection work")
-    plan = build_projection_plan(root, name, view)
+    plan = build_projection_plan(root, name, view, descriptor)
     publish_projection_plan(root, state, plan)
 
 
@@ -101,6 +109,7 @@ def build_projection_plan(
     root: Path,
     name: str,
     view: dict,
+    descriptor: dict,
     canonical_tip: str | None = None,
 ) -> dict:
     canonical = canonical_repo(root)
@@ -128,12 +137,18 @@ def build_projection_plan(
         frontier,
         canonical_tip,
         old_tip,
-        view["read"],
+        descriptor,
     )
+    generation = view["descriptor_generation"]
+    for anchor in anchors.values():
+        anchor["descriptor_id"] = descriptor["id"]
+        anchor["descriptor_generation"] = generation
     return {
         "view": name,
         "canonical_ref": view["canonical_ref"],
         "projected_ref": view["projected_ref"],
+        "descriptor_id": descriptor["id"],
+        "descriptor_generation": generation,
         "old_frontier": view["canonical_frontier"],
         "new_frontier": frontier,
         "old_tip": old_tip,
@@ -147,6 +162,9 @@ def publish_projection_plan(root: Path, state: dict, plan: dict) -> None:
     view = state["views"].get(name)
     if not view:
         raise ForgeError(f"unknown view: {name}")
+    identity.require_matching_descriptor(
+        view, plan["descriptor_id"], plan["descriptor_generation"]
+    )
     if view["canonical_frontier"] != plan["old_frontier"] or view[
         "projected_tip"
     ] != plan["old_tip"]:
@@ -187,24 +205,52 @@ def publish_projection_plan(root: Path, state: dict, plan: dict) -> None:
                 projected_oid,
                 anchor["canonical"],
                 "synthetic",
+                anchor["descriptor_id"],
+                anchor["descriptor_generation"],
             )
     view["projected_tip"] = plan["new_tip"]
     view["canonical_frontier"] = plan["new_frontier"]
 
 
+def _catalog_operation(root: Path, operation) -> None:
+    with locked(root) as state:
+        operation(state)
+        save_state(root, state)
+
+
+def add_principal(root: Path, principal_id: str) -> None:
+    _catalog_operation(root, lambda state: identity.add_principal(state, principal_id))
+
+
+def add_service_account(root: Path, service_id: str, owner_principal_id: str) -> None:
+    _catalog_operation(
+        root,
+        lambda state: identity.add_service_account(state, service_id, owner_principal_id),
+    )
+
+
+def add_team(root: Path, team_id: str, members: list[str]) -> None:
+    _catalog_operation(root, lambda state: identity.add_team(state, team_id, members))
+
+
+def add_role(root: Path, role_id: str, read: list[str], write: list[str]) -> None:
+    _catalog_operation(root, lambda state: identity.add_role(state, role_id, read, write))
+
+
+def bind_role(root: Path, role_id: str, subject_kind: str, subject_id: str) -> None:
+    _catalog_operation(
+        root, lambda state: identity.bind_role(state, role_id, subject_kind, subject_id)
+    )
+
+
 def add_view(
     root: Path,
     name: str,
-    read: list[str],
-    write: list[str],
+    principal_id: str,
     branch: str,
     entrypoint: Path,
 ) -> None:
     validate_view_name(name)
-    read = sorted(set(normalize_prefix(value) for value in read))
-    write = sorted(set(normalize_prefix(value) for value in write))
-    if not read:
-        raise ForgeError("a view needs at least one readable path prefix")
     with locked(root) as state:
         if name in state["views"]:
             raise ForgeError(f"view already exists: {name}")
@@ -212,28 +258,44 @@ def add_view(
             raise ForgeError(
                 "this experiment supports the configured canonical branch only"
             )
+        descriptor = identity.effective_descriptor(
+            state, principal_id, f"refs/heads/{branch}"
+        )
+        if not descriptor["read"]:
+            raise ForgeError("principal has no effective readable path")
+        for other in state["views"].values():
+            if other["principal_id"] == principal_id and (
+                other["descriptor_id"] != descriptor["id"]
+            ):
+                raise ForgeError("principal views must share one effective descriptor")
         destination = view_repo(root, name)
+        existed_before = destination.exists()
         run("git", "init", "--bare", "-q", "-b", branch, str(destination))
-        for key, value in (
-            ("receive.denyDeletes", "true"),
-            ("receive.denyNonFastForwards", "true"),
-            ("uploadpack.allowAnySHA1InWant", "false"),
-            ("uploadpack.allowReachableSHA1InWant", "false"),
-            ("uploadpack.allowTipSHA1InWant", "false"),
-        ):
-            git(destination, "config", key, value)
-        state["views"][name] = {
-            "principal": name,
-            "canonical_ref": f"refs/heads/{branch}",
-            "projected_ref": f"refs/heads/{branch}",
-            "read": read,
-            "write": write,
-            "canonical_frontier": ZERO_OID,
-            "projected_tip": ZERO_OID,
-            "anchors": {},
-        }
-        install_hooks(root, name, entrypoint)
-        sync_view_locked(root, state, name)
+        try:
+            for key, value in (
+                ("receive.denyDeletes", "true"),
+                ("receive.denyNonFastForwards", "true"),
+                ("uploadpack.allowAnySHA1InWant", "false"),
+                ("uploadpack.allowReachableSHA1InWant", "false"),
+                ("uploadpack.allowTipSHA1InWant", "false"),
+            ):
+                git(destination, "config", key, value)
+            state["views"][name] = {
+                "principal_id": principal_id,
+                "descriptor_id": descriptor["id"],
+                "descriptor_generation": 1,
+                "canonical_ref": f"refs/heads/{branch}",
+                "projected_ref": f"refs/heads/{branch}",
+                "canonical_frontier": ZERO_OID,
+                "projected_tip": ZERO_OID,
+                "anchors": {},
+            }
+            install_hooks(root, name, entrypoint)
+            sync_view_locked(root, state, name)
+        except Exception:
+            if not existed_before:
+                shutil.rmtree(destination, ignore_errors=True)
+            raise
         save_state(root, state)
 
 
@@ -261,6 +323,16 @@ def validate_canonical_update(canonical: Path, expected: str, new: str) -> None:
                 raise ForgeError("canonical update contains an unsupported tree entry")
 
 
+def current_target_assignments(state: dict) -> dict[str, dict]:
+    return {
+        name: {
+            "descriptor_id": view["descriptor_id"],
+            "descriptor_generation": view["descriptor_generation"],
+        }
+        for name, view in sorted(state["views"].items())
+    }
+
+
 def update_canonical_ref_locked(
     root: Path,
     state: dict,
@@ -286,6 +358,7 @@ def update_canonical_ref_locked(
             "canonical_ref": canonical_ref,
             "canonical_old": expected,
             "canonical_new": new,
+            "target_descriptors": current_target_assignments(state),
             "pending_views": sorted(state["views"]),
             "status": "prepared",
         }
