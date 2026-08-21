@@ -25,14 +25,28 @@ def add_view(
     read: list[str],
     write: list[str],
     branch: str = "main",
+    principal: str | None = None,
 ) -> None:
-    """Create principal ``name`` with a dedicated role and bind one view."""
+    """Materialize one view.
+
+    With ``principal`` unset this provisions a dedicated principal named
+    ``name`` plus one immutable role from the prefix lists.  With an
+    explicit ``principal`` the view binds that existing identity and no
+    catalog records are touched.
+    """
+    from errors import ForgeError
     from service import add_principal, add_role, bind_role
 
     root = Path(root)
-    add_principal(root, name)
-    if read or write:
-        role_id = f"legacy-{name}"
-        add_role(root, role_id, list(read), list(write))
-        bind_role(root, role_id, "principal", name)
-    _service_add_view(root, name, name, branch, ENTRYPOINT)
+    owner = principal or name
+    if principal is None:
+        try:
+            add_principal(root, name)
+        except ForgeError as error:
+            if "already exists" not in str(error):
+                raise
+        if read or write:
+            role_id = f"legacy-{name}"
+            add_role(root, role_id, list(read), list(write))
+            bind_role(root, role_id, "principal", name)
+    _service_add_view(root, name, owner, branch, ENTRYPOINT)

@@ -9,7 +9,7 @@ from pathlib import Path
 import identity
 from errors import ForgeError
 from invariants import check_invariants, check_loaded, collect_layout
-from state import load_state, locked, save_state
+from state import load_state, locked_unversioned, save_state
 
 
 def _legacy_role_id(view_name: str) -> str:
@@ -115,14 +115,13 @@ def _build_candidate(state: dict) -> dict:
 
     for identifier, transaction in sorted(candidate["transactions"].items()):
         targets: dict[str, dict] = {}
-        if transaction.get("kind") == "canonical_update":
-            target_names = sorted(transaction["pending_views"])
+        # Use the corresponding event's immutable target list when one
+        # exists; pending views are emptied as fanout completes.
+        event = events_by_tx.get(identifier)
+        if event is not None:
+            target_names = sorted(event["target_views"])
         else:
-            event = events_by_tx.get(identifier)
-            if event is not None:
-                target_names = sorted(event["target_views"])
-            else:
-                target_names = sorted(transaction["pending_views"])
+            target_names = sorted(transaction["pending_views"])
         for name in target_names:
             targets[name] = assignment_for(name)
         if transaction.get("kind") != "canonical_update":
@@ -133,10 +132,9 @@ def _build_candidate(state: dict) -> dict:
         transaction["target_descriptors"] = targets
 
     for event in candidate["outbox"].values():
-        event["target_descriptors"] = copy.deepcopy(
-            events_by_tx[event["transaction_id"]]["target_descriptors"]
-        )
-        event["target_views"] = sorted(event["target_descriptors"])
+        targets = candidate["transactions"][event["transaction_id"]]["target_descriptors"]
+        event["target_descriptors"] = copy.deepcopy(targets)
+        event["target_views"] = sorted(targets)
 
     for job in candidate["projection_jobs"].values():
         job["descriptor_id"], job["descriptor_generation"] = assignments[job["view"]]
@@ -156,7 +154,7 @@ def _build_candidate(state: dict) -> dict:
 
 def migrate_identities(root: Path) -> None:
     """Upgrade a healthy quiescent version-1 forge in one state replacement."""
-    with locked(root, recoverer=lambda _root, _state: None):
+    with locked_unversioned(root):
         state = load_state(root)
         version = state.get("version")
         if version == 2:

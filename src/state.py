@@ -340,3 +340,11 @@ def locked(
             raise ForgeError(f"unsupported forge state version: {version!r}")
         recoverer(root, state)
         yield state
+
+
+@contextlib.contextmanager
+def locked_unversioned(root: Path) -> Iterator[dict]:
+    """Exclusive state lock without a schema-version gate (migration only)."""
+    with (root / "state.lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield load_state(root)
