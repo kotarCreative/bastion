@@ -37,9 +37,33 @@ Each view is a valid bare Git repository with its own refs and authorization-
 safe object closure. It has no alternate pointing to the canonical object
 database.
 
-The local prototype treats a view name as both the permission-view identity and
-the submitting principal. Production should separate users, teams, roles, and
-immutable view descriptors.
+## Identity Model
+
+The physical view name, the submitting principal, and the authorization policy
+are three separate concepts:
+
+| Concept | Meaning |
+|---|---|
+| Principal | Stable user or service-account identity; submits pushes and owns `Change-Id`s |
+| Team | Immutable direct set of principals; grants nothing by itself |
+| Role | Immutable normalized read/write prefix grants |
+| Role binding | Immutable assignment of one role to a principal or team |
+| Effective view descriptor | Content-addressed snapshot of provenance plus effective read/write areas |
+| Physical view | One bare repository bound to exactly one principal and descriptor generation |
+
+Resolution is deterministic: direct teams, applicable bindings, and roles sort
+lexicographically; effective read is the component-aware minimized union of
+role reads; effective write is that union intersected with effective read. A
+descriptor's ID is the SHA-256 of its canonical JSON payload under a fixed
+domain separator. Two views of one principal share one descriptor.
+
+Every authorization-sensitive record (source and administrative transactions,
+outbox events, projection jobs, retained plans, anchors, logical revisions)
+carries `descriptor_id` and `descriptor_generation` fields captured before any
+canonical compare-and-swap. Publication fails closed with
+`projection descriptor changed` on any mismatch. There is currently no
+operation that mutates a principal's resolution after it materializes a view;
+policy transitions belong to later roadmap work.
 
 ## Projection Rules
 
@@ -119,6 +143,7 @@ The implementation is under `src/`.
 
 | Module | Responsibility |
 |---|---|
+| `identity.py` | Identifier rules, immutable catalog, prefix algebra, descriptor resolution |
 | `validation.py` | Pure path, ref, metadata, and tree-transition decisions |
 | `git.py` | Git process, object, tree, commit, and quarantine adapter |
 | `projection.py` | Tree filtering, hidden-only elision, and synthetic commits |
@@ -144,6 +169,7 @@ projection runs outside the global state lock.
 - no force pushes or ref deletion/creation
 - no gitlinks/submodule updates
 - readable and writable positive path prefixes only
+- immutable generation-1 descriptors; no policy mutation or revocation yet
 - local bare-repository transport and development identity model
 - JSON state and a filesystem lock
 - direct writes to `canonical.git` are unsupported

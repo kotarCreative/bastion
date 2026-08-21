@@ -49,10 +49,14 @@ confirm source publication
 activate canonical.committed event
 ```
 
-The outbox event exists durably when canonical commitment is recorded, but it
-remains blocked until source ref publication is confirmed. This prevents a
-later transaction or manual synchronization from exposing an unconfirmed
-submission to another view.
+The prepared transaction persists the source principal and descriptor plus the
+complete target descriptor map before the canonical compare-and-swap. The
+outbox event exists durably when canonical commitment is recorded, copies that
+exact target map, and remains blocked until source ref publication is
+confirmed. Dispatch stamps one captured assignment onto each per-view job.
+This prevents a later transaction or manual synchronization from exposing an
+unconfirmed submission to another view, and prevents any worker from publishing
+under permissions other than those captured before commitment.
 
 If source publication is not confirmed, the transaction becomes
 `source_unconfirmed`. Recovery never moves the source ref on the client's
@@ -61,7 +65,9 @@ source publication without creating another canonical commit.
 
 An unconfirmed source transaction is a repository-wide publication barrier.
 No later canonical submission, manual synchronization, or projection worker
-may cross it.
+may cross it. An exact retry revalidates that its view still carries the
+transaction's recorded descriptor assignment; recovery replays with captured
+descriptors and never resolves roles again.
 
 ## Transaction States
 
@@ -115,14 +121,20 @@ pending -> running -> ready -> completed
 
 A worker:
 
-1. Claims a job and lease while holding the state lock.
-2. Captures the expected view frontier and projected tip.
+1. Claims a job and lease while holding the state lock, requiring the view's
+   current descriptor assignment to equal the job's captured assignment.
+2. Captures the expected view frontier, projected tip, and descriptor record.
 3. Releases the lock.
-4. Builds a deterministic projection plan and Git objects.
-5. Persists the ready plan before ref publication.
-6. Rechecks source activity, view state, and canonical ancestry.
+4. Builds a deterministic projection plan and Git objects under that record.
+5. Persists the ready plan (descriptor-bound) before ref publication.
+6. Rechecks source activity, view state, canonical ancestry, and descriptor
+   equality across plan, job, and live view before publication.
 7. CAS updates or adopts the projected ref.
-8. Persists anchors, `Change-Id` representations, and completion.
+8. Persists anchors, `Change-Id` representations, and completion with the
+   same descriptor provenance.
+
+Any mismatch fails closed with `projection descriptor changed` before ref
+movement.
 
 If the process crashes after moving a projected ref but before state
 persistence, the ready plan remains durable. A retry adopts the already-moved

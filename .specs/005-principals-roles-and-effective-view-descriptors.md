@@ -2,9 +2,14 @@
 
 ## Status
 
-Proposed.
+Implemented for state schema version 2. Principals, service accounts, teams,
+roles, bindings, content-addressed descriptors, descriptor capture across
+transactions, events, jobs, plans, anchors, and revisions, principal-based
+`Change-Id` ownership, the version-2 checker, and the quiescent migration are
+present with focused pure, integration, and migration tests including process-
+crash atomicity at both state-save failpoints.
 
-This specification covers the first incomplete item in Phase 2 of
+This specification covered the first incomplete item in Phase 2 of
 `ROADMAP.md`:
 
 > Define principals, teams, roles, service accounts, and immutable effective

@@ -2,6 +2,9 @@
 
 ## Status
 
+Version-1 assumptions remain the legacy checker contract; version 2 extends
+this specification (see `.specs/005-principals-roles-and-effective-view-descriptors.md`).
+
 Implemented for the version-1 forge. The checker and its focused healthy,
 pending, retry, source-unconfirmed, read-only, and selected corruption tests
 are present. The full corruption matrix described by this specification remains

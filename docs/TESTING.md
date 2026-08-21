@@ -13,7 +13,10 @@ Git repositories, hooks, clones, fetches, rebases, and pushes.
 
 | Test module | Coverage |
 |---|---|
-| `tests/test_validation.py` | Prefix matching, authorization, modes, tree effects, refs, and `Change-Id` parsing |
+| `tests/test_identity.py` | Identifier rules, prefix algebra, immutable catalog, resolution, independent descriptor hashing, freeze rules |
+| `tests/test_identity_integration.py` | Principal/view separation, shared descriptors, cross-view `Change-Id` continuation, service accounts, team grants, environment resistance |
+| `tests/test_identity_migration.py` | Quiescent v1-to-v2 migration, idempotency, non-quiescence rejection, v1 runtime lockout, kill-during-save atomicity |
+| `tests/test_validation.py` | Prefix matching, descriptor authorization, modes, tree effects, refs, and `Change-Id` parsing |
 | `tests/test_git_adapter.py` | Git environment isolation |
 | `tests/test_tree_operations.py` | Directed source and administrative delete, rename, mode, symlink, directory-boundary, and rejection behavior |
 | `tests/test_unusual_paths.py` | Raw non-UTF-8, tab, newline, near-component-limit, and over-4096-byte path lifecycles |
@@ -77,9 +80,10 @@ trace:
 
 `tests/state_machine.py` also exposes `replay_scenario(seed, operations)` for
 direct execution of a recorded trace without selecting new random operations.
-The version-1 permission-change operation only adds one of the fixed immutable
-view descriptors. It does not mutate, revoke, expand, or contract any existing
-view policy, so it is not revocation coverage.
+The permission-change operation only adds one of the fixed immutable views,
+each backed by its own principal, role, and binding. It does not mutate,
+revoke, expand, or contract any existing view policy, so it is not revocation
+coverage.
 
 ## Demonstrated Behavior
 
@@ -103,7 +107,9 @@ The tests currently demonstrate:
 - byte-preserving source and administrative projection of non-UTF-8, tab, newline, and long paths;
 - OID-only closure validation, including quarantined extra-object rejection;
 - shared-visible modify/modify, delete/modify, and mode/content conflicts serialized through fetch/rebase;
-- rejection immutability for force pushes, stale updates, merge commits, non-linear history, unauthorized paths, unsupported entries, structural conflicts, duplicate `Change-Id` ownership, administrative validation failures, and sync barriers.
+- rejection immutability for force pushes, stale updates, merge commits, non-linear history, unauthorized paths, unsupported entries, structural conflicts, duplicate `Change-Id` ownership, administrative validation failures, and sync barriers;
+- principal-based identity: two views per principal share one descriptor and fanout excludes only the physical source; service accounts own their changes; owners gain no claim through ownership; environment variables cannot override state-selected identity;
+- quiescent version-1 migration that preserves every ref, object ID, hook file, and transaction identifier, rejects non-quiescent forges without byte changes, and survives process kills at either atomic state-save point.
 
 The directed tree modules use `tests/tree_harness.py`, an independent binary Git
 plumbing helper. It reads `ls-tree -rz` records and writes temporary-index trees
@@ -166,16 +172,39 @@ Create a source repository, then initialize a forge:
 python3 forge.py init /tmp/bastion-forge /path/to/source --branch main
 ```
 
-Create overlapping views:
+Create identities, roles, bindings, then bind views to principals:
 
 ```bash
-python3 forge.py add-view /tmp/bastion-forge alice \
-  --read shared --read team-a \
-  --write shared --write team-a
+python3 forge.py add-principal /tmp/bastion-forge alice
+python3 forge.py add-role /tmp/bastion-forge alice-grants \
+  --read shared --read team-a --write shared --write team-a
+python3 forge.py bind-role /tmp/bastion-forge alice-grants --principal alice
 
-python3 forge.py add-view /tmp/bastion-forge bob \
-  --read shared --read team-b \
-  --write shared --write team-b
+python3 forge.py add-principal /tmp/bastion-forge bob
+python3 forge.py add-team /tmp/bastion-forge engineering --member bob
+python3 forge.py add-role /tmp/bastion-forge shared-write --read shared --write shared
+python3 forge.py add-role /tmp/bastion-forge team-b-write --read team-b --write team-b
+python3 forge.py bind-role /tmp/bastion-forge shared-write --principal bob
+python3 forge.py bind-role /tmp/bastion-forge shared-write --team engineering
+python3 forge.py bind-role /tmp/bastion-forge team-b-write --team engineering
+
+python3 forge.py add-view /tmp/bastion-forge alice --principal alice
+python3 forge.py add-view /tmp/bastion-forge bob --principal bob
+```
+
+Roles compose: Bob's effective access is the union of his direct and
+team-bound roles. Once a principal materializes a view, catalog records that
+would alter its resolution are rejected. Service accounts push and own changes
+under their own IDs:
+
+```bash
+python3 forge.py add-service-account /tmp/bastion-forge build-bot --owner alice
+```
+
+Upgrading a legacy version-1 forge is one explicit quiescent command:
+
+```bash
+python3 forge.py migrate-identities /tmp/bastion-forge
 ```
 
 Clone through Git transport rather than local object linking:
@@ -247,6 +276,11 @@ The local durable model is stored at:
 Useful sections are:
 
 ```text
+principals
+teams
+roles
+role_bindings
+view_descriptors
 views
 transactions
 changes

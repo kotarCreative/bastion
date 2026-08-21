@@ -32,9 +32,16 @@ Trusted in the prototype:
 
 - forge code and Git executable;
 - canonical repository storage;
-- view policy configuration;
+- immutable identity catalog and effective view descriptors in state;
 - local state file and lock;
 - canonical update coordinator.
+
+Hooks receive only a physical view name. `pre_receive` derives principal,
+descriptor, and generation from trusted server state; stdin, push options,
+environment variables, commit metadata, and client refs cannot select or
+alter identity. This separates endpoint and principal semantics but provides
+no authentication: Phase 4 must bind an authenticated network identity to an
+allowed endpoint.
 
 Production must add authenticated principals, protected service storage,
 database authorization, and controlled HTTP/SSH endpoints.
@@ -65,10 +72,27 @@ Future shared object storage must authorize every lookup and pack delta base.
 Read revocation cannot remove objects already downloaded by a client. Policy
 changes can only govern future server operations.
 
+## Descriptor-Bound Authorization
+
+Authorization never reads live policy at transaction time. Each view binds one
+immutable generation-1 descriptor; source transactions capture their source and
+all target descriptors before the canonical compare-and-swap, and events, jobs,
+plans, anchors, and revisions copy that exact assignment. Workers revalidate
+assignment equality at claim, plan persistence, publication, adoption, and
+completion, failing closed with `projection descriptor changed` before any ref
+movement. Recovery replays with captured descriptors and refuses to advance a
+source cursor whose view no longer matches its recorded assignment.
+
+Consequence: a worker can never publish under permissions different from those
+that authorized the submission, and independently recomputable descriptor IDs
+let the global checker verify every historical decision without trusting the
+runtime. Revocation between clone and push is not yet implemented; today a
+principal's resolution is frozen once it materializes a view.
+
 ## Write Authorization
 
-The prototype grants positive read and write path prefixes. A changed path must
-match both current read and write scope.
+The prototype grants positive read and write path prefixes through roles. A
+changed path must match both effective read and write scope.
 
 Authorization treats Git as snapshots:
 
@@ -97,9 +121,12 @@ Synthetic commits intentionally expose only:
 They do not copy canonical authors, messages, signatures, or source timestamps.
 Commit count and visible topology remain observable.
 
-`Change-Id` ownership is scoped to the prototype principal/view and canonical
-ref. Another principal cannot claim the same ID. Production needs repository,
-branch, review-state, and role-aware ownership rules.
+`Change-Id` ownership is principal-based and scoped to the canonical ref. Two
+views of one principal may continue the same change; another principal cannot
+claim it, and a service account owns changes under its own ID even when a user
+owns that account. Ownerless IDs introduced by canonical history remain
+unclaimable. Production needs repository, branch, review-state, and role-aware
+ownership rules.
 
 ## HTTP Transport
 

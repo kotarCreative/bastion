@@ -25,7 +25,14 @@ The local prototype currently has:
 - shared-visible modify/modify, delete/modify, and mode/content conflict tests;
 - systematic rejection immutability for every major validation and barrier path;
 - an experimental smart-HTTP endpoint with per-view token authorization,
-  uniform unknown/unauthorized view responses, and protocol v2 support.
+  uniform unknown/unauthorized view responses, and protocol v2 support;
+- state schema version 2 with principals (users and service accounts),
+  immutable direct-member teams, immutable roles and role bindings,
+  deterministic resolution, content-addressed effective view descriptors
+  bound to every view at generation 1, descriptor capture on transactions,
+  events, jobs, plans, anchors, and revisions, principal-based `Change-Id`
+  ownership, a version-2 invariant checker, and an explicit quiescent
+  version-1 migration.
 
 The roadmap is ordered by architectural risk, not product visibility.
 
@@ -60,8 +67,8 @@ Exit criteria:
 
 Goal: replace immutable view prefixes with versioned current authorization.
 
-- Define principals, teams, roles, service accounts, and immutable effective
-  view descriptors.
+- [done] Define principals, teams, roles, service accounts, and immutable
+  effective view descriptors (.specs/005-principals-roles-and-effective-view-descriptors.md).
 - Separate read, create, modify, delete, mode, symlink, branch, merge, and admin
   capabilities.
 - Add policy inheritance and more-specific deny rules.

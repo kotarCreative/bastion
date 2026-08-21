@@ -9,6 +9,10 @@ The prototype demonstrates that this model is feasible with explicit
 restrictions:
 
 - submitted history is linear;
+- principals (users and service accounts), immutable teams, roles, and
+  bindings resolve to content-addressed effective view descriptors;
+- every authorization decision uses the descriptor captured before canonical
+  commitment, verified across events, jobs, plans, anchors, and revisions;
 - accepted commits retain their exact Git IDs in the submitting view;
 - other views receive synthetic commits only for changes visible to them;
 - hidden-only canonical commits do not move an unaffected projected ref;
@@ -42,13 +46,15 @@ Run all tests:
 python3 -m unittest discover -v tests 'test_*.py'
 ```
 
-Create a local forge and one view:
+Create a local forge, one principal, and one view:
 
 ```bash
 python3 forge.py init /tmp/bastion-forge /path/to/source --branch main
-python3 forge.py add-view /tmp/bastion-forge alice \
-  --read shared --read team-a \
-  --write shared --write team-a
+python3 forge.py add-principal /tmp/bastion-forge alice
+python3 forge.py add-role /tmp/bastion-forge alice-grants \
+  --read shared --read team-a --write shared --write team-a
+python3 forge.py bind-role /tmp/bastion-forge alice-grants --principal alice
+python3 forge.py add-view /tmp/bastion-forge alice --principal alice
 git clone --no-local /tmp/bastion-forge/views/alice.git alice
 ```
 
@@ -74,6 +80,12 @@ Views can also be served over HTTP with one token per view:
 python3 forge.py add-token /tmp/bastion-forge alice
 python3 forge.py serve /tmp/bastion-forge --port 8000
 git clone http://alice:TOKEN@127.0.0.1:8000/alice.git alice-http
+```
+
+Legacy version-1 forges upgrade in place while quiescent:
+
+```bash
+python3 forge.py migrate-identities /tmp/bastion-forge
 ```
 
 Run `python3 forge.py --help` for all experimental commands.
