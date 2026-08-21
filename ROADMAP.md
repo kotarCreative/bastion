@@ -40,7 +40,12 @@ The local prototype currently has:
   publish policy-adjustment commits, era-stamped anchors with stale-policy
   retention, explicitly non-revocable downloaded data, admin-gated
   administrative canonical updates, a version-3 invariant checker, and a
-  chained quiescent migration from versions 1 and 2.
+  chained quiescent migration from versions 1 and 2;
+- state schema version 4 with metadata permissions: declared principal
+  author identities enforced at receive time and re-verified by the checker,
+  a fixed future-dating skew window recorded as `received_at` evidence, and
+  the reserved `tag` capability under algorithm `capabilities-v2`, plus a
+  chained migration from versions 1 through 3.
 
 The roadmap is ordered by architectural risk, not product visibility.
 
@@ -84,8 +89,8 @@ Goal: replace immutable view prefixes with versioned current authorization.
 - [done] Implement view expansion and contraction.
 - [done] Define stale policy and stale anchor retention.
 - [done] Keep previously downloaded data explicitly non-revocable.
-- Define metadata permissions for refs, authors, messages, timestamps, topology,
-  tags, and `Change-Id` records.
+- [done] Define metadata permissions for refs, authors, messages, timestamps, topology,
+  tags, and `Change-Id` records (.specs/008-metadata-permissions.md).
 
 Exit criteria:
 

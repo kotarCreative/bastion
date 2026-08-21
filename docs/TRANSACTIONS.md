@@ -157,8 +157,10 @@ python3 forge.py update-canonical FORGE OLD_OID NEW_OID --principal ADMIN
 
 The acting principal's descriptor must hold `admin` coverage of every path
 changed between `OLD_OID` and `NEW_OID`; the actor is recorded on the
-administrative transaction. Both IDs must be immutable full SHA-1 commit IDs
-already present in the canonical object database. The coordinator rejects:
+administrative transaction. Source transactions record their receive time as
+`received_at` for timestamp-bound evidence. Both IDs must be immutable full
+SHA-1 commit IDs already present in the canonical object database. The
+coordinator rejects:
 
 - expected-ref mismatch;
 - non-fast-forward updates;

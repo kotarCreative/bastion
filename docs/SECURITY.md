@@ -93,11 +93,25 @@ projected or downloaded is explicitly non-revocable.
 ## Write Authorization
 
 Roles grant and deny path-scoped capabilities (`read create modify delete mode
-symlink branch merge admin`). For every changed path the forge classifies its
-effects, requires `read` coverage plus each effect capability, and adjudicates
-pointwise: the capability applies only when the longest allow prefix covering
-the path exists and is strictly longer than any deny prefix covering it. Equal
-prefixes or a longer deny win; denies never grant access.
+symlink branch merge admin tag`). For every changed path the forge classifies
+its effects, requires `read` coverage plus each effect capability, and
+adjudicates pointwise: the capability applies only when the longest allow
+prefix covering the path exists and is strictly longer than any deny prefix
+covering it. Equal prefixes or a longer deny win; denies never grant access.
+
+## Metadata Authorization
+
+Principals may declare immutable author email addresses at creation. A
+principal with declared addresses may submit only commits authored by one of
+them; undeclared identities fail closed before any object promotion, and the
+global checker re-verifies every confirmed mapping against the same records.
+Principals without declared addresses remain unrestricted by explicit
+operator choice. Submitted commits must not be dated more than ten minutes
+into the future; receive time is recorded on transactions as `received_at`
+and re-verified by the checker where present. Messages stay byte-exact,
+topology stays linear with `merge` reserved, views expose exactly one
+projected ref with `branch` reserved, tags remain unsupported data-plane
+entries with `tag` reserved, and `Change-Id` ownership rules are unchanged.
 
 Authorization treats Git as snapshots:
 

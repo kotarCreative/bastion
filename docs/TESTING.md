@@ -15,6 +15,7 @@ Git repositories, hooks, clones, fetches, rebases, and pushes.
 |---|---|
 | `tests/test_identity.py` | Identifier rules, prefix algebra, immutable catalog, resolution, independent descriptor hashing, unfrozen catalog rules |
 | `tests/test_capabilities.py` | Capability effect classification and enforcement, longest-match deny adjudication, expansion/contraction transitions with adjustment commits, quiescence gating, admin coverage |
+| `tests/test_metadata.py` | Author identity binding, timestamp skew bounds, email admission and immutability, service-account ownership, reserved `tag` capability resolution |
 | `tests/test_identity_integration.py` | Principal/view separation, shared descriptors, cross-view `Change-Id` continuation, service accounts, team grants, environment resistance |
 | `tests/test_identity_migration.py` | Quiescent chained v1-to-v3 migration, idempotency, non-quiescence rejection, v1 runtime lockout, kill-during-save atomicity |
 | `tests/test_validation.py` | Prefix matching, descriptor authorization, modes, tree effects, refs, and `Change-Id` parsing |

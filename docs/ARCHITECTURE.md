@@ -44,7 +44,7 @@ are three separate concepts:
 
 | Concept | Meaning |
 |---|---|
-| Principal | Stable user or service-account identity; submits pushes and owns `Change-Id`s |
+| Principal | Stable user or service-account identity; submits pushes, owns `Change-Id`s, and may declare author email addresses |
 | Team | Immutable direct set of principals; grants nothing by itself |
 | Role | Immutable capability maps of path-scoped allow and deny prefix grants |
 | Role binding | Immutable assignment of one role to a principal or team |

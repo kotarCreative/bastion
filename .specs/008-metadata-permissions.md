@@ -2,7 +2,7 @@
 
 ## Status
 
-Ready for implementation.
+Implemented for state schema version 4.
 
 This specification closes the final Phase 2 item of `ROADMAP.md`: metadata
 permissions for refs, authors, messages, timestamps, topology, tags, and
