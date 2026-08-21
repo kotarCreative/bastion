@@ -13,9 +13,10 @@ Git repositories, hooks, clones, fetches, rebases, and pushes.
 
 | Test module | Coverage |
 |---|---|
-| `tests/test_identity.py` | Identifier rules, prefix algebra, immutable catalog, resolution, independent descriptor hashing, freeze rules |
+| `tests/test_identity.py` | Identifier rules, prefix algebra, immutable catalog, resolution, independent descriptor hashing, unfrozen catalog rules |
+| `tests/test_capabilities.py` | Capability effect classification and enforcement, longest-match deny adjudication, expansion/contraction transitions with adjustment commits, quiescence gating, admin coverage |
 | `tests/test_identity_integration.py` | Principal/view separation, shared descriptors, cross-view `Change-Id` continuation, service accounts, team grants, environment resistance |
-| `tests/test_identity_migration.py` | Quiescent v1-to-v2 migration, idempotency, non-quiescence rejection, v1 runtime lockout, kill-during-save atomicity |
+| `tests/test_identity_migration.py` | Quiescent chained v1-to-v3 migration, idempotency, non-quiescence rejection, v1 runtime lockout, kill-during-save atomicity |
 | `tests/test_validation.py` | Prefix matching, descriptor authorization, modes, tree effects, refs, and `Change-Id` parsing |
 | `tests/test_git_adapter.py` | Git environment isolation |
 | `tests/test_tree_operations.py` | Directed source and administrative delete, rename, mode, symlink, directory-boundary, and rejection behavior |
@@ -177,13 +178,16 @@ Create identities, roles, bindings, then bind views to principals:
 ```bash
 python3 forge.py add-principal /tmp/bastion-forge alice
 python3 forge.py add-role /tmp/bastion-forge alice-grants \
-  --read shared --read team-a --write shared --write team-a
+  --allow read=shared --allow read=team-a \
+  --allow modify=shared --allow modify=team-a
 python3 forge.py bind-role /tmp/bastion-forge alice-grants --principal alice
 
 python3 forge.py add-principal /tmp/bastion-forge bob
 python3 forge.py add-team /tmp/bastion-forge engineering --member bob
-python3 forge.py add-role /tmp/bastion-forge shared-write --read shared --write shared
-python3 forge.py add-role /tmp/bastion-forge team-b-write --read team-b --write team-b
+python3 forge.py add-role /tmp/bastion-forge shared-write \
+  --allow read=shared --allow create=shared --allow modify=shared
+python3 forge.py add-role /tmp/bastion-forge team-b-write \
+  --allow read=team-b --allow modify=team-b
 python3 forge.py bind-role /tmp/bastion-forge shared-write --principal bob
 python3 forge.py bind-role /tmp/bastion-forge shared-write --team engineering
 python3 forge.py bind-role /tmp/bastion-forge team-b-write --team engineering
@@ -258,7 +262,8 @@ NEW=$(git -C /path/to/admin-clone rev-parse HEAD)
 git -C /path/to/admin-clone push /tmp/bastion-forge/canonical.git \
   "$NEW:refs/staging/admin-update"
 
-python3 forge.py update-canonical /tmp/bastion-forge "$OLD" "$NEW"
+python3 forge.py update-canonical /tmp/bastion-forge "$OLD" "$NEW" \
+  --principal forge-admin
 python3 forge.py work /tmp/bastion-forge
 ```
 

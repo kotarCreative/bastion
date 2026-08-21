@@ -52,10 +52,19 @@ Create a local forge, one principal, and one view:
 python3 forge.py init /tmp/bastion-forge /path/to/source --branch main
 python3 forge.py add-principal /tmp/bastion-forge alice
 python3 forge.py add-role /tmp/bastion-forge alice-grants \
-  --read shared --read team-a --write shared --write team-a
+  --allow read=shared --allow read=team-a \
+  --allow modify=shared --deny read=team-a/private
 python3 forge.py bind-role /tmp/bastion-forge alice-grants --principal alice
 python3 forge.py add-view /tmp/bastion-forge alice --principal alice
 git clone --no-local /tmp/bastion-forge/views/alice.git alice
+```
+
+Roles grant and deny path-scoped capabilities (`read create modify delete mode
+symlink branch merge admin`); more-specific denies override broader allows.
+Catalog additions stay dormant until an explicit transition applies them:
+
+```bash
+python3 forge.py transition-principal /tmp/bastion-forge alice
 ```
 
 Use normal Git inside `alice`:
@@ -82,7 +91,7 @@ python3 forge.py serve /tmp/bastion-forge --port 8000
 git clone http://alice:TOKEN@127.0.0.1:8000/alice.git alice-http
 ```
 
-Legacy version-1 forges upgrade in place while quiescent:
+Legacy version-1 and version-2 forges upgrade in place while quiescent:
 
 ```bash
 python3 forge.py migrate-identities /tmp/bastion-forge

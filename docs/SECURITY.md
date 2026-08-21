@@ -86,13 +86,18 @@ source cursor whose view no longer matches its recorded assignment.
 Consequence: a worker can never publish under permissions different from those
 that authorized the submission, and independently recomputable descriptor IDs
 let the global checker verify every historical decision without trusting the
-runtime. Revocation between clone and push is not yet implemented; today a
-principal's resolution is frozen once it materializes a view.
+runtime. Catalog additions are dormant until a quiescent policy transition;
+revocation then applies to future projections and pushes, while data already
+projected or downloaded is explicitly non-revocable.
 
 ## Write Authorization
 
-The prototype grants positive read and write path prefixes through roles. A
-changed path must match both effective read and write scope.
+Roles grant and deny path-scoped capabilities (`read create modify delete mode
+symlink branch merge admin`). For every changed path the forge classifies its
+effects, requires `read` coverage plus each effect capability, and adjudicates
+pointwise: the capability applies only when the longest allow prefix covering
+the path exists and is strictly longer than any deny prefix covering it. Equal
+prefixes or a longer deny win; denies never grant access.
 
 Authorization treats Git as snapshots:
 

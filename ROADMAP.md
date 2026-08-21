@@ -32,7 +32,15 @@ The local prototype currently has:
   bound to every view at generation 1, descriptor capture on transactions,
   events, jobs, plans, anchors, and revisions, principal-based `Change-Id`
   ownership, a version-2 invariant checker, and an explicit quiescent
-  version-1 migration.
+  version-1 migration;
+- state schema version 3 with path-scoped capabilities (read, create, modify,
+  delete, mode, symlink, branch, merge, admin), additive allow and deny maps
+  adjudicated by longest match, an unfrozen catalog where additions stay
+  dormant until quiescent `transition-principal` policy transitions that
+  publish policy-adjustment commits, era-stamped anchors with stale-policy
+  retention, explicitly non-revocable downloaded data, admin-gated
+  administrative canonical updates, a version-3 invariant checker, and a
+  chained quiescent migration from versions 1 and 2.
 
 The roadmap is ordered by architectural risk, not product visibility.
 
@@ -69,13 +77,13 @@ Goal: replace immutable view prefixes with versioned current authorization.
 
 - [done] Define principals, teams, roles, service accounts, and immutable
   effective view descriptors (.specs/005-principals-roles-and-effective-view-descriptors.md).
-- Separate read, create, modify, delete, mode, symlink, branch, merge, and admin
-  capabilities.
-- Add policy inheritance and more-specific deny rules.
-- Implement read and write revocation between clone and push.
-- Implement view expansion and contraction.
-- Define stale policy and stale anchor retention.
-- Keep previously downloaded data explicitly non-revocable.
+- [done] Separate read, create, modify, delete, mode, symlink, branch, merge, and admin
+  capabilities (.specs/007-capabilities-deny-rules-and-policy-transitions.md).
+- [done] Add policy inheritance and more-specific deny rules.
+- [done] Implement read and write revocation between clone and push.
+- [done] Implement view expansion and contraction.
+- [done] Define stale policy and stale anchor retention.
+- [done] Keep previously downloaded data explicitly non-revocable.
 - Define metadata permissions for refs, authors, messages, timestamps, topology,
   tags, and `Change-Id` records.
 

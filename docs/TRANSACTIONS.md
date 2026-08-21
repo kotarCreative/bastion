@@ -152,11 +152,13 @@ All canonical branch writers must use the forge coordinator. Direct writes to
 Administrative updates use:
 
 ```bash
-python3 forge.py update-canonical FORGE OLD_OID NEW_OID
+python3 forge.py update-canonical FORGE OLD_OID NEW_OID --principal ADMIN
 ```
 
-Both IDs must be immutable full SHA-1 commit IDs already present in the
-canonical object database. The coordinator rejects:
+The acting principal's descriptor must hold `admin` coverage of every path
+changed between `OLD_OID` and `NEW_OID`; the actor is recorded on the
+administrative transaction. Both IDs must be immutable full SHA-1 commit IDs
+already present in the canonical object database. The coordinator rejects:
 
 - expected-ref mismatch;
 - non-fast-forward updates;

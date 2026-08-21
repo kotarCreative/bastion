@@ -46,24 +46,26 @@ are three separate concepts:
 |---|---|
 | Principal | Stable user or service-account identity; submits pushes and owns `Change-Id`s |
 | Team | Immutable direct set of principals; grants nothing by itself |
-| Role | Immutable normalized read/write prefix grants |
+| Role | Immutable capability maps of path-scoped allow and deny prefix grants |
 | Role binding | Immutable assignment of one role to a principal or team |
-| Effective view descriptor | Content-addressed snapshot of provenance plus effective read/write areas |
+| Effective view descriptor | Content-addressed snapshot of provenance plus per-capability allow and deny areas |
 | Physical view | One bare repository bound to exactly one principal and descriptor generation |
 
 Resolution is deterministic: direct teams, applicable bindings, and roles sort
-lexicographically; effective read is the component-aware minimized union of
-role reads; effective write is that union intersected with effective read. A
-descriptor's ID is the SHA-256 of its canonical JSON payload under a fixed
-domain separator. Two views of one principal share one descriptor.
+lexicographically; role grants union additively per capability, separately for
+allow and deny, each side minimized. A descriptor's ID is the SHA-256 of its
+canonical JSON payload under a fixed domain separator. Two views of one
+principal share one descriptor.
 
 Every authorization-sensitive record (source and administrative transactions,
 outbox events, projection jobs, retained plans, anchors, logical revisions)
 carries `descriptor_id` and `descriptor_generation` fields captured before any
 canonical compare-and-swap. Publication fails closed with
-`projection descriptor changed` on any mismatch. There is currently no
-operation that mutates a principal's resolution after it materializes a view;
-policy transitions belong to later roadmap work.
+`projection descriptor changed` on any mismatch. The catalog is unfrozen:
+records are immutable and may be added at any time, but their effect stays
+dormant until a quiescent `transition-principal` policy transition repoints the
+principal's views to a fresh descriptor generation and publishes
+policy-adjustment commits.
 
 ## Projection Rules
 
@@ -124,8 +126,9 @@ Only linear submitted chains rooted at the advertised projected tip are
 accepted. For every submitted commit, Bastion:
 
 1. Reads the projected parent and child trees.
-2. Computes exact add, modify, delete, and mode effects.
-3. Requires current read and write authorization for every affected path.
+2. Computes exact add, modify, delete, mode, and symlink effects.
+3. Requires `read` plus the effect capabilities for every affected path under
+   the view's bound descriptor, adjudicated by longest allow-versus-deny match.
 4. Rejects unsupported modes, gitlinks, empty subtrees, and unsafe structural
    collisions.
 5. Applies the authorized effects to the current complete canonical tree.

@@ -2,7 +2,7 @@
 
 ## Status
 
-Ready for implementation.
+Implemented for state schema version 3.
 
 This specification covers the remaining core Phase 2 items of `ROADMAP.md`:
 
