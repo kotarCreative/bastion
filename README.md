@@ -68,4 +68,12 @@ python3 forge.py work /tmp/bastion-forge
 python3 forge.py check /tmp/bastion-forge
 ```
 
+Views can also be served over HTTP with one token per view:
+
+```bash
+python3 forge.py add-token /tmp/bastion-forge alice
+python3 forge.py serve /tmp/bastion-forge --port 8000
+git clone http://alice:TOKEN@127.0.0.1:8000/alice.git alice-http
+```
+
 Run `python3 forge.py --help` for all experimental commands.

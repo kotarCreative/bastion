@@ -23,7 +23,9 @@ The local prototype currently has:
   independent tree model;
 - byte-exact tree-operation and unusual-path projection coverage;
 - shared-visible modify/modify, delete/modify, and mode/content conflict tests;
-- systematic rejection immutability for every major validation and barrier path.
+- systematic rejection immutability for every major validation and barrier path;
+- an experimental smart-HTTP endpoint with per-view token authorization,
+  uniform unknown/unauthorized view responses, and protocol v2 support.
 
 The roadmap is ordered by architectural risk, not product visibility.
 
@@ -102,6 +104,9 @@ Exit criteria:
 
 Goal: replace filesystem-local endpoints with authenticated network services.
 
+- [done] Add an experimental loopback smart-HTTP endpoint with per-view
+  tokens as the transport boundary for security testing
+  (.specs/006-smart-http-endpoint.md).
 - Receive pushes into a separate authenticated intake repository or service.
 - Implement wrapped `git-receive-pack` with quarantine and stable opaque errors.
 - Implement authorization-safe `git-upload-pack` for smart HTTP protocol v2 and

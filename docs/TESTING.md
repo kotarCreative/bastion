@@ -30,6 +30,9 @@ Git repositories, hooks, clones, fetches, rebases, and pushes.
 | `tests/test_process_failpoints.py` | Source, administrative, worker, projection, recovery, and state-file crash matrix |
 | `tests/test_shared_conflicts.py` | Shared-visible modify/modify, delete/modify, and mode/content conflict resolution |
 | `tests/test_rejection_immutability.py` | Systematic verification that rejected operations leave authoritative state unchanged |
+| `tests/test_http_unit.py` | HTTP route grammar, credential parsing, gzip bodies, and token management |
+| `tests/test_http_server.py` | Clone, push, fanout, protocol v2, and shallow clones over loopback HTTP |
+| `tests/test_http_security.py` | Authentication, cross-view isolation, traversal probes, hidden-object wants, and state immutability over HTTP |
 
 Also run syntax and repository checks:
 

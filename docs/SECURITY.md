@@ -101,12 +101,26 @@ Commit count and visible topology remain observable.
 ref. Another principal cannot claim the same ID. Production needs repository,
 branch, review-state, and role-aware ownership rules.
 
+## HTTP Transport
+
+An experimental smart-HTTP endpoint serves every view with one shared token
+per view (`forge.py add-token`, `forge.py serve`). Authorization happens
+before any Git process starts. Unknown views and unauthorized views return
+identical 404 responses, so view existence is not enumerable. Unknown or
+malformed credentials return 401. Hidden objects are absent from view
+repositories by construction, so direct OID wants fail inside Git without
+server-side special cases.
+
+The endpoint is a testing boundary, not a production service: there is no
+TLS, no rate limiting, no identity beyond shared tokens, buffered request
+bodies, and non-uniform error timing.
+
 ## Protocol And Object Risks Still Open
 
 The following are not production-proven:
 
-- smart HTTP and SSH authentication;
-- protocol v0/v1/v2 configuration;
+- SSH transport and production HTTP identity (TLS, principals, rate limits);
+- protocol v0/v1 configuration;
 - shallow and partial clone;
 - thin packs and delta-base confidentiality;
 - Git LFS authorization;
