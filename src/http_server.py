@@ -185,11 +185,13 @@ class BastionRequestHandler(BaseHTTPRequestHandler):
         try:
             self._handle(method)
         except HttpError as error:
+            self.close_connection = True
             self._respond(error.status, error.body, "text/plain; charset=utf-8", error.headers)
         except Exception:
             import traceback
 
             traceback.print_exc(file=sys.stderr)
+            self.close_connection = True
             self._respond(500, b"internal error", "text/plain; charset=utf-8")
 
     def _handle(self, method: str) -> None:
@@ -204,7 +206,10 @@ class BastionRequestHandler(BaseHTTPRequestHandler):
         expected_method = "GET" if target == "info/refs" else "POST"
         if method != expected_method:
             raise HttpError(405, BODY_405)
-        if load_tokens(self.root).get(credential) != view:
+        tokens = load_tokens(self.root)
+        if credential not in tokens:
+            raise HttpError(401, BODY_401, {"WWW-Authenticate": 'Basic realm="bastion"'})
+        if tokens[credential] != view:
             raise HttpError(404, BODY_404)
         repo = view_repo(self.root, view)
         if not repo.is_dir():
