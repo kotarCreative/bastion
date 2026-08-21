@@ -3,17 +3,22 @@ from __future__ import annotations
 import unittest
 
 from errors import ForgeError
+from identity import CAPABILITIES
 from layout import ZERO_OID
 from validation import (
     allowed,
     apply_changes,
     authorize_changes,
+    capability_allowed,
     changed_entries,
+    longest_covering,
     normalize_prefix,
     parse_change_id,
     parse_updates,
+    required_capabilities,
     validate_ref_update,
     validate_view_name,
+    visible,
 )
 
 
@@ -21,8 +26,19 @@ def blob(oid: str = "1" * 40, mode: bytes = b"100644") -> tuple[bytes, bytes, st
     return mode, b"blob", oid
 
 
-def descriptor(read: list[str], write: list[str]) -> dict:
-    return {"read": read, "write": write}
+def descriptor(
+    read: list[str],
+    write: list[str],
+    deny_read: list[str] | None = None,
+) -> dict:
+    allow = {capability: [] for capability in CAPABILITIES}
+    restrictions = {capability: [] for capability in CAPABILITIES}
+    allow["read"] = read
+    for capability in ("create", "modify", "delete", "mode", "symlink"):
+        allow[capability] = write
+    if deny_read is not None:
+        restrictions["read"] = deny_read
+    return {"capabilities": allow, "restrictions": restrictions}
 
 
 class PathPolicyTest(unittest.TestCase):
@@ -81,22 +97,71 @@ class TreeTransitionTest(unittest.TestCase):
             changed_entries({b"shared/link": blob("1" * 40)}, {b"shared/link": link}),
         )
 
-    def test_authorization_requires_both_read_and_write(self) -> None:
+    def test_authorization_requires_read_and_effect_capabilities(self) -> None:
         changes = {b"visible/file": blob()}
-        authorize_changes(changes, descriptor(["visible"], ["visible"]))
+        parents = {}
+        authorize_changes(changes, parents, descriptor(["visible"], ["visible"]))
         for read, write in ((["other"], ["visible"]), (["visible"], ["other"])):
             with self.subTest(read=read, write=write), self.assertRaises(ForgeError):
-                authorize_changes(changes, descriptor(read, write))
+                authorize_changes(changes, parents, descriptor(read, write))
 
-    def test_rename_requires_both_endpoints_to_be_readable_and_writable(self) -> None:
-        changes = {b"team-a/old": None, b"shared/new": blob()}
+    def test_rename_requires_both_endpoints_to_be_authorized(self) -> None:
         with self.assertRaisesRegex(ForgeError, "outside current authorization"):
-            authorize_changes(changes, descriptor(["shared", "team-a"], ["shared"]))
+            authorize_changes(
+                {b"team-a/old": None, b"shared/new": blob()},
+                {b"team-a/old": blob()},
+                descriptor(["shared", "team-a"], ["shared"]),
+            )
         with self.assertRaisesRegex(ForgeError, "outside current authorization"):
             authorize_changes(
                 {b"shared/old": None, b"team-a/new": blob()},
+                {b"shared/old": blob()},
                 descriptor(["shared", "team-a"], ["shared"]),
             )
+
+    def test_longest_match_adjudication_for_deny_rules(self) -> None:
+        allow = ["shared", "docs"]
+        deny = ["shared/private"]
+        self.assertTrue(capability_allowed(allow, deny, b"shared/file"))
+        self.assertFalse(capability_allowed(allow, deny, b"shared/private/file"))
+        # Equal prefixes tie in favor of the deny; a longer deny always wins.
+        self.assertFalse(capability_allowed(["shared"], ["shared"], b"shared/file"))
+        self.assertFalse(
+            capability_allowed(["shared"], ["shared/sub/deep"], b"shared/sub/deep/f")
+        )
+        # A longer allow beats the shorter deny.
+        self.assertTrue(
+            capability_allowed(
+                ["shared/private/exception"], ["shared/private"],
+                b"shared/private/exception/file",
+            )
+        )
+        # Denies never grant access.
+        self.assertFalse(capability_allowed([], ["nothing"], b"any/path"))
+        self.assertIsNone(longest_covering(b"other", allow))
+
+    def test_visibility_uses_read_adjudication(self) -> None:
+        policy = descriptor(["shared"], [], deny_read=["shared/private"])
+        self.assertTrue(visible(b"shared/file", policy))
+        self.assertFalse(visible(b"shared/private/file", policy))
+
+    def test_effect_classification_covers_every_capability_row(self) -> None:
+        link = (b"120000", b"blob", "2" * 40)
+        gitlink = (b"160000", b"commit", "3" * 40)
+        cases = (
+            ((None, blob()), {"read", "create"}),
+            ((blob(), None), {"read", "delete"}),
+            ((blob("a" * 40), blob("b" * 40)), {"read", "modify"}),
+            ((blob("a" * 40), blob("a" * 40, b"100755")), {"read", "mode"}),
+            ((blob("a" * 40), link), {"read", "modify", "mode", "symlink"}),
+            ((link, blob("a" * 40)), {"read", "modify", "mode", "symlink"}),
+            ((None, link), {"read", "create", "symlink"}),
+            ((link, None), {"read", "delete", "symlink"}),
+            ((blob(), gitlink), {"read", "modify", "mode", "symlink"}),
+        )
+        for (parent, child), expected in cases:
+            with self.subTest(parent=parent, child=child):
+                self.assertEqual(expected, required_capabilities(parent, child))
 
     def test_apply_changes_preserves_unaffected_hidden_state(self) -> None:
         hidden = blob("a" * 40)

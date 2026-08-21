@@ -334,9 +334,11 @@ def locked(
         fcntl.flock(lock, fcntl.LOCK_EX)
         state = load_state(root)
         version = state.get("version")
-        if version != 2:
-            if version == 1:
-                raise ForgeError("forge state version 1 requires migrate-identities")
+        if version != 3:
+            if version in (1, 2):
+                raise ForgeError(
+                    f"forge state version {version} requires migrate-identities"
+                )
             raise ForgeError(f"unsupported forge state version: {version!r}")
         recoverer(root, state)
         yield state

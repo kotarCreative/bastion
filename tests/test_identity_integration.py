@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 from tests.identity_harness import ENTRYPOINT
+from tests.identity_harness import capability_grants
 from tests.identity_harness import add_view as fixture_add_view
 
 import forge
@@ -61,11 +62,13 @@ class IdentityIntegrationTest(unittest.TestCase):
         # alice-primary/alice-secondary are two endpoints of one principal.
         add_principal(self.forge, "alice")
         add_principal(self.forge, "bob")
-        add_role(self.forge, "shared-write", ["shared"], ["shared"])
+        allow, deny = capability_grants(["shared"], ["shared"])
+        add_role(self.forge, "shared-write", allow, deny)
         bind_role(self.forge, "shared-write", "principal", "alice")
         bind_role(self.forge, "shared-write", "principal", "bob")
         add_team(self.forge, "engineering", ["bob"])
-        add_role(self.forge, "team-a-grant", ["team-a"], ["team-a"])
+        allow, deny = capability_grants(["team-a"], ["team-a"])
+        add_role(self.forge, "team-a-grant", allow, deny)
         bind_role(self.forge, "team-a-grant", "team", "engineering")
         fixture_add_view(self.forge, "alice-primary", ["shared"], ["shared"], "main", principal="alice")
         fixture_add_view(self.forge, "alice-secondary", ["shared"], ["shared"], "main", principal="alice")
@@ -165,7 +168,8 @@ class IdentityIntegrationTest(unittest.TestCase):
 
     def test_service_account_pushes_and_owns_its_changes(self) -> None:
         add_service_account(self.forge, "release-bot", "alice")
-        add_role(self.forge, "bot-shared", ["shared"], ["shared"])
+        allow, deny = capability_grants(["shared"], ["shared"])
+        add_role(self.forge, "bot-shared", allow, deny)
         bind_role(self.forge, "bot-shared", "principal", "release-bot")
         fixture_add_view(self.forge, "release-bot", ["shared"], ["shared"], "main")
         bot = self.root / "client-release-bot"
@@ -215,7 +219,10 @@ class IdentityIntegrationTest(unittest.TestCase):
         new = commit(admin, "team a via team grant", 1_700_000_800)
         old = command("git", "rev-parse", "HEAD~1", cwd=admin).stdout.strip()
         command("git", "push", "-q", "origin", f"{new}:refs/staging/team-test", cwd=admin)
-        forge.update_canonical_ref(self.forge, old, new)
+        from tests.identity_harness import provision_admin, update_canonical
+
+        provision_admin(self.forge)
+        update_canonical(self.forge, old, new)
         forge.drain_projection_jobs(self.forge)
 
         command("git", "fetch", "-q", "origin", cwd=bob)
@@ -228,7 +235,8 @@ class IdentityIntegrationTest(unittest.TestCase):
 
     def test_read_only_descriptor_rejects_pushes_without_moving_refs(self) -> None:
         add_principal(self.forge, "reader")
-        add_role(self.forge, "read-shared", ["shared"], [])
+        allow, deny = capability_grants(["shared"], [])
+        add_role(self.forge, "read-shared", allow, deny)
         bind_role(self.forge, "read-shared", "principal", "reader")
         fixture_add_view(self.forge, "reader", ["shared"], [], "main")
         reader = self.root / "client-reader"

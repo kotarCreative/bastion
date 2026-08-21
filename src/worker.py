@@ -79,8 +79,10 @@ def claim_projection_job(root: Path, now: float | None = None) -> dict | None:
                 job["expected_projected_tip"] = view["projected_tip"]
                 snapshot = copy.deepcopy(job)
                 snapshot["view_state"] = copy.deepcopy(view)
+                # Jobs finish under their captured descriptor; catalog drift
+                # is dormant until an explicit policy transition.
                 snapshot["descriptor"] = copy.deepcopy(
-                    identity.descriptor_for_view(state, job["view"])
+                    state["view_descriptors"][job["descriptor_id"]]
                 )
                 save_state(root, state)
                 claimed_snapshot = snapshot

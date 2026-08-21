@@ -41,6 +41,7 @@ class InvariantTest(unittest.TestCase):
         command("git", "commit", "-q", "-m", "initial", cwd=source)
         self.forge = self.root / "forge"
         forge.init_forge(self.forge, source, "main")
+        identity_harness.provision_admin(self.forge)
         identity_harness.add_view(self.forge, "alice", ["shared", "private"], ["shared", "private"], "main")
         identity_harness.add_view(self.forge, "bob", ["shared", "other"], ["shared", "other"], "main")
         self._admin_counter = 0
@@ -132,7 +133,7 @@ class InvariantTest(unittest.TestCase):
         alice_old_frontier = before["views"]["alice"]["canonical_frontier"]
         old_tip = self._canonical_tip()
         new_tip = self._admin_commit("other/hidden.txt", "hidden\n", "hidden-only canonical change")
-        forge.update_canonical_ref(self.forge, old_tip, new_tip)
+        identity_harness.update_canonical(self.forge, old_tip, new_tip)
         forge.drain_projection_jobs(self.forge)
         check_invariants(self.forge)
         after = json.loads((self.forge / "state.json").read_text())
@@ -154,7 +155,7 @@ class InvariantTest(unittest.TestCase):
         change_id = "Ieeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
         old_tip = self._canonical_tip()
         new_tip = self._admin_commit("shared/admin.txt", "admin\n", f"admin change\n\nChange-Id: {change_id}")
-        forge.update_canonical_ref(self.forge, old_tip, new_tip)
+        identity_harness.update_canonical(self.forge, old_tip, new_tip)
         forge.drain_projection_jobs(self.forge)
         check_invariants(self.forge)
         state = json.loads((self.forge / "state.json").read_text())
@@ -233,7 +234,7 @@ class InvariantTest(unittest.TestCase):
     def test_wrong_event_status_blocked_with_job_fails(self) -> None:
         old_tip = self._canonical_tip()
         new_tip = self._admin_commit("shared/x.txt", "x\n", "admin")
-        forge.update_canonical_ref(self.forge, old_tip, new_tip)
+        identity_harness.update_canonical(self.forge, old_tip, new_tip)
         from state import load_state, recover, save_state
         state = load_state(self.forge)
         recover(self.forge, state)
@@ -248,9 +249,9 @@ class InvariantTest(unittest.TestCase):
     def test_job_linked_to_another_events_transaction_fails(self) -> None:
         old_tip = self._canonical_tip()
         first_tip = self._admin_commit("shared/first.txt", "first\n", "first")
-        forge.update_canonical_ref(self.forge, old_tip, first_tip)
+        identity_harness.update_canonical(self.forge, old_tip, first_tip)
         second_tip = self._admin_commit("shared/second.txt", "second\n", "second")
-        forge.update_canonical_ref(self.forge, first_tip, second_tip)
+        identity_harness.update_canonical(self.forge, first_tip, second_tip)
         from state import load_state, recover, save_state
         state = load_state(self.forge)
         recover(self.forge, state)
@@ -323,7 +324,7 @@ class InvariantTest(unittest.TestCase):
     def test_pending_job_passes(self) -> None:
         old_tip = self._canonical_tip()
         new_tip = self._admin_commit("shared/x.txt", "x\n", "admin")
-        forge.update_canonical_ref(self.forge, old_tip, new_tip)
+        identity_harness.update_canonical(self.forge, old_tip, new_tip)
         from state import load_state, recover, save_state
         state = load_state(self.forge)
         recover(self.forge, state)
@@ -335,7 +336,7 @@ class InvariantTest(unittest.TestCase):
     def test_retry_job_without_plan_passes(self) -> None:
         old_tip = self._canonical_tip()
         new_tip = self._admin_commit("shared/x.txt", "x\n", "admin")
-        forge.update_canonical_ref(self.forge, old_tip, new_tip)
+        identity_harness.update_canonical(self.forge, old_tip, new_tip)
         from state import load_state, recover, save_state
         state = load_state(self.forge)
         recover(self.forge, state)
@@ -353,7 +354,7 @@ class InvariantTest(unittest.TestCase):
     def test_retry_job_with_plan_passes(self) -> None:
         old_tip = self._canonical_tip()
         new_tip = self._admin_commit("shared/x.txt", "x\n", "admin")
-        forge.update_canonical_ref(self.forge, old_tip, new_tip)
+        identity_harness.update_canonical(self.forge, old_tip, new_tip)
         from state import load_state, recover, save_state
         state = load_state(self.forge)
         recover(self.forge, state)
@@ -376,7 +377,7 @@ class InvariantTest(unittest.TestCase):
     def test_running_job_passes(self) -> None:
         old_tip = self._canonical_tip()
         new_tip = self._admin_commit("shared/x.txt", "x\n", "admin")
-        forge.update_canonical_ref(self.forge, old_tip, new_tip)
+        identity_harness.update_canonical(self.forge, old_tip, new_tip)
         from state import load_state, recover, save_state
         state = load_state(self.forge)
         recover(self.forge, state)
@@ -389,7 +390,7 @@ class InvariantTest(unittest.TestCase):
     def test_ready_job_without_plan_fails(self) -> None:
         old_tip = self._canonical_tip()
         new_tip = self._admin_commit("shared/x.txt", "x\n", "admin")
-        forge.update_canonical_ref(self.forge, old_tip, new_tip)
+        identity_harness.update_canonical(self.forge, old_tip, new_tip)
         from state import load_state, recover, save_state
         state = load_state(self.forge)
         recover(self.forge, state)
@@ -406,7 +407,7 @@ class InvariantTest(unittest.TestCase):
     def test_ready_job_with_retained_plan_and_unchanged_ref_passes(self) -> None:
         old_tip = self._canonical_tip()
         new_tip = self._admin_commit("shared/x.txt", "x\n", "admin")
-        forge.update_canonical_ref(self.forge, old_tip, new_tip)
+        identity_harness.update_canonical(self.forge, old_tip, new_tip)
         from state import recover, save_state
         state = json.loads((self.forge / "state.json").read_text())
         # Dispatch without changing the claimed job's durable ref boundary.
@@ -426,7 +427,7 @@ class InvariantTest(unittest.TestCase):
         old_tip = self._canonical_tip()
         change_id = "Iabababababababababababababababababababab"
         new_tip = self._admin_commit("shared/x.txt", "x\n", f"admin\n\nChange-Id: {change_id}")
-        forge.update_canonical_ref(self.forge, old_tip, new_tip)
+        identity_harness.update_canonical(self.forge, old_tip, new_tip)
         from state import recover, save_state
         state = json.loads((self.forge / "state.json").read_text())
         recover(self.forge, state)
@@ -453,9 +454,9 @@ class InvariantTest(unittest.TestCase):
     def test_completed_job_ahead_of_frontier_fails(self) -> None:
         first_old = self._canonical_tip()
         first_new = self._admin_commit("shared/first.txt", "first\n", "first")
-        forge.update_canonical_ref(self.forge, first_old, first_new)
+        identity_harness.update_canonical(self.forge, first_old, first_new)
         second_new = self._admin_commit("shared/second.txt", "second\n", "second")
-        forge.update_canonical_ref(self.forge, first_new, second_new)
+        identity_harness.update_canonical(self.forge, first_new, second_new)
         from state import recover, save_state
         state = json.loads((self.forge / "state.json").read_text())
         recover(self.forge, state)
@@ -489,6 +490,7 @@ class InvariantTest(unittest.TestCase):
         state["transactions"][identifier] = {
             "id": identifier,
             "kind": "canonical_update",
+            "principal_id": identity_harness.ADMIN_PRINCIPAL,
             "sequence": sequence,
             "canonical_ref": "refs/heads/main",
             "canonical_old": parent,

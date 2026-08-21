@@ -154,6 +154,7 @@ class Scenario:
             target.write_bytes(contents)
         initial_oid = self._commit(self.source, "initial fixture", 0)
         forge.init_forge(self.root, self.source, "main")
+        identity_harness.provision_admin(self.root)
         identity_harness.add_view(self.root, "alice", ["shared", "team-a"], ["shared", "team-a"], "main")
         identity_harness.add_view(self.root, "bob", ["shared", "team-b"], ["shared", "team-b"], "main")
         self.canonical_tree = tree_at(forge.canonical_repo(self.root), initial_oid)
@@ -294,7 +295,7 @@ class Scenario:
             self._write_edit(self.admin, arguments)
             new = self._commit(self.admin, f"admin step {step}", step)
             git(self.admin, "push", "-q", "origin", f"{new}:refs/staging/state-machine-{self.seed}-{step}")
-            forge.update_canonical_ref(self.root, canonical_old, new)
+            identity_harness.update_canonical(self.root, canonical_old, new)
             self.canonical_tree = self._apply(self.canonical_tree, arguments)
             self.trees[new] = dict(self.canonical_tree)
         elif kind == "client_refresh":

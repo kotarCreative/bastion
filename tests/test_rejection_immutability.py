@@ -256,13 +256,13 @@ class RejectionImmutabilityTest(unittest.TestCase):
         git(self.fixture.admin, "update-ref", "refs/heads/main", expected)
         first = build_commit(self.fixture.admin, expected, {b"shared/admin.txt": (b"100644", b"first\n")}, b"first\n", 1_700_000_100)
         command("git", "-C", os.fsdecode(self.fixture.admin), "push", "origin", f"{first}:refs/staging/admin-first")
-        forge.update_canonical_ref(self.fixture.root, expected, first)
+        identity_harness.update_canonical(self.fixture.root, expected, first)
         forge.drain_projection_jobs(self.fixture.root)
         second = build_commit(self.fixture.admin, first, {b"shared/admin.txt": (b"100644", b"second\n")}, b"second\n", 1_700_000_101)
         command("git", "-C", os.fsdecode(self.fixture.admin), "push", "origin", f"{second}:refs/staging/admin-second")
         before = self.fixture.rejection_snapshot()
         with self.assertRaisesRegex(ForgeError, "canonical ref changed before administrative update"):
-            forge.update_canonical_ref(self.fixture.root, expected, second)
+            identity_harness.update_canonical(self.fixture.root, expected, second)
         self.fixture.assert_rejection(before)
 
     def test_administrative_non_fast_forward_rejected(self) -> None:
@@ -274,11 +274,11 @@ class RejectionImmutabilityTest(unittest.TestCase):
         second = _make_commit(self.fixture.admin, expected, {b"shared/admin.txt": (b"100644", b"second\n")}, b"second\n", 1_700_000_101)
         command("git", "-C", os.fsdecode(self.fixture.admin), "push", "origin", f"{first}:refs/staging/admin-first")
         command("git", "-C", os.fsdecode(self.fixture.admin), "push", "origin", f"{second}:refs/staging/admin-second")
-        forge.update_canonical_ref(self.fixture.root, expected, first)
+        identity_harness.update_canonical(self.fixture.root, expected, first)
         forge.drain_projection_jobs(self.fixture.root)
         before = self.fixture.rejection_snapshot()
         with self.assertRaisesRegex(ForgeError, "canonical non-fast-forward updates are not supported"):
-            forge.update_canonical_ref(self.fixture.root, first, second)
+            identity_harness.update_canonical(self.fixture.root, first, second)
         self.fixture.assert_rejection(before)
 
     def test_administrative_merge_commit_rejected(self) -> None:
@@ -300,7 +300,7 @@ class RejectionImmutabilityTest(unittest.TestCase):
         command("git", "-C", os.fsdecode(self.fixture.admin), "push", "origin", f"{merge}:refs/staging/admin-merge")
         before = self.fixture.rejection_snapshot()
         with self.assertRaisesRegex(ForgeError, "merge commits are not supported"):
-            forge.update_canonical_ref(self.fixture.root, expected, merge)
+            identity_harness.update_canonical(self.fixture.root, expected, merge)
         self.fixture.assert_rejection(before)
 
     def test_administrative_unsupported_tree_entry_rejected(self) -> None:
@@ -312,7 +312,7 @@ class RejectionImmutabilityTest(unittest.TestCase):
         command("git", "-C", os.fsdecode(self.fixture.admin), "push", "origin", f"{bad}:refs/staging/admin-bad")
         before = self.fixture.rejection_snapshot()
         with self.assertRaisesRegex(ForgeError, "unsupported tree entry"):
-            forge.update_canonical_ref(self.fixture.root, expected, bad)
+            identity_harness.update_canonical(self.fixture.root, expected, bad)
         self.fixture.assert_rejection(before)
 
     def test_administrative_empty_subtree_rejected(self) -> None:
@@ -324,7 +324,7 @@ class RejectionImmutabilityTest(unittest.TestCase):
         command("git", "-C", os.fsdecode(self.fixture.admin), "push", "origin", f"{bad}:refs/staging/admin-empty")
         before = self.fixture.rejection_snapshot()
         with self.assertRaisesRegex(ForgeError, "explicit empty subtrees are not supported"):
-            forge.update_canonical_ref(self.fixture.root, expected, bad)
+            identity_harness.update_canonical(self.fixture.root, expected, bad)
         self.fixture.assert_rejection(before)
 
 

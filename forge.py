@@ -25,6 +25,7 @@ from service import (
     bind_role as _bind_role,
     init_forge,
     sync_view,
+    transition_principal,
     update_canonical_ref,
 )
 from state import save_state
@@ -39,6 +40,20 @@ def add_view(
 
 def new_change_id() -> str:
     return "I" + hashlib.sha1(os.urandom(32)).hexdigest()
+
+
+def capability_grants(pairs: list[str]) -> dict[str, list[str]]:
+    from identity import CAPABILITIES
+
+    grants = {capability: [] for capability in CAPABILITIES}
+    for pair in pairs:
+        capability, separator, path = pair.partition("=")
+        if not separator or capability not in CAPABILITIES:
+            raise SystemExit(
+                f"grant must be CAPABILITY=PATH with one of: {', '.join(CAPABILITIES)}"
+            )
+        grants[capability].append(path)
+    return grants
 
 
 def parser() -> argparse.ArgumentParser:
@@ -62,8 +77,8 @@ def parser() -> argparse.ArgumentParser:
     role = commands.add_parser("add-role")
     role.add_argument("root", type=Path)
     role.add_argument("role")
-    role.add_argument("--read", action="append", default=[])
-    role.add_argument("--write", action="append", default=[])
+    role.add_argument("--allow", action="append", default=[], metavar="CAPABILITY=PATH")
+    role.add_argument("--deny", action="append", default=[], metavar="CAPABILITY=PATH")
     bind = commands.add_parser("bind-role")
     bind.add_argument("root", type=Path)
     bind.add_argument("role")
@@ -88,6 +103,10 @@ def parser() -> argparse.ArgumentParser:
     canonical.add_argument("root", type=Path)
     canonical.add_argument("expected")
     canonical.add_argument("new")
+    canonical.add_argument("--principal", required=True)
+    transition = commands.add_parser("transition-principal")
+    transition.add_argument("root", type=Path)
+    transition.add_argument("principal")
     migrate = commands.add_parser("migrate-identities")
     migrate.add_argument("root", type=Path)
     pre = commands.add_parser("pre-receive")
@@ -118,7 +137,12 @@ def main() -> int:
         elif args.command == "add-team":
             _add_team(args.root, args.team, args.member)
         elif args.command == "add-role":
-            _add_role(args.root, args.role, args.read, args.write)
+            _add_role(
+                args.root,
+                args.role,
+                capability_grants(args.allow),
+                capability_grants(args.deny),
+            )
         elif args.command == "bind-role":
             if args.principal is not None:
                 _bind_role(args.root, args.role, "principal", args.principal)
@@ -135,7 +159,9 @@ def main() -> int:
         elif args.command == "work":
             drain_projection_jobs(args.root, args.limit)
         elif args.command == "update-canonical":
-            update_canonical_ref(args.root, args.expected, args.new)
+            update_canonical_ref(args.root, args.expected, args.new, args.principal)
+        elif args.command == "transition-principal":
+            transition_principal(args.root, args.principal)
         elif args.command == "migrate-identities":
             from migration import migrate_identities
 

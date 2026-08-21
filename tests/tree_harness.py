@@ -192,6 +192,7 @@ class TreeFixture:
         }
         initial_tip = build_commit(self.source, None, initial, b"initial fixture\n", 1_700_000_000)
         forge.init_forge(self.root, self.source, "main")
+        self.admin_principal = identity_harness.provision_admin(self.root)
         for name, (read, write) in self.policies.items():
             identity_harness.add_view(self.root, name, read, write, "main")
             checkout = self.directory / f"client-{name}"
@@ -266,7 +267,7 @@ class TreeFixture:
             commits.append(parent)
         staging = f"refs/staging/tree-{self.counter}"
         command("git", "-C", os.fsdecode(self.admin), "push", "origin", f"{parent}:{staging}")
-        forge.update_canonical_ref(self.root, expected, parent)
+        identity_harness.update_canonical(self.root, expected, parent, self.admin_principal)
         forge.drain_projection_jobs(self.root)
         for commit, effects in zip(commits, chain):
             self.canonical_model = self._apply(self.canonical_model, effects)

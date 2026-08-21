@@ -1,4 +1,4 @@
-"""Explicit, quiescent version-1 to version-2 identity migration."""
+"""Explicit, quiescent identity and policy migrations between state versions."""
 
 from __future__ import annotations
 
@@ -16,7 +16,8 @@ def _legacy_role_id(view_name: str) -> str:
     return hashlib.sha256(view_name.encode()).hexdigest()
 
 
-def _require_quiescent(root: Path, state: dict) -> None:
+def require_quiescent(root: Path, state: dict) -> None:
+    """Require global quiescence: no unfinished work anywhere in the forge."""
     for identifier, transaction in sorted(state["transactions"].items()):
         if transaction["status"] not in {"published", "aborted"}:
             raise ForgeError(f"forge has unfinished transactions; migrate-identities requires quiescence: {identifier}")
@@ -86,7 +87,35 @@ def _build_candidate(state: dict) -> dict:
             "subject_id": principal_id,
             "role_id": role_id,
         }
-        descriptor = identity.effective_descriptor(candidate, principal_id, canonical_ref)
+        team_ids, binding_ids, role_ids = identity.resolve_principal(
+            candidate, principal_id
+        )
+        read_union: list[str] = []
+        write_union: list[str] = []
+        for resolved_role in role_ids:
+            role = candidate["roles"][resolved_role]
+            read_union.extend(role["read"])
+            write_union.extend(role["write"])
+        effective_read = identity.minimize_prefixes(read_union)
+        effective_write = identity.minimize_prefixes(
+            identity.intersect_prefixes(effective_read, write_union)
+        )
+        payload = {
+            "algorithm": identity.LEGACY_DESCRIPTOR_ALGORITHM,
+            "principal_id": principal_id,
+            "principal_kind": candidate["principals"][principal_id]["kind"],
+            "canonical_ref": canonical_ref,
+            "team_ids": team_ids,
+            "role_ids": role_ids,
+            "binding_ids": binding_ids,
+            "read": effective_read,
+            "write": effective_write,
+        }
+        descriptor = {"id": identity.compute_descriptor_id(payload)}
+        descriptor.update(payload)
+        existing = candidate["view_descriptors"].setdefault(descriptor["id"], descriptor)
+        if existing != descriptor:
+            raise ForgeError("descriptor identity collision with different content")
         view_record = {
             "principal_id": principal_id,
             "descriptor_id": descriptor["id"],
@@ -152,19 +181,79 @@ def _build_candidate(state: dict) -> dict:
     return candidate
 
 
+def _upgrade_catalog_to_v3(candidate: dict) -> dict:
+    """Rewrite roles to capability maps and rebind current view assignments.
+
+    ``read`` stays ``read``; ``write`` expands to create, modify, delete, mode,
+    and symlink; denies stay empty. Fresh descriptors are appended and only
+    current view assignments are repointed; historical descriptor references
+    and generations are preserved because effective authorization is unchanged.
+    """
+    candidate = copy.deepcopy(candidate)
+    for role in candidate["roles"].values():
+        read = role.pop("read")
+        write = role.pop("write")
+        allow = identity.empty_capability_map()
+        allow["read"] = list(read)
+        for capability in ("create", "modify", "delete", "mode", "symlink"):
+            allow[capability] = list(write)
+        role["allow"] = allow
+        role["deny"] = identity.empty_capability_map()
+    canonical_ref = f"refs/heads/{candidate['canonical_branch']}"
+    # Historical administrative updates predate acting-principal attribution;
+    # they are stamped with a dedicated synthetic administrator.
+    unattributed = [
+        transaction
+        for transaction in candidate["transactions"].values()
+        if transaction.get("kind") == "canonical_update" and not transaction.get("principal_id")
+    ]
+    if unattributed:
+        identity.add_principal(candidate, "legacy-admin")
+        admin_allow = identity.empty_capability_map()
+        admin_allow["admin"] = [""]
+        candidate["roles"]["legacy-admin-root"] = {
+            "id": "legacy-admin-root",
+            "allow": admin_allow,
+            "deny": identity.empty_capability_map(),
+        }
+        binding_id = identity.binding_identifier(
+            "principal", "legacy-admin", "legacy-admin-root"
+        )
+        candidate["role_bindings"][binding_id] = {
+            "id": binding_id,
+            "subject_kind": "principal",
+            "subject_id": "legacy-admin",
+            "role_id": "legacy-admin-root",
+        }
+        for transaction in unattributed:
+            transaction["principal_id"] = "legacy-admin"
+    for view_name, view in sorted(candidate["views"].items()):
+        fresh = identity.effective_descriptor(
+            candidate, view["principal_id"], canonical_ref
+        )
+        view["descriptor_id"] = fresh["id"]
+    candidate["version"] = 3
+    return candidate
+
+
 def migrate_identities(root: Path) -> None:
-    """Upgrade a healthy quiescent version-1 forge in one state replacement."""
+    """Upgrade a healthy quiescent forge through every schema version."""
     with locked_unversioned(root):
         state = load_state(root)
         version = state.get("version")
-        if version == 2:
+        if version == 3:
             return
-        if version != 1:
+        if version not in (1, 2):
             raise ForgeError(f"unsupported forge state version: {version!r}")
         refs = collect_layout(root, state)
         check_loaded(root, state, *refs)
-        _require_quiescent(root, state)
-        candidate = _build_candidate(state)
+        require_quiescent(root, state)
+        if version == 1:
+            candidate = _build_candidate(state)
+            check_loaded(root, candidate, *refs)
+        else:
+            candidate = copy.deepcopy(state)
+        candidate = _upgrade_catalog_to_v3(candidate)
         check_loaded(root, candidate, *refs)
         save_state(root, candidate)
     check_invariants(root)

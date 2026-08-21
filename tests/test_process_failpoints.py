@@ -11,6 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import worker
+
+from identity_harness import ADMIN_PRINCIPAL
 from process_harness import (
     Controller,
     Fixture,
@@ -77,6 +79,8 @@ class ProcessFailpointTest(unittest.TestCase):
                 str(self.fixture.forge),
                 old,
                 new,
+                "--principal",
+                identity_harness.ADMIN_PRINCIPAL,
             ],
             checkpoint=checkpoint,
             action="SIGKILL",
@@ -326,6 +330,8 @@ class ProcessFailpointTest(unittest.TestCase):
                 str(fresh.forge),
                 fresh_canonical_old,
                 new,
+                "--principal",
+                ADMIN_PRINCIPAL,
             ],
             checkpoint="admin.prepared_persisted",
             action="SIGKILL",
@@ -344,6 +350,8 @@ class ProcessFailpointTest(unittest.TestCase):
                 str(fresh.forge),
                 fresh_canonical_old,
                 new,
+                "--principal",
+                ADMIN_PRINCIPAL,
             ]
         )
         self.assertEqual(0, retry.returncode, ctrl.diagnostic(retry))
@@ -368,6 +376,8 @@ class ProcessFailpointTest(unittest.TestCase):
                 str(fresh.forge),
                 fresh_canonical_old,
                 new,
+                "--principal",
+                ADMIN_PRINCIPAL,
             ],
             checkpoint="admin.canonical_ref_published",
             action="SIGKILL",
@@ -396,6 +406,8 @@ class ProcessFailpointTest(unittest.TestCase):
                 str(fresh.forge),
                 fresh_canonical_old,
                 new,
+                "--principal",
+                ADMIN_PRINCIPAL,
             ],
             checkpoint="admin.canonical_state_persisted",
             action="SIGKILL",

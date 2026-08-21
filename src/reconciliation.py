@@ -75,7 +75,7 @@ def reconcile_commits(
         parent_entries = tree_entries(submitted, projected_parent, submitted_env)
         child_entries = tree_entries(submitted, submitted_oid, submitted_env)
         changes = changed_entries(parent_entries, child_entries)
-        authorize_changes(changes, descriptor)
+        authorize_changes(changes, parent_entries, descriptor)
         candidate_tree = materialize_transition(
             canonical,
             submitted,

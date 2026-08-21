@@ -12,9 +12,20 @@ from validation import normalize_prefix
 
 IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 PRINCIPAL_KINDS = {"user", "service_account"}
-DESCRIPTOR_ALGORITHM = "effective-view-v1"
+CAPABILITIES = (
+    "read",
+    "create",
+    "modify",
+    "delete",
+    "mode",
+    "symlink",
+    "branch",
+    "merge",
+    "admin",
+)
+DESCRIPTOR_ALGORITHM = "capabilities-v1"
+LEGACY_DESCRIPTOR_ALGORITHM = "effective-view-v1"
 DESCRIPTOR_DOMAIN = b"bastion-effective-view-v1\0"
-FREEZE_MESSAGE = "principal already has a materialized view; permission changes are not supported"
 
 
 def validate_identifier(identifier: str) -> None:
@@ -39,6 +50,10 @@ def minimize_prefixes(values: list[str]) -> list[str]:
     return kept
 
 
+def empty_capability_map() -> dict[str, list[str]]:
+    return {capability: [] for capability in CAPABILITIES}
+
+
 def intersect_prefixes(read: list[str], write: list[str]) -> list[str]:
     """Component-wise read/write intersection keeping the narrower area."""
     result: set[str] = set()
@@ -51,14 +66,21 @@ def intersect_prefixes(read: list[str], write: list[str]) -> list[str]:
     return minimize_prefixes(sorted(result))
 
 
-def _materialized_principals(state: dict) -> set[str]:
-    return {view["principal_id"] for view in state.get("views", {}).values()}
-
-
-def _reject_frozen(state: dict, principal_ids: set[str]) -> None:
-    frozen = _materialized_principals(state)
-    for principal_id in sorted(principal_ids & frozen):
-        raise ForgeError(FREEZE_MESSAGE)
+def normalize_capability_map(raw: object, subject: str) -> dict[str, list[str]]:
+    """Validate and normalize one allow or deny map with all nine capabilities."""
+    if not isinstance(raw, dict):
+        raise ForgeError(f"{subject} must be a capability map")
+    if set(raw) != set(CAPABILITIES):
+        raise ForgeError(f"{subject} must hold exactly the nine capabilities")
+    result = empty_capability_map()
+    for capability in CAPABILITIES:
+        values = raw[capability]
+        if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+            raise ForgeError(f"{subject}.{capability} must be a list of path strings")
+        result[capability] = minimize_prefixes(
+            [normalize_prefix(value) for value in values]
+        )
+    return result
 
 
 def add_principal(state: dict, principal_id: str) -> None:
@@ -100,23 +122,27 @@ def add_team(state: dict, team_id: str, members: list[str]) -> None:
             raise ForgeError(f"unknown team member principal: {member}")
         if record["kind"] not in PRINCIPAL_KINDS:
             raise ForgeError(f"invalid principal kind for member: {member}")
-    _reject_frozen(state, set(unique))
     teams[team_id] = {"id": team_id, "members": unique}
 
 
-def add_role(state: dict, role_id: str, read: list[str], write: list[str]) -> None:
+def add_role(
+    state: dict,
+    role_id: str,
+    allow: dict[str, list[str]],
+    deny: dict[str, list[str]],
+) -> None:
     validate_identifier(role_id)
     roles = state.setdefault("roles", {})
     if role_id in roles:
         raise ForgeError(f"role already exists: {role_id}")
-    normalized_read = minimize_prefixes([normalize_prefix(value) for value in read])
-    normalized_write = minimize_prefixes([normalize_prefix(value) for value in write])
-    if not normalized_read and not normalized_write:
-        raise ForgeError("a role needs at least one read or write grant")
+    normalized_allow = normalize_capability_map(allow, "allow")
+    normalized_deny = normalize_capability_map(deny, "deny")
+    if not any(normalized_allow[capability] for capability in CAPABILITIES):
+        raise ForgeError("a role needs at least one allow grant")
     roles[role_id] = {
         "id": role_id,
-        "read": normalized_read,
-        "write": normalized_write,
+        "allow": normalized_allow,
+        "deny": normalized_deny,
     }
 
 
@@ -136,15 +162,12 @@ def bind_role(state: dict, role_id: str, subject_kind: str, subject_id: str) -> 
     if role_id not in state.setdefault("roles", {}):
         raise ForgeError(f"unknown role: {role_id}")
     if subject_kind == "principal":
-        record = state.setdefault("principals", {}).get(subject_id)
-        if record is None:
+        if subject_id not in state.setdefault("principals", {}):
             raise ForgeError(f"unknown principal: {subject_id}")
-        _reject_frozen(state, {subject_id})
     else:
         team = state.setdefault("teams", {}).get(subject_id)
         if team is None:
             raise ForgeError(f"unknown team: {subject_id}")
-        _reject_frozen(state, set(team["members"]))
     bindings[identifier] = {
         "id": identifier,
         "subject_kind": subject_kind,
@@ -184,18 +207,25 @@ def resolve_principal(state: dict, principal_id: str) -> tuple[list[str], list[s
     return team_ids, selected, sorted(role_ids)
 
 
-def effective_grants(state: dict, role_ids: list[str]) -> tuple[list[str], list[str]]:
-    read_union: list[str] = []
-    write_union: list[str] = []
+def effective_grants(
+    state: dict, role_ids: list[str]
+) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    """Union role grants additively per capability, separately for allow and deny."""
+    allow_union = empty_capability_map()
+    deny_union = empty_capability_map()
     for role_id in role_ids:
         role = state["roles"].get(role_id)
         if role is None:
             raise ForgeError(f"unknown role: {role_id}")
-        read_union.extend(role["read"])
-        write_union.extend(role["write"])
-    effective_read = minimize_prefixes(read_union)
-    effective_write = minimize_prefixes(intersect_prefixes(effective_read, write_union))
-    return effective_read, effective_write
+        for capability in CAPABILITIES:
+            allow_union[capability].extend(role["allow"][capability])
+            deny_union[capability].extend(role["deny"][capability])
+    effective_allow = empty_capability_map()
+    effective_deny = empty_capability_map()
+    for capability in CAPABILITIES:
+        effective_allow[capability] = minimize_prefixes(allow_union[capability])
+        effective_deny[capability] = minimize_prefixes(deny_union[capability])
+    return effective_allow, effective_deny
 
 
 def descriptor_payload(
@@ -207,7 +237,7 @@ def descriptor_payload(
     role_ids: list[str],
 ) -> dict:
     principal = state["principals"][principal_id]
-    read, write = effective_grants(state, role_ids)
+    allow, deny = effective_grants(state, role_ids)
     return {
         "algorithm": DESCRIPTOR_ALGORITHM,
         "principal_id": principal_id,
@@ -216,8 +246,8 @@ def descriptor_payload(
         "team_ids": team_ids,
         "role_ids": role_ids,
         "binding_ids": binding_ids,
-        "read": read,
-        "write": write,
+        "capabilities": allow,
+        "restrictions": deny,
     }
 
 
@@ -252,8 +282,10 @@ def effective_descriptor(state: dict, principal_id: str, canonical_ref: str) -> 
 def require_descriptor_assignment(view: dict) -> tuple[str, int]:
     descriptor_id = view.get("descriptor_id")
     generation = view.get("descriptor_generation")
-    if not isinstance(descriptor_id, str) or generation != 1:
-        raise ForgeError("view lacks a valid generation-1 descriptor assignment")
+    if not isinstance(descriptor_id, str):
+        raise ForgeError("view lacks a valid descriptor assignment")
+    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
+        raise ForgeError("view lacks a valid descriptor generation")
     return descriptor_id, generation
 
 
@@ -265,22 +297,44 @@ def require_matching_descriptor(
         raise ForgeError("projection descriptor changed")
 
 
+def assigned_descriptor(state: dict, principal_id: str) -> dict | None:
+    """The descriptor currently bound to this principal's views, if any."""
+    for view in state.setdefault("views", {}).values():
+        if view["principal_id"] == principal_id:
+            descriptor = state["view_descriptors"].get(view["descriptor_id"])
+            if descriptor is None:
+                raise ForgeError("view references an unknown descriptor")
+            return descriptor
+    return None
+
+
+def _verified_descriptor_record(state: dict, descriptor_id: str) -> dict:
+    descriptor = state["view_descriptors"].get(descriptor_id)
+    if descriptor is None:
+        raise ForgeError(f"unknown descriptor: {descriptor_id}")
+    payload = {key: value for key, value in descriptor.items() if key != "id"}
+    if compute_descriptor_id(payload) != descriptor_id:
+        raise ForgeError("descriptor content does not match its identity")
+    if payload.get("algorithm") != DESCRIPTOR_ALGORITHM:
+        raise ForgeError(f"unsupported descriptor algorithm: {payload.get('algorithm')!r}")
+    return descriptor
+
+
 def descriptor_for_view(state: dict, view_name: str) -> dict:
-    """Load and validate the immutable descriptor bound to one physical view."""
+    """Load the immutable descriptor bound to one physical view.
+
+    Catalog additions are dormant until an explicit policy transition, so
+    the bound descriptor is served verbatim; only its integrity is checked.
+    """
     view = state.setdefault("views", {}).get(view_name)
     if view is None:
         raise ForgeError(f"unknown view: {view_name}")
     descriptor_id, generation = require_descriptor_assignment(view)
-    descriptor = state.setdefault("view_descriptors", {}).get(descriptor_id)
-    if descriptor is None:
-        raise ForgeError(f"view references an unknown descriptor: {view_name}")
-    fresh = effective_descriptor(state, descriptor["principal_id"], view["canonical_ref"])
-    if fresh["id"] != descriptor_id or descriptor != fresh:
-        raise ForgeError(f"descriptor no longer matches resolution: {view_name}")
+    descriptor = _verified_descriptor_record(state, descriptor_id)
     if view["canonical_ref"] != descriptor["canonical_ref"]:
         raise ForgeError(f"descriptor canonical ref differs from view: {view_name}")
     if descriptor["principal_id"] != view["principal_id"]:
         raise ForgeError(f"descriptor principal differs from view: {view_name}")
-    if generation != 1:
+    if generation < 1:
         raise ForgeError(f"unsupported descriptor generation: {generation}")
     return descriptor

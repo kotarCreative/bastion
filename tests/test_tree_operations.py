@@ -164,7 +164,7 @@ class TreeOperationsTest(unittest.TestCase):
         command("git", "-C", os.fsdecode(self.fixture.admin), "push", "origin", f"{bad}:refs/staging/bad-gitlink")
         before = self.fixture.rejection_snapshot()
         with self.assertRaisesRegex(ForgeError, "unsupported tree entry"):
-            forge.update_canonical_ref(self.fixture.root, expected, bad)
+            identity_harness.update_canonical(self.fixture.root, expected, bad)
         self.fixture.assert_rejection(before)
 
         git(self.fixture.admin, "update-ref", "refs/heads/main", expected)
@@ -172,7 +172,7 @@ class TreeOperationsTest(unittest.TestCase):
         command("git", "-C", os.fsdecode(self.fixture.admin), "push", "origin", f"{bad}:refs/staging/bad-empty")
         before = self.fixture.rejection_snapshot()
         with self.assertRaisesRegex(ForgeError, "explicit empty subtrees are not supported"):
-            forge.update_canonical_ref(self.fixture.root, expected, bad)
+            identity_harness.update_canonical(self.fixture.root, expected, bad)
         self.fixture.assert_rejection(before)
 
 

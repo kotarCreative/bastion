@@ -45,6 +45,80 @@ def allowed(path: bytes, prefixes: list[str]) -> bool:
     return False
 
 
+def longest_covering(path: bytes, prefixes: list[str]) -> str | None:
+    """The longest normalized prefix whose area contains the byte path."""
+    best: str | None = None
+    best_length = -1
+    for raw in prefixes:
+        prefix = os.fsencode(raw)
+        if not prefix or path == prefix or path.startswith(prefix + b"/"):
+            if len(prefix) > best_length:
+                best, best_length = raw, len(prefix)
+    return best
+
+
+def capability_allowed(allow: list[str], deny: list[str], path: bytes) -> bool:
+    """Pointwise adjudication: the longest deny must be strictly shorter than allow."""
+    grant = longest_covering(path, allow)
+    if grant is None:
+        return False
+    restriction = longest_covering(path, deny)
+    if restriction is None:
+        return True
+    return len(os.fsencode(restriction)) < len(os.fsencode(grant))
+
+
+def visible(path: bytes, descriptor: dict) -> bool:
+    read = descriptor["capabilities"]["read"]
+    restrictions = descriptor["restrictions"]["read"]
+    return capability_allowed(read, restrictions, path)
+
+
+SYMLINK_MODE = b"120000"
+
+
+def required_capabilities(
+    parent: TreeEntry | None, child: TreeEntry | None
+) -> set[str]:
+    """Classify one changed leaf into the capabilities its effect requires.
+
+    Classifications compose: a changed path may require several capabilities
+    at once, and any touched or surviving symlink contributes ``symlink``.
+    """
+    effects = {"read"}
+    if parent is None and child is not None:
+        effects.add("create")
+    if parent is not None and child is None:
+        effects.add("delete")
+    if parent is not None and child is not None:
+        if parent[2] != child[2]:
+            effects.add("modify")
+        if parent[0] != child[0]:
+            effects.add("mode")
+        if parent[1] != child[1]:
+            effects.add("symlink")
+    if (parent is not None and parent[0] == SYMLINK_MODE) or (
+        child is not None and child[0] == SYMLINK_MODE
+    ):
+        effects.add("symlink")
+    return effects
+
+
+def authorize_changes(
+    changes: TreeChanges,
+    parents: TreeEntries,
+    descriptor: dict,
+) -> None:
+    capabilities = descriptor["capabilities"]
+    restrictions = descriptor["restrictions"]
+    for path, entry in changes.items():
+        for effect in sorted(required_capabilities(parents.get(path), entry)):
+            if not capability_allowed(capabilities[effect], restrictions[effect], path):
+                raise ForgeError(
+                    "submission changes a path outside current authorization"
+                )
+
+
 def changed_entries(parent: TreeEntries, child: TreeEntries) -> TreeChanges:
     return {
         path: child.get(path)
@@ -62,14 +136,6 @@ def has_file_directory_conflict(entries: TreeEntries) -> bool:
             if b"/".join(parts[:index]) in paths:
                 return True
     return False
-
-
-def authorize_changes(changes: TreeChanges, descriptor: dict) -> None:
-    read = descriptor["read"]
-    write = descriptor["write"]
-    for path in changes:
-        if not allowed(path, write) or not allowed(path, read):
-            raise ForgeError("submission changes a path outside current authorization")
 
 
 def apply_changes(canonical: TreeEntries, changes: TreeChanges) -> TreeEntries:

@@ -76,7 +76,11 @@ class MigrationFixture:
         commit(source, "initial", 1_700_000_000)
 
         self.forge = root / "forge"
-        from tests.identity_harness import add_view as fixture_add_view
+        from tests.identity_harness import (
+            add_view as fixture_add_view,
+            provision_admin,
+            update_canonical,
+        )
 
         forge.init_forge(self.forge, source, "main")
         fixture_add_view(self.forge, "alice", ["shared", "team-a"], ["shared", "team-a"], "main")
@@ -101,7 +105,8 @@ class MigrationFixture:
         new = commit(admin, "hidden-only admin change\n\nChange-Id: I" + "2" * 40, 1_700_000_200)
         old = command("git", "rev-parse", "HEAD~1", cwd=admin).stdout.strip()
         command("git", "push", "-q", "origin", f"{new}:refs/staging/migration-fixture", cwd=admin)
-        forge.update_canonical_ref(self.forge, old, new)
+        provision_admin(self.forge)
+        update_canonical(self.forge, old, new)
         forge.drain_projection_jobs(self.forge)
 
     def state_bytes(self) -> bytes:
@@ -109,7 +114,9 @@ class MigrationFixture:
 
 
 def downgrade_to_v1(forge_root: Path) -> None:
-    """Rewrite a quiescent version-2 state into its equivalent version-1 form."""
+    """Rewrite a quiescent version-3 state into its equivalent version-1 form."""
+    import identity
+
     state = load_state(forge_root)
     descriptors = state.get("view_descriptors", {})
     legacy: dict = {
@@ -125,12 +132,18 @@ def downgrade_to_v1(forge_root: Path) -> None:
     strip = ("descriptor_id", "descriptor_generation")
     for name, view in sorted(state["views"].items()):
         descriptor = descriptors[view["descriptor_id"]]
+        read = list(descriptor["capabilities"]["read"])
+        write_union: list[str] = []
+        for capability in ("create", "modify", "delete", "mode", "symlink"):
+            write_union.extend(descriptor["capabilities"][capability])
         legacy["views"][name] = {
             "principal": view["principal_id"],
             "canonical_ref": view["canonical_ref"],
             "projected_ref": view["projected_ref"],
-            "read": descriptor["read"],
-            "write": descriptor["write"],
+            "read": read,
+            "write": identity.minimize_prefixes(
+                identity.intersect_prefixes(read, write_union)
+            ),
             "canonical_frontier": view["canonical_frontier"],
             "projected_tip": view["projected_tip"],
             "anchors": {
@@ -146,6 +159,9 @@ def downgrade_to_v1(forge_root: Path) -> None:
         }
         if transaction.get("kind") != "canonical_update":
             record["principal"] = record.pop("principal_id")
+        else:
+            # Version-1 administrative updates carried no acting identity.
+            record.pop("principal_id", None)
         legacy["transactions"][identifier] = record
     for identifier, event in sorted(state["outbox"].items()):
         legacy["outbox"][identifier] = {
@@ -185,7 +201,7 @@ class MigrationTest(unittest.TestCase):
 
     def _migration_evidence_preserved(self, before_state: dict) -> None:
         after = load_state(self.forge)
-        self.assertEqual(2, after["version"])
+        self.assertEqual(3, after["version"])
         self.assertEqual(
             sorted(before_state["transactions"]), sorted(after["transactions"])
         )
@@ -302,7 +318,10 @@ class MigrationTest(unittest.TestCase):
         new = commit(admin, f"late {path_name} change", 1_700_000_300)
         old = command("git", "rev-parse", "HEAD~1", cwd=admin).stdout.strip()
         command("git", "push", "-q", "origin", f"{new}:refs/staging/migration-{name}", cwd=admin)
-        forge.update_canonical_ref(self.forge, old, new)
+        from tests.identity_harness import provision_admin, update_canonical
+
+        provision_admin(self.forge)
+        update_canonical(self.forge, old, new)
 
     def test_unsettled_transactions_reject_migration(self) -> None:
         self._prepare_unconfirmed_source()
@@ -377,7 +396,7 @@ class MigrationTest(unittest.TestCase):
         self._downgrade()
         for checkpoint_name, expected_versions in (
             ("state.temporary_fsynced", {1}),
-            ("state.replaced", {2}),
+            ("state.replaced", {3}),
         ):
             with self.subTest(checkpoint=checkpoint_name):
                 # Rebuild a pristine quiescent v1 forge for each kill point.

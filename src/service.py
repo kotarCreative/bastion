@@ -12,9 +12,9 @@ from pathlib import Path
 import identity
 from errors import ForgeError
 from failpoints import checkpoint
-from git import clean_env, git, output, ref, run, tree_entries
+from git import clean_env, git, output, ref, run, tree_entries, tree_oid
 from layout import ZERO_OID, canonical_repo, view_repo
-from projection import project_history
+from projection import project_history, project_tree, synthetic_commit
 from state import (
     has_unconfirmed_source,
     is_ancestor,
@@ -23,7 +23,7 @@ from state import (
     save_state,
     source_publication_pending,
 )
-from validation import validate_view_name
+from validation import capability_allowed, validate_view_name
 
 
 def init_forge(root: Path, source: Path, branch: str) -> None:
@@ -47,7 +47,7 @@ def init_forge(root: Path, source: Path, branch: str) -> None:
     save_state(
         root,
         {
-            "version": 2,
+            "version": 3,
             "canonical_branch": branch,
             "principals": {},
             "teams": {},
@@ -233,8 +233,13 @@ def add_team(root: Path, team_id: str, members: list[str]) -> None:
     _catalog_operation(root, lambda state: identity.add_team(state, team_id, members))
 
 
-def add_role(root: Path, role_id: str, read: list[str], write: list[str]) -> None:
-    _catalog_operation(root, lambda state: identity.add_role(state, role_id, read, write))
+def add_role(
+    root: Path,
+    role_id: str,
+    allow: dict[str, list[str]],
+    deny: dict[str, list[str]],
+) -> None:
+    _catalog_operation(root, lambda state: identity.add_role(state, role_id, allow, deny))
 
 
 def bind_role(root: Path, role_id: str, subject_kind: str, subject_id: str) -> None:
@@ -258,16 +263,16 @@ def add_view(
             raise ForgeError(
                 "this experiment supports the configured canonical branch only"
             )
-        descriptor = identity.effective_descriptor(
-            state, principal_id, f"refs/heads/{branch}"
-        )
-        if not descriptor["read"]:
+        # Dormant policy: a principal with existing views keeps its assigned
+        # descriptor until an explicit transition; otherwise bind fresh
+        # resolution.
+        descriptor = identity.assigned_descriptor(state, principal_id)
+        if descriptor is None:
+            descriptor = identity.effective_descriptor(
+                state, principal_id, f"refs/heads/{branch}"
+            )
+        if not descriptor["capabilities"]["read"]:
             raise ForgeError("principal has no effective readable path")
-        for other in state["views"].values():
-            if other["principal_id"] == principal_id and (
-                other["descriptor_id"] != descriptor["id"]
-            ):
-                raise ForgeError("principal views must share one effective descriptor")
         destination = view_repo(root, name)
         existed_before = destination.exists()
         run("git", "init", "--bare", "-q", "-b", branch, str(destination))
@@ -333,12 +338,36 @@ def current_target_assignments(state: dict) -> dict[str, dict]:
     }
 
 
+def _changed_paths_between(canonical: Path, expected: str, new: str) -> set[bytes]:
+    before = tree_entries(canonical, expected)
+    after = tree_entries(canonical, new)
+    return {
+        path for path in before.keys() | after.keys() if before.get(path) != after.get(path)
+    }
+
+
+def require_admin_coverage(
+    state: dict, principal_id: str, canonical: Path, expected: str, new: str
+) -> None:
+    """Require the acting principal's descriptor to hold admin over every change."""
+    canonical_ref = f"refs/heads/{state['canonical_branch']}"
+    descriptor = identity.effective_descriptor(state, principal_id, canonical_ref)
+    allow = descriptor["capabilities"]["admin"]
+    restrictions = descriptor["restrictions"]["admin"]
+    for path in sorted(_changed_paths_between(canonical, expected, new)):
+        if not capability_allowed(allow, restrictions, path):
+            raise ForgeError(
+                "acting principal lacks admin coverage for the canonical update"
+            )
+
+
 def update_canonical_ref_locked(
     root: Path,
     state: dict,
     expected: str,
     new: str,
     create_event: bool,
+    acting_principal_id: str | None = None,
 ) -> None:
     canonical = canonical_repo(root)
     canonical_ref = f"refs/heads/{state['canonical_branch']}"
@@ -346,6 +375,10 @@ def update_canonical_ref_locked(
     if actual != expected:
         raise ForgeError("canonical ref changed before administrative update")
     validate_canonical_update(canonical, expected, new)
+    if create_event:
+        if not acting_principal_id:
+            raise ForgeError("administrative updates require an acting principal")
+        require_admin_coverage(state, acting_principal_id, canonical, expected, new)
     transaction = None
     if create_event:
         sequence = state.setdefault("next_transaction_sequence", 1)
@@ -354,6 +387,7 @@ def update_canonical_ref_locked(
         transaction = {
             "id": transaction_id,
             "kind": "canonical_update",
+            "principal_id": acting_principal_id,
             "sequence": sequence,
             "canonical_ref": canonical_ref,
             "canonical_old": expected,
@@ -378,7 +412,66 @@ def update_canonical_ref_locked(
         checkpoint(root, "admin.canonical_state_persisted")
 
 
-def update_canonical_ref(root: Path, expected: str, new: str) -> None:
+def update_canonical_ref(root: Path, expected: str, new: str, principal_id: str) -> None:
     """Serialize and enqueue an administrative canonical fast-forward."""
     with locked(root) as state:
-        update_canonical_ref_locked(root, state, expected, new, create_event=True)
+        update_canonical_ref_locked(
+            root, state, expected, new, create_event=True, acting_principal_id=principal_id
+        )
+
+
+def transition_principal(root: Path, principal_id: str) -> None:
+    """Apply a quiescent policy transition for every view of one principal."""
+    with locked(root) as state:
+        from migration import require_quiescent
+
+        require_quiescent(root, state)
+        identity.validate_identifier(principal_id)
+        if principal_id not in state["principals"]:
+            raise ForgeError(f"unknown principal: {principal_id}")
+        names = sorted(
+            name
+            for name, view in sorted(state["views"].items())
+            if view["principal_id"] == principal_id
+        )
+        if not names:
+            raise ForgeError("principal has no views to transition")
+        assignments = {state["views"][name]["descriptor_id"] for name in names}
+        generations = {state["views"][name]["descriptor_generation"] for name in names}
+        if len(assignments) != 1 or len(generations) != 1:
+            raise ForgeError("principal views disagree on their descriptor assignment")
+        fresh = identity.effective_descriptor(
+            state, principal_id, f"refs/heads/{state['canonical_branch']}"
+        )
+        current_id = next(iter(assignments))
+        if current_id == fresh["id"]:
+            return
+        generation = next(iter(generations)) + 1
+        canonical = canonical_repo(root)
+        checkpoint(root, "transition.prepared")
+        for name in names:
+            view = state["views"][name]
+            destination = view_repo(root, name)
+            tip = view["projected_tip"]
+            frontier = view["canonical_frontier"]
+            if tip != ZERO_OID and frontier != ZERO_OID:
+                new_tree = project_tree(canonical, destination, frontier, fresh)
+                old_tree = tree_oid(destination, tip)
+                if new_tree != old_tree:
+                    commit = synthetic_commit(
+                        canonical, destination, frontier, new_tree, tip, None
+                    )
+                    git(destination, "update-ref", view["projected_ref"], commit, tip)
+                    checkpoint(root, "transition.ref_published")
+                    view["anchors"][commit] = {
+                        "canonical": frontier,
+                        "kind": "synthetic",
+                        "change_id": None,
+                        "descriptor_id": fresh["id"],
+                        "descriptor_generation": generation,
+                    }
+                    view["projected_tip"] = commit
+            view["descriptor_id"] = fresh["id"]
+            view["descriptor_generation"] = generation
+        save_state(root, state)
+        checkpoint(root, "transition.state_persisted")

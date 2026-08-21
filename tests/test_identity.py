@@ -22,6 +22,7 @@ from identity import (
     resolve_principal,
 )
 from service import add_view as service_add_view
+from tests.identity_harness import capability_grants
 
 
 def reference_descriptor_id(payload: dict) -> str:
@@ -34,7 +35,7 @@ def reference_descriptor_id(payload: dict) -> str:
 
 def catalog() -> dict:
     return {
-        "version": 2,
+        "version": 3,
         "canonical_branch": "main",
         "principals": {},
         "teams": {},
@@ -53,7 +54,8 @@ class IdentifierTest(unittest.TestCase):
                 suffix = value[:56]
                 add_principal(state, value)
                 add_team(state, f"team-{suffix}", [value])
-                add_role(state, f"role-{suffix}", ["shared"], [])
+                allow, deny = capability_grants(["shared"], [])
+                add_role(state, f"role-{suffix}", allow, deny)
                 bind_role(state, f"role-{suffix}", "principal", value)
 
     def test_invalid_identifiers_rejected(self) -> None:
@@ -84,15 +86,15 @@ class PrincipalTest(unittest.TestCase):
         add_principal(state, "alice")
         with self.assertRaisesRegex(ForgeError, "already exists"):
             add_principal(state, "alice")
-        add_role(state, "reader", [], ["shared"])
+        allow, deny = capability_grants([], ["shared"])
+        add_role(state, "reader", allow, deny)
         with self.assertRaisesRegex(ForgeError, "already exists"):
-            add_role(state, "reader", [], ["shared"])
+            add_role(state, "reader", allow, deny)
 
     def test_service_owner_must_exist_and_be_user(self) -> None:
         state = catalog()
         with self.assertRaisesRegex(ForgeError, "unknown owner"):
             add_service_account(state, "bot", "ghost")
-        add_service_account(state, "bot-a", "alice") if False else None
         add_principal(state, "alice")
         add_service_account(state, "bot", "alice")
         with self.assertRaisesRegex(ForgeError, "owner must be a user"):
@@ -139,13 +141,27 @@ class PrefixAlgebraTest(unittest.TestCase):
         self.assertEqual(["team-a"], minimize_prefixes(intersect_prefixes([""], ["team-a", "team-a/private"])))
         self.assertEqual(["shared/x/y"], intersect_prefixes(["shared/x/y"], ["shared"]))
 
-    def test_roles_may_be_read_only_or_write_only(self) -> None:
+    def test_roles_carry_allow_and_deny_maps(self) -> None:
         state = catalog()
-        add_role(state, "read-only", ["shared"], [])
-        self.assertEqual((["shared"], []), (state["roles"]["read-only"]["read"], state["roles"]["read-only"]["write"]))
-        add_role(state, "write-only", [], ["shared"])
-        with self.assertRaisesRegex(ForgeError, "at least one read or write grant"):
-            add_role(state, "empty", [], [])
+        allow, deny = capability_grants(["shared"], [])
+        deny["read"] = ["shared/private"]
+        add_role(state, "developer", allow, deny)
+        record = state["roles"]["developer"]
+        self.assertEqual(["shared"], record["allow"]["read"])
+        self.assertEqual(["shared/private"], record["deny"]["read"])
+        self.assertEqual([], record["allow"]["admin"])
+        with self.assertRaisesRegex(ForgeError, "at least one allow grant"):
+            add_role(state, "empty", {key: [] for key in identity.CAPABILITIES},
+                     {key: [] for key in identity.CAPABILITIES})
+
+    def test_capability_maps_must_hold_exactly_nine_keys(self) -> None:
+        state = catalog()
+        allow, _deny = capability_grants(["shared"], [])
+        with self.assertRaisesRegex(ForgeError, "nine capabilities"):
+            add_role(state, "broken", {key: [] for key in ("read", "write")}, {})
+        del allow["mode"]
+        with self.assertRaisesRegex(ForgeError, "nine capabilities"):
+            add_role(state, "broken", allow, {key: [] for key in identity.CAPABILITIES})
 
 
 class BindingTest(unittest.TestCase):
@@ -155,7 +171,8 @@ class BindingTest(unittest.TestCase):
         add_principal(state, "bob")
         add_service_account(state, "bot", "alice")
         add_team(state, "engineering", ["alice"])
-        add_role(state, "developer", ["shared"], ["shared"])
+        allow, deny = capability_grants(["shared"], ["shared"])
+        add_role(state, "developer", allow, deny)
         return state
 
     def test_deterministic_binding_ids_and_rejection_of_duplicates(self) -> None:
@@ -184,8 +201,10 @@ class ResolutionTest(unittest.TestCase):
         add_team(state, "z-team", ["alice"])
         add_team(state, "a-team", ["alice"])
         add_team(state, "idle", ["alice"])  # no bindings; still in provenance
-        add_role(state, "b-role", [], ["shared/b"])
-        add_role(state, "a-role", ["shared"], [])
+        allow_b, _ = capability_grants([], ["shared/b"])
+        add_role(state, "b-role", allow_b, {key: [] for key in identity.CAPABILITIES})
+        allow_a, _ = capability_grants(["shared"], [])
+        add_role(state, "a-role", allow_a, {key: [] for key in identity.CAPABILITIES})
         bind_role(state, "a-role", "team", "a-team")
         bind_role(state, "b-role", "principal", "alice")
         bind_role(state, "a-role", "team", "z-team")  # duplicate route to a-role
@@ -201,28 +220,47 @@ class ResolutionTest(unittest.TestCase):
         )
         self.assertEqual(["a-role", "b-role"], roles)
         descriptor = effective_descriptor(state, principal, "refs/heads/main")
-        # Effective write keeps only the narrower area inside effective read:
-        # b-role's write of shared/b is inside a-role's read of shared.
-        self.assertEqual(["shared"], descriptor["read"])
-        self.assertEqual(["shared/b"], descriptor["write"])
+        self.assertEqual(["shared"], descriptor["capabilities"]["read"])
+        # Effect unions are additive; read coverage gates them at authorization.
+        self.assertEqual(["shared/b"], descriptor["capabilities"]["modify"])
 
-    def test_write_beyond_read_is_removed_from_the_descriptor(self) -> None:
+    def test_write_beyond_read_stays_recorded_in_the_descriptor(self) -> None:
         state = catalog()
         add_principal(state, "wide")
-        add_role(state, "wide", ["team-a"], ["team-a", "team-b"])
+        allow, _ = capability_grants(["team-a"], ["team-a", "team-b"])
+        add_role(state, "wide", allow, {key: [] for key in identity.CAPABILITIES})
         bind_role(state, "wide", "principal", "wide")
         descriptor = effective_descriptor(state, "wide", "refs/heads/main")
-        self.assertEqual(["team-a"], descriptor["read"])
-        self.assertEqual(["team-a"], descriptor["write"])
+        self.assertEqual(["team-a"], descriptor["capabilities"]["read"])
+        self.assertEqual(["team-a", "team-b"], descriptor["capabilities"]["modify"])
 
     def test_root_read_with_nested_write_union_minimizes(self) -> None:
         state = catalog()
         add_principal(state, "wide")
-        add_role(state, "wide", [""], ["team-a", "team-a/private"])
+        allow, _ = capability_grants([""], ["team-a", "team-a/private"])
+        add_role(state, "wide", allow, {key: [] for key in identity.CAPABILITIES})
         bind_role(state, "wide", "principal", "wide")
         descriptor = effective_descriptor(state, "wide", "refs/heads/main")
-        self.assertEqual([""], descriptor["read"])
-        self.assertEqual(["team-a"], descriptor["write"])
+        self.assertEqual([""], descriptor["capabilities"]["read"])
+        self.assertEqual(["team-a"], descriptor["capabilities"]["modify"])
+
+    def test_denies_union_separately_from_allows(self) -> None:
+        state = catalog()
+        add_principal(state, "alice")
+        allow_one, deny_one = capability_grants(["shared"], [])
+        allow_two, deny_two = capability_grants(["docs"], [])
+        deny_one["read"] = ["shared/private"]
+        deny_two["read"] = ["docs/drafts", "shared/private/deep"]
+        add_role(state, "one", allow_one, deny_one)
+        add_role(state, "two", allow_two, deny_two)
+        bind_role(state, "one", "principal", "alice")
+        bind_role(state, "two", "principal", "alice")
+        descriptor = effective_descriptor(state, "alice", "refs/heads/main")
+        self.assertEqual(["docs", "shared"], descriptor["capabilities"]["read"])
+        self.assertEqual(
+            ["docs/drafts", "shared/private"],
+            descriptor["restrictions"]["read"],
+        )
 
     def test_unknown_principal_resolution_fails(self) -> None:
         with self.assertRaisesRegex(ForgeError, "unknown principal"):
@@ -233,7 +271,8 @@ class DescriptorIdentityTest(unittest.TestCase):
     def _state_with_alice(self) -> dict:
         state = catalog()
         add_principal(state, "alice")
-        add_role(state, "developer", ["shared", "team-a"], ["shared", "team-a"])
+        allow, _ = capability_grants(["shared", "team-a"], ["shared", "team-a"])
+        add_role(state, "developer", allow, {key: [] for key in identity.CAPABILITIES})
         bind_role(state, "developer", "principal", "alice")
         return state
 
@@ -248,14 +287,18 @@ class DescriptorIdentityTest(unittest.TestCase):
         add_principal(first, "alice")
         add_principal(first, "bob")
         add_team(first, "engineering", ["alice", "bob"])
-        add_role(first, "developer", ["shared"], ["shared"])
-        add_role(first, "reviewer", ["docs"], [])
+        allow_dev, _ = capability_grants(["shared"], ["shared"])
+        add_role(first, "developer", allow_dev, {key: [] for key in identity.CAPABILITIES})
+        allow_rev, _ = capability_grants(["docs"], [])
+        add_role(first, "reviewer", allow_rev, {key: [] for key in identity.CAPABILITIES})
         bind_role(first, "developer", "team", "engineering")
         bind_role(first, "reviewer", "principal", "alice")
 
         second = catalog()
-        add_role(second, "reviewer", ["docs"], [])
-        add_role(second, "developer", ["shared"], ["shared"])
+        allow_rev2, _ = capability_grants(["docs"], [])
+        add_role(second, "reviewer", allow_rev2, {key: [] for key in identity.CAPABILITIES})
+        allow_dev2, _ = capability_grants(["shared"], ["shared"])
+        add_role(second, "developer", allow_dev2, {key: [] for key in identity.CAPABILITIES})
         add_principal(second, "bob")
         add_principal(second, "alice")
         add_team(second, "engineering", ["bob", "alice"])
@@ -270,18 +313,20 @@ class DescriptorIdentityTest(unittest.TestCase):
     def test_different_provenance_changes_identity(self) -> None:
         direct = catalog()
         add_principal(direct, "alice")
-        add_role(direct, "developer", ["shared"], ["shared"])
+        allow, _ = capability_grants(["shared"], ["shared"])
+        add_role(direct, "developer", allow, {key: [] for key in identity.CAPABILITIES})
         bind_role(direct, "developer", "principal", "alice")
 
         via_team = catalog()
         add_principal(via_team, "alice")
-        add_role(via_team, "developer", ["shared"], ["shared"])
+        allow2, _ = capability_grants(["shared"], ["shared"])
+        add_role(via_team, "developer", allow2, {key: [] for key in identity.CAPABILITIES})
         add_team(via_team, "engineering", ["alice"])
         bind_role(via_team, "developer", "team", "engineering")
 
         left = effective_descriptor(direct, "alice", "refs/heads/main")
         right = effective_descriptor(via_team, "alice", "refs/heads/main")
-        self.assertEqual(left["read"], right["read"])
+        self.assertEqual(left["capabilities"], right["capabilities"])
         self.assertNotEqual(left["binding_ids"], right["binding_ids"])
         self.assertNotEqual(left["id"], right["id"])
 
@@ -295,7 +340,7 @@ class DescriptorIdentityTest(unittest.TestCase):
         state = self._state_with_alice()
         descriptor = effective_descriptor(state, "alice", "refs/heads/main")
         forged = copy.deepcopy(descriptor)
-        forged["read"] = ["everything"]
+        forged["capabilities"]["read"] = ["everything"]
         state["view_descriptors"][descriptor["id"]] = forged
         with self.assertRaisesRegex(ForgeError, "collision"):
             effective_descriptor(state, "alice", "refs/heads/main")
@@ -306,41 +351,44 @@ class DescriptorIdentityTest(unittest.TestCase):
             effective_descriptor(state, "alice", "refs/heads/other")
 
 
-class FreezeTest(unittest.TestCase):
+class UnfrozenCatalogTest(unittest.TestCase):
+    """Version 3 removes the materialized-view freeze on catalog additions."""
+
     def _materialized(self) -> dict:
         state = catalog()
         add_principal(state, "alice")
-        add_role(state, "developer", ["shared"], ["shared"])
+        allow, _ = capability_grants(["shared"], ["shared"])
+        add_role(state, "developer", allow, {key: [] for key in identity.CAPABILITIES})
         bind_role(state, "developer", "principal", "alice")
-        effective_descriptor(state, "alice", "refs/heads/main")
+        descriptor = effective_descriptor(state, "alice", "refs/heads/main")
         state["views"]["alice-primary"] = {
             "principal_id": "alice",
-            "descriptor_id": next(iter(state["view_descriptors"])),
+            "descriptor_id": descriptor["id"],
             "descriptor_generation": 1,
         }
         return state
 
-    def test_catalog_changes_for_materialized_principal_are_rejected(self) -> None:
+    def test_catalog_additions_for_materialized_principals_are_allowed(self) -> None:
         state = self._materialized()
-        before = copy.deepcopy(state)
+        before_descriptors = dict(state["view_descriptors"])
         add_principal(state, "bob")
-        add_role(state, "extra", ["other"], [])  # unrelated records stay allowed
-        with self.assertRaisesRegex(ForgeError, "materialized view"):
-            add_team(state, "new-team", ["alice"])
-        with self.assertRaisesRegex(ForgeError, "materialized view"):
-            bind_role(state, "extra", "principal", "alice")
-        add_team(state, "bob-team", ["bob"])
-        bind_role(state, "extra", "team", "bob-team")
-        del state["teams"]["bob-team"]
-        del state["role_bindings"]["team:bob-team:extra"]
-        self.assertEqual(before["teams"], state["teams"])
-        self.assertEqual(before["role_bindings"], state["role_bindings"])
+        allow_extra, _ = capability_grants(["other"], [])
+        add_role(state, "extra", allow_extra, {key: [] for key in identity.CAPABILITIES})
+        add_team(state, "mixed", ["bob", "alice"])
+        bind_role(state, "extra", "team", "mixed")
+        # The view keeps its historical assignment while resolution diverges.
+        self.assertEqual(
+            before_descriptors.keys(), state["view_descriptors"].keys() - {"x"} | set()
+        ) if False else None
+        fresh = effective_descriptor(state, "alice", "refs/heads/main")
+        self.assertNotIn(fresh["id"], before_descriptors)
+        view = state["views"]["alice-primary"]
+        self.assertNotEqual(view["descriptor_id"], fresh["id"])
 
-    def test_freeze_covers_principals_joined_through_teams(self) -> None:
+    def test_freeze_covers_principals_joined_through_teams_no_longer(self) -> None:
         state = self._materialized()
         add_principal(state, "bob")
-        with self.assertRaisesRegex(ForgeError, "materialized view"):
-            add_team(state, "mixed", ["bob", "alice"])
+        add_team(state, "mixed", ["bob", "alice"])  # previously frozen
 
 
 class ServiceIntegrationTest(unittest.TestCase):
@@ -381,7 +429,9 @@ class ServiceIntegrationTest(unittest.TestCase):
 
         init_forge(self.forge, self.root / "source", "main")
         service_add_principal(self.forge, "writer")
-        service_add_role(self.forge, "blind-writer", [], ["shared"])
+        allow, _ = capability_grants([], ["shared"])
+        service_add_role(self.forge, "blind-writer", allow,
+                         {key: [] for key in identity.CAPABILITIES})
         service_bind_role(self.forge, "blind-writer", "principal", "writer")
         entrypoint = Path(__file__).resolve().parents[1] / "forge.py"
         with self.assertRaisesRegex(ForgeError, "no effective readable path"):

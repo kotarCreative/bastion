@@ -11,6 +11,8 @@ from errors import ForgeError
 from service import init_forge, update_canonical_ref
 import forge
 
+from tests.identity_harness import provision_admin
+
 
 class ForgeInitializationTest(unittest.TestCase):
     def test_revision_expression_is_not_a_branch_name(self) -> None:
@@ -80,7 +82,7 @@ class ForgeInitializationTest(unittest.TestCase):
                 check=True,
             )
             with self.assertRaisesRegex(ForgeError, "canonical merge commits"):
-                update_canonical_ref(forge_root, old, merge)
+                update_canonical_ref(forge_root, old, merge, provision_admin(forge_root))
             self.assertEqual(old, forge.ref(canonical, "refs/heads/main"))
 
     def test_canonical_update_requires_immutable_oid(self) -> None:
@@ -101,7 +103,7 @@ class ForgeInitializationTest(unittest.TestCase):
             init_forge(forge_root, source, "main")
             old = forge.ref(forge.canonical_repo(forge_root), "refs/heads/main")
             with self.assertRaisesRegex(ForgeError, "immutable full commit OIDs"):
-                update_canonical_ref(forge_root, old, "refs/staging/next")
+                update_canonical_ref(forge_root, old, "refs/staging/next", provision_admin(forge_root))
 
     def test_canonical_update_without_views_completes_immediately(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -133,7 +135,7 @@ class ForgeInitializationTest(unittest.TestCase):
                 cwd=source,
                 check=True,
             )
-            update_canonical_ref(forge_root, old, new)
+            update_canonical_ref(forge_root, old, new, provision_admin(forge_root))
             state = json.loads((forge_root / "state.json").read_text())
             self.assertEqual("published", next(iter(state["transactions"].values()))["status"])
 

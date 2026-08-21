@@ -17,8 +17,8 @@ from git import (
     write_tree,
 )
 from layout import ZERO_OID
-from validation import allowed
 from validation import parse_change_id
+from validation import visible
 
 
 def project_tree(
@@ -29,19 +29,18 @@ def project_tree(
     source_env: dict[str, str] | None = None,
     destination_env: dict[str, str] | None = None,
 ) -> str:
-    read_prefixes = descriptor["read"]
-    visible = {}
+    visible_paths = {}
     validate_no_empty_subtrees(canonical, canonical_treeish, source_env)
     for path, entry in tree_entries(canonical, canonical_treeish, source_env).items():
-        if not allowed(path, read_prefixes):
+        if not visible(path, descriptor):
             continue
         mode, kind, oid = entry
         if kind == b"blob":
             copy_object(canonical, destination, oid, source_env, destination_env)
         elif kind != b"commit":
             raise ForgeError("unsupported canonical tree entry")
-        visible[path] = (mode, kind, oid)
-    return write_tree(destination, visible, destination_env)
+        visible_paths[path] = (mode, kind, oid)
+    return write_tree(destination, visible_paths, destination_env)
 
 
 def synthetic_commit(
@@ -92,7 +91,6 @@ def project_history(
     descriptor: dict,
 ) -> tuple[str, str, dict[str, dict[str, str]]]:
     """Project canonical commits, eliding commits whose visible tree is unchanged."""
-    read_prefixes = descriptor["read"]
     previous_tree = (
         tree_oid(destination, projected_tip) if projected_tip != ZERO_OID else None
     )

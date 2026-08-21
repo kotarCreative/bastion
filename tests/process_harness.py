@@ -111,6 +111,7 @@ class Fixture:
             target.write_bytes(contents)
         self._commit(self.source, "initial fixture", 1_700_000_000)
         forge.init_forge(self.forge, self.source, "main")
+        self.admin_principal = identity_harness.provision_admin(self.forge)
         identity_harness.add_view(
             self.forge, "alice", ["shared", "team-a"], ["shared", "team-a"], "main"
         )
@@ -237,7 +238,7 @@ class Fixture:
     ) -> tuple[str, str]:
         """Place an administrative canonical update and return (old, new)."""
         old, new = self.stage_admin_commit(path, contents, message, timestamp)
-        forge.update_canonical_ref(self.forge, old, new)
+        identity_harness.update_canonical(self.forge, old, new, self.admin_principal)
         return old, new
 
     def source_push(
