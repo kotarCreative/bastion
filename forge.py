@@ -64,6 +64,13 @@ def parser() -> argparse.ArgumentParser:
     post = commands.add_parser("post-receive")
     post.add_argument("root", type=Path)
     post.add_argument("name")
+    token_command = commands.add_parser("add-token")
+    token_command.add_argument("root", type=Path)
+    token_command.add_argument("view")
+    serve = commands.add_parser("serve")
+    serve.add_argument("root", type=Path)
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=8000)
     return result
 
 
@@ -88,6 +95,14 @@ def main() -> int:
             pre_receive(args.root, args.name, sys.stdin.buffer.read())
         elif args.command == "post-receive":
             post_receive(args.root, args.name, sys.stdin.buffer.read())
+        elif args.command == "add-token":
+            from http_server import add_token
+
+            print(add_token(args.root, args.view))
+        elif args.command == "serve":
+            from http_server import serve
+
+            serve(args.root, args.host, args.port)
         return 0
     except ForgeError as error:
         print(f"bastion: {error}", file=sys.stderr)
