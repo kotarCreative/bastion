@@ -35,7 +35,7 @@ def reference_descriptor_id(payload: dict) -> str:
 
 def catalog() -> dict:
     return {
-        "version": 3,
+        "version": 4,
         "canonical_branch": "main",
         "principals": {},
         "teams": {},

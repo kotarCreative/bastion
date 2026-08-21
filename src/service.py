@@ -47,7 +47,7 @@ def init_forge(root: Path, source: Path, branch: str) -> None:
     save_state(
         root,
         {
-            "version": 3,
+            "version": 4,
             "canonical_branch": branch,
             "principals": {},
             "teams": {},
@@ -218,14 +218,23 @@ def _catalog_operation(root: Path, operation) -> None:
         save_state(root, state)
 
 
-def add_principal(root: Path, principal_id: str) -> None:
-    _catalog_operation(root, lambda state: identity.add_principal(state, principal_id))
+def add_principal(root: Path, principal_id: str, emails: list[str] | None = None) -> None:
+    _catalog_operation(
+        root, lambda state: identity.add_principal(state, principal_id, emails)
+    )
 
 
-def add_service_account(root: Path, service_id: str, owner_principal_id: str) -> None:
+def add_service_account(
+    root: Path,
+    service_id: str,
+    owner_principal_id: str,
+    emails: list[str] | None = None,
+) -> None:
     _catalog_operation(
         root,
-        lambda state: identity.add_service_account(state, service_id, owner_principal_id),
+        lambda state: identity.add_service_account(
+            state, service_id, owner_principal_id, emails
+        ),
     )
 
 

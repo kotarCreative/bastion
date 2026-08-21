@@ -12,6 +12,7 @@ from validation import normalize_prefix
 
 IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 PRINCIPAL_KINDS = {"user", "service_account"}
+EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 CAPABILITIES = (
     "read",
     "create",
@@ -22,15 +23,29 @@ CAPABILITIES = (
     "branch",
     "merge",
     "admin",
+    "tag",
 )
-DESCRIPTOR_ALGORITHM = "capabilities-v1"
+DESCRIPTOR_ALGORITHM = "capabilities-v2"
 LEGACY_DESCRIPTOR_ALGORITHM = "effective-view-v1"
 DESCRIPTOR_DOMAIN = b"bastion-effective-view-v1\0"
+TIMESTAMP_SKEW_SECONDS = 600
 
 
 def validate_identifier(identifier: str) -> None:
     if not isinstance(identifier, str) or not IDENTIFIER.fullmatch(identifier):
         raise ForgeError(f"identifier must be a simple 1-64 character token: {identifier!r}")
+
+
+def normalize_emails(values: object) -> list[str]:
+    """Validate, lowercase, sort, and deduplicate declared author addresses."""
+    if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+        raise ForgeError("emails must be a list of address strings")
+    normalized: set[str] = set()
+    for value in values:
+        if len(value) > 254 or not EMAIL.fullmatch(value.strip()):
+            raise ForgeError(f"invalid email address: {value!r}")
+        normalized.add(value.strip().lower())
+    return sorted(normalized)
 
 
 def prefix_covers(ancestor: str, descendant: str) -> bool:
@@ -83,15 +98,23 @@ def normalize_capability_map(raw: object, subject: str) -> dict[str, list[str]]:
     return result
 
 
-def add_principal(state: dict, principal_id: str) -> None:
+def add_principal(state: dict, principal_id: str, emails: list[str] | None = None) -> None:
     validate_identifier(principal_id)
     principals = state.setdefault("principals", {})
     if principal_id in principals:
         raise ForgeError(f"principal already exists: {principal_id}")
-    principals[principal_id] = {"id": principal_id, "kind": "user"}
+    record: dict = {"id": principal_id, "kind": "user"}
+    if emails:
+        record["emails"] = normalize_emails(emails)
+    principals[principal_id] = record
 
 
-def add_service_account(state: dict, service_id: str, owner_principal_id: str) -> None:
+def add_service_account(
+    state: dict,
+    service_id: str,
+    owner_principal_id: str,
+    emails: list[str] | None = None,
+) -> None:
     validate_identifier(service_id)
     validate_identifier(owner_principal_id)
     principals = state.setdefault("principals", {})
@@ -102,11 +125,14 @@ def add_service_account(state: dict, service_id: str, owner_principal_id: str) -
         raise ForgeError(f"unknown owner principal: {owner_principal_id}")
     if owner["kind"] != "user":
         raise ForgeError("service-account owner must be a user principal")
-    principals[service_id] = {
+    record: dict = {
         "id": service_id,
         "kind": "service_account",
         "owner_principal_id": owner_principal_id,
     }
+    if emails:
+        record["emails"] = normalize_emails(emails)
+    principals[service_id] = record
 
 
 def add_team(state: dict, team_id: str, members: list[str]) -> None:
@@ -175,6 +201,21 @@ def bind_role(state: dict, role_id: str, subject_kind: str, subject_id: str) -> 
         "role_id": role_id,
     }
     return identifier
+
+
+def require_author_binding(
+    state: dict, principal_id: str, author_email: bytes
+) -> None:
+    """Enforce declared author identities for one submitted commit."""
+    record = state.setdefault("principals", {}).get(principal_id)
+    if record is None:
+        raise ForgeError(f"unknown principal: {principal_id}")
+    declared = record.get("emails") or []
+    if not declared:
+        return
+    address = author_email.decode(errors="surrogateescape").strip().lower()
+    if address not in declared:
+        raise ForgeError("submission is authored by an undeclared identity")
 
 
 def resolve_principal(state: dict, principal_id: str) -> tuple[list[str], list[str], list[str]]:

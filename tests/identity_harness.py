@@ -28,7 +28,7 @@ def capability_grants(read: list[str], write: list[str]) -> tuple[dict, dict]:
     """Expand legacy read/write prefix lists into v3 allow/deny maps."""
     allow = {capability: [] for capability in
              ("read", "create", "modify", "delete", "mode", "symlink",
-              "branch", "merge", "admin")}
+              "branch", "merge", "admin", "tag")}
     deny = {capability: [] for capability in allow}
     allow["read"] = list(read)
     for capability in WRITE_CAPABILITIES:

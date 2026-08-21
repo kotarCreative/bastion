@@ -201,7 +201,7 @@ class MigrationTest(unittest.TestCase):
 
     def _migration_evidence_preserved(self, before_state: dict) -> None:
         after = load_state(self.forge)
-        self.assertEqual(3, after["version"])
+        self.assertEqual(4, after["version"])
         self.assertEqual(
             sorted(before_state["transactions"]), sorted(after["transactions"])
         )
@@ -396,7 +396,7 @@ class MigrationTest(unittest.TestCase):
         self._downgrade()
         for checkpoint_name, expected_versions in (
             ("state.temporary_fsynced", {1}),
-            ("state.replaced", {3}),
+            ("state.replaced", {4}),
         ):
             with self.subTest(checkpoint=checkpoint_name):
                 # Rebuild a pristine quiescent v1 forge for each kill point.

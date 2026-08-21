@@ -144,13 +144,13 @@ class ProcessFailpointTest(unittest.TestCase):
 
     def test_source_validation_complete(self) -> None:
         control = self._source_control(
-            "alice", "shared/a.txt", b"a\n", "source a", 1_900_000_000, "Isrcval"
+            "alice", "shared/a.txt", b"a\n", "source a", 1_700_000_000, "Isrcval"
         )
         fresh = Fixture()
         self.addCleanup(fresh.cleanup)
         ctrl = Controller(fresh, self)
         fresh.client_commit(
-            "alice", "shared/a.txt", b"a\n", "source a", 1_900_000_000, "Isrcval"
+            "alice", "shared/a.txt", b"a\n", "source a", 1_700_000_000, "Isrcval"
         )
         actor = ctrl.run_actor(
             ["git", "push", "-q", "origin", "main"],
@@ -167,13 +167,13 @@ class ProcessFailpointTest(unittest.TestCase):
 
     def test_source_prepared_persisted(self) -> None:
         control = self._source_control(
-            "alice", "shared/b.txt", b"b\n", "source b", 1_900_000_000, "Isrcprep"
+            "alice", "shared/b.txt", b"b\n", "source b", 1_700_000_000, "Isrcprep"
         )
         fresh = Fixture()
         self.addCleanup(fresh.cleanup)
         ctrl = Controller(fresh, self)
         fresh.client_commit(
-            "alice", "shared/b.txt", b"b\n", "source b", 1_900_000_000, "Isrcprep"
+            "alice", "shared/b.txt", b"b\n", "source b", 1_700_000_000, "Isrcprep"
         )
         actor = ctrl.run_actor(
             ["git", "push", "-q", "origin", "main"],
@@ -190,13 +190,13 @@ class ProcessFailpointTest(unittest.TestCase):
 
     def test_source_canonical_ref_published(self) -> None:
         control = self._source_control(
-            "alice", "shared/c.txt", b"c\n", "source c", 1_900_000_000, "Isrccas"
+            "alice", "shared/c.txt", b"c\n", "source c", 1_700_000_000, "Isrccas"
         )
         fresh = Fixture()
         self.addCleanup(fresh.cleanup)
         ctrl = Controller(fresh, self)
         fresh.client_commit(
-            "alice", "shared/c.txt", b"c\n", "source c", 1_900_000_000, "Isrccas"
+            "alice", "shared/c.txt", b"c\n", "source c", 1_700_000_000, "Isrccas"
         )
         actor = ctrl.run_actor(
             ["git", "push", "-q", "origin", "main"],
@@ -214,13 +214,13 @@ class ProcessFailpointTest(unittest.TestCase):
 
     def test_source_canonical_state_persisted(self) -> None:
         control = self._source_control(
-            "alice", "shared/d.txt", b"d\n", "source d", 1_900_000_000, "Isrcstate"
+            "alice", "shared/d.txt", b"d\n", "source d", 1_700_000_000, "Isrcstate"
         )
         fresh = Fixture()
         self.addCleanup(fresh.cleanup)
         ctrl = Controller(fresh, self)
         fresh.client_commit(
-            "alice", "shared/d.txt", b"d\n", "source d", 1_900_000_000, "Isrcstate"
+            "alice", "shared/d.txt", b"d\n", "source d", 1_700_000_000, "Isrcstate"
         )
         actor = ctrl.run_actor(
             ["git", "push", "-q", "origin", "main"],
@@ -238,13 +238,13 @@ class ProcessFailpointTest(unittest.TestCase):
 
     def test_source_ref_published(self) -> None:
         control = self._source_control(
-            "alice", "shared/e.txt", b"e\n", "source e", 1_900_000_000, "Isrcref"
+            "alice", "shared/e.txt", b"e\n", "source e", 1_700_000_000, "Isrcref"
         )
         fresh = Fixture()
         self.addCleanup(fresh.cleanup)
         ctrl = Controller(fresh, self)
         fresh.client_commit(
-            "alice", "shared/e.txt", b"e\n", "source e", 1_900_000_000, "Isrcref"
+            "alice", "shared/e.txt", b"e\n", "source e", 1_700_000_000, "Isrcref"
         )
         actor = ctrl.run_actor(
             ["git", "push", "-q", "origin", "main"],
@@ -259,13 +259,13 @@ class ProcessFailpointTest(unittest.TestCase):
 
     def test_source_confirmation_persisted(self) -> None:
         control = self._source_control(
-            "alice", "shared/f.txt", b"f\n", "source f", 1_900_000_000, "Isrcconfirm"
+            "alice", "shared/f.txt", b"f\n", "source f", 1_700_000_000, "Isrcconfirm"
         )
         fresh = Fixture()
         self.addCleanup(fresh.cleanup)
         ctrl = Controller(fresh, self)
         fresh.client_commit(
-            "alice", "shared/f.txt", b"f\n", "source f", 1_900_000_000, "Isrcconfirm"
+            "alice", "shared/f.txt", b"f\n", "source f", 1_700_000_000, "Isrcconfirm"
         )
         actor = ctrl.run_actor(
             ["git", "push", "-q", "origin", "main"],
@@ -280,13 +280,13 @@ class ProcessFailpointTest(unittest.TestCase):
 
     def test_source_receiver_cleanup_persisted(self) -> None:
         control = self._source_control(
-            "alice", "shared/g.txt", b"g\n", "source g", 1_900_000_000, "Isrccleanup"
+            "alice", "shared/g.txt", b"g\n", "source g", 1_700_000_000, "Isrccleanup"
         )
         fresh = Fixture()
         self.addCleanup(fresh.cleanup)
         ctrl = Controller(fresh, self)
         fresh.client_commit(
-            "alice", "shared/g.txt", b"g\n", "source g", 1_900_000_000, "Isrccleanup"
+            "alice", "shared/g.txt", b"g\n", "source g", 1_700_000_000, "Isrccleanup"
         )
         actor = ctrl.run_actor(
             ["git", "push", "-q", "origin", "main"],
@@ -314,13 +314,13 @@ class ProcessFailpointTest(unittest.TestCase):
 
     def test_admin_prepared_persisted(self) -> None:
         old, new, control = self._admin_control(
-            "shared/admin.txt", b"admin\n", "admin update", 1_900_000_000
+            "shared/admin.txt", b"admin\n", "admin update", 1_700_000_000
         )
         fresh = Fixture()
         self.addCleanup(fresh.cleanup)
         ctrl = Controller(fresh, self)
         fresh_canonical_old, _ = fresh.stage_admin_commit(
-            "shared/admin.txt", b"admin\n", "admin update", 1_900_000_000
+            "shared/admin.txt", b"admin\n", "admin update", 1_700_000_000
         )
         actor = ctrl.run_actor(
             [
@@ -360,13 +360,13 @@ class ProcessFailpointTest(unittest.TestCase):
 
     def test_admin_canonical_ref_published(self) -> None:
         old, new, control = self._admin_control(
-            "shared/admin2.txt", b"admin2\n", "admin update 2", 1_900_000_000
+            "shared/admin2.txt", b"admin2\n", "admin update 2", 1_700_000_000
         )
         fresh = Fixture()
         self.addCleanup(fresh.cleanup)
         ctrl = Controller(fresh, self)
         fresh_canonical_old, _ = fresh.stage_admin_commit(
-            "shared/admin2.txt", b"admin2\n", "admin update 2", 1_900_000_000
+            "shared/admin2.txt", b"admin2\n", "admin update 2", 1_700_000_000
         )
         actor = ctrl.run_actor(
             [
@@ -390,13 +390,13 @@ class ProcessFailpointTest(unittest.TestCase):
 
     def test_admin_canonical_state_persisted(self) -> None:
         old, new, control = self._admin_control(
-            "shared/admin3.txt", b"admin3\n", "admin update 3", 1_900_000_000
+            "shared/admin3.txt", b"admin3\n", "admin update 3", 1_700_000_000
         )
         fresh = Fixture()
         self.addCleanup(fresh.cleanup)
         ctrl = Controller(fresh, self)
         fresh_canonical_old, _ = fresh.stage_admin_commit(
-            "shared/admin3.txt", b"admin3\n", "admin update 3", 1_900_000_000
+            "shared/admin3.txt", b"admin3\n", "admin update 3", 1_700_000_000
         )
         actor = ctrl.run_actor(
             [
@@ -425,13 +425,13 @@ class ProcessFailpointTest(unittest.TestCase):
     def _worker_crash_fixture(self) -> Fixture:
         fresh = Fixture()
         fresh.admin_update(
-            "shared/worker.txt", b"worker\n", "worker update", 1_900_000_000
+            "shared/worker.txt", b"worker\n", "worker update", 1_700_000_000
         )
         return fresh
 
     def test_worker_claim_persisted(self) -> None:
         control = self._worker_control(
-            "shared/worker.txt", b"worker\n", "worker update", 1_900_000_000
+            "shared/worker.txt", b"worker\n", "worker update", 1_700_000_000
         )
         fresh = self._worker_crash_fixture()
         self.addCleanup(fresh.cleanup)
@@ -442,14 +442,14 @@ class ProcessFailpointTest(unittest.TestCase):
                 str(ctrl.ACTOR_PY),
                 "worker",
                 str(fresh.forge),
-                str(1_900_000_000),
+                str(1_700_000_000),
             ],
             checkpoint="worker.claim_persisted",
             action="SIGKILL",
         )
         self.assertNotEqual(0, actor.returncode)
         fresh.recover()
-        now = 1_900_000_000 + worker.LEASE_SECONDS + 1
+        now = 1_700_000_000 + worker.LEASE_SECONDS + 1
         while fresh.run_worker(now):
             now += 1
         fresh.recover()
@@ -457,7 +457,7 @@ class ProcessFailpointTest(unittest.TestCase):
 
     def test_worker_plan_persisted(self) -> None:
         control = self._worker_control(
-            "shared/worker.txt", b"worker\n", "worker update", 1_900_000_000
+            "shared/worker.txt", b"worker\n", "worker update", 1_700_000_000
         )
         fresh = self._worker_crash_fixture()
         self.addCleanup(fresh.cleanup)
@@ -468,14 +468,14 @@ class ProcessFailpointTest(unittest.TestCase):
                 str(ctrl.ACTOR_PY),
                 "worker",
                 str(fresh.forge),
-                str(1_900_000_000),
+                str(1_700_000_000),
             ],
             checkpoint="worker.plan_persisted",
             action="SIGKILL",
         )
         self.assertNotEqual(0, actor.returncode)
         fresh.recover()
-        now = 1_900_000_000 + worker.LEASE_SECONDS + 1
+        now = 1_700_000_000 + worker.LEASE_SECONDS + 1
         while fresh.run_worker(now):
             now += 1
         fresh.recover()
@@ -483,7 +483,7 @@ class ProcessFailpointTest(unittest.TestCase):
 
     def test_projection_ref_published(self) -> None:
         control = self._worker_control(
-            "shared/worker.txt", b"worker\n", "worker update", 1_900_000_000
+            "shared/worker.txt", b"worker\n", "worker update", 1_700_000_000
         )
         fresh = self._worker_crash_fixture()
         self.addCleanup(fresh.cleanup)
@@ -494,14 +494,14 @@ class ProcessFailpointTest(unittest.TestCase):
                 str(ctrl.ACTOR_PY),
                 "worker",
                 str(fresh.forge),
-                str(1_900_000_000),
+                str(1_700_000_000),
             ],
             checkpoint="projection.ref_published",
             action="SIGKILL",
         )
         self.assertNotEqual(0, actor.returncode)
         fresh.recover()
-        now = 1_900_000_000 + worker.LEASE_SECONDS + 1
+        now = 1_700_000_000 + worker.LEASE_SECONDS + 1
         while fresh.run_worker(now):
             now += 1
         fresh.recover()
@@ -509,7 +509,7 @@ class ProcessFailpointTest(unittest.TestCase):
 
     def test_worker_completion_persisted(self) -> None:
         control = self._worker_control(
-            "shared/worker.txt", b"worker\n", "worker update", 1_900_000_000
+            "shared/worker.txt", b"worker\n", "worker update", 1_700_000_000
         )
         fresh = self._worker_crash_fixture()
         self.addCleanup(fresh.cleanup)
@@ -520,7 +520,7 @@ class ProcessFailpointTest(unittest.TestCase):
                 str(ctrl.ACTOR_PY),
                 "worker",
                 str(fresh.forge),
-                str(1_900_000_000),
+                str(1_700_000_000),
             ],
             checkpoint="worker.completion_persisted",
             action="SIGKILL",
@@ -537,7 +537,7 @@ class ProcessFailpointTest(unittest.TestCase):
         self.addCleanup(fresh.cleanup)
         ctrl = Controller(fresh, self)
         fresh.admin_update(
-            "shared/retry.txt", b"retry\n", "retry update", 1_900_000_000
+            "shared/retry.txt", b"retry\n", "retry update", 1_700_000_000
         )
         # Worker A claims the first sorted job and pauses after releasing the lock.
         worker_a = ctrl.start_actor(
@@ -546,7 +546,7 @@ class ProcessFailpointTest(unittest.TestCase):
                 str(ctrl.ACTOR_PY),
                 "worker",
                 str(fresh.forge),
-                str(1_900_000_000),
+                str(1_700_000_000),
             ],
             checkpoint="worker.claim_persisted",
         )
@@ -560,7 +560,7 @@ class ProcessFailpointTest(unittest.TestCase):
                 str(ctrl.ACTOR_PY),
                 "worker",
                 str(fresh.forge),
-                str(1_900_000_000 + worker.LEASE_SECONDS + 1),
+                str(1_700_000_000 + worker.LEASE_SECONDS + 1),
             ],
             checkpoint="worker.claim_persisted",
         )
@@ -588,7 +588,7 @@ class ProcessFailpointTest(unittest.TestCase):
                 str(ctrl.ACTOR_PY),
                 "fail",
                 str(fresh.forge),
-                str(1_900_000_000 + worker.LEASE_SECONDS + 1),
+                str(1_700_000_000 + worker.LEASE_SECONDS + 1),
                 job_id,
                 token,
             ],
@@ -603,7 +603,7 @@ class ProcessFailpointTest(unittest.TestCase):
 
         fresh.recover()
         # Settle remaining work deterministically after B's retry deadline.
-        now = 1_900_000_000 + worker.LEASE_SECONDS + 1 + worker.RETRY_SECONDS + 1
+        now = 1_700_000_000 + worker.LEASE_SECONDS + 1 + worker.RETRY_SECONDS + 1
         while fresh.run_worker(now):
             now += 1
         fresh.recover()
@@ -612,7 +612,7 @@ class ProcessFailpointTest(unittest.TestCase):
     def _lease_lost_control(self) -> dict:
         fresh = Fixture()
         fresh.admin_update(
-            "shared/retry.txt", b"retry\n", "retry update", 1_900_000_000
+            "shared/retry.txt", b"retry\n", "retry update", 1_700_000_000
         )
         fresh.settle()
         snapshot = authoritative_snapshot(fresh.forge)
@@ -625,13 +625,13 @@ class ProcessFailpointTest(unittest.TestCase):
 
     def test_recovery_state_persisted(self) -> None:
         control = self._source_control(
-            "alice", "shared/rec.txt", b"rec\n", "recovery", 1_900_000_000, "Isrcrec"
+            "alice", "shared/rec.txt", b"rec\n", "recovery", 1_700_000_000, "Isrcrec"
         )
         fresh = Fixture()
         self.addCleanup(fresh.cleanup)
         ctrl = Controller(fresh, self)
         fresh.client_commit(
-            "alice", "shared/rec.txt", b"rec\n", "recovery", 1_900_000_000, "Isrcrec"
+            "alice", "shared/rec.txt", b"rec\n", "recovery", 1_700_000_000, "Isrcrec"
         )
         actor = ctrl.run_actor(
             ["git", "push", "-q", "origin", "main"],
@@ -765,7 +765,7 @@ class ProcessFailpointTest(unittest.TestCase):
 
     def test_receiver_marker_aborted_prepared_transaction_is_removed(self) -> None:
         self.fixture.admin_update(
-            "shared/abort.txt", b"abort\n", "abort marker", 1_900_000_000
+            "shared/abort.txt", b"abort\n", "abort marker", 1_700_000_000
         )
         state = self.fixture.state()
         txid = list(state["transactions"].keys())[0]
@@ -783,7 +783,7 @@ class ProcessFailpointTest(unittest.TestCase):
             "shared/confirm.txt",
             b"confirm\n",
             "confirm marker",
-            1_900_000_000,
+            1_700_000_000,
             "Iconfmark",
         )
         old = self.fixture.state()["views"]["alice"]["projected_tip"]

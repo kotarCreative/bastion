@@ -271,7 +271,7 @@ class Fixture:
     def settle(self) -> None:
         """Run recovery and deterministic workers until nothing remains."""
         self.recover()
-        now = 1_900_000_000
+        now = 1_700_000_000
         while True:
             if not self.run_worker(now):
                 break

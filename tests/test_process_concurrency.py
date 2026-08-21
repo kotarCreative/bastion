@@ -66,10 +66,10 @@ class ProcessConcurrencyTest(unittest.TestCase):
 
         old = self.fixture.state()["views"]["alice"]["projected_tip"]
         self.fixture.client_commit(
-            "alice", "shared/a.txt", b"alice a\n", "alice first", 1_900_000_000, change_a
+            "alice", "shared/a.txt", b"alice a\n", "alice first", 1_700_000_000, change_a
         )
         self.fixture.commit_in(
-            alice2, "shared/b.txt", b"alice b\n", "alice second", 1_900_000_100, change_b
+            alice2, "shared/b.txt", b"alice b\n", "alice second", 1_700_000_100, change_b
         )
 
         winner = self.controller.start_actor(
@@ -108,10 +108,10 @@ class ProcessConcurrencyTest(unittest.TestCase):
 
     def test_cross_view_hidden_disjoint_pushes_are_both_accepted(self) -> None:
         self.fixture.client_commit(
-            "alice", "team-a/a.txt", b"team a\n", "alice team", 1_900_000_000
+            "alice", "team-a/a.txt", b"team a\n", "alice team", 1_700_000_000
         )
         self.fixture.client_commit(
-            "bob", "team-b/a.txt", b"team b\n", "bob team", 1_900_000_100
+            "bob", "team-b/a.txt", b"team b\n", "bob team", 1_700_000_100
         )
 
         alice_actor = self.controller.start_actor(
@@ -161,7 +161,7 @@ class ProcessConcurrencyTest(unittest.TestCase):
             "shared/alice.txt",
             b"alice shared\n",
             "alice shared",
-            1_900_000_000,
+            1_700_000_000,
             change_a,
         )
         old_alice = self.fixture.state()["views"]["alice"]["projected_tip"]
@@ -179,7 +179,7 @@ class ProcessConcurrencyTest(unittest.TestCase):
             "shared/bob.txt",
             b"bob shared\n",
             "bob shared",
-            1_900_000_100,
+            1_700_000_100,
         )
         bob_actor = self.controller.start_actor(
             ["git", "push", "-q", "origin", "main"],
@@ -225,7 +225,7 @@ class ProcessConcurrencyTest(unittest.TestCase):
             "shared/barrier.txt",
             b"barrier\n",
             "alice barrier",
-            1_900_000_000,
+            1_700_000_000,
             change_a,
         )
 
@@ -243,13 +243,13 @@ class ProcessConcurrencyTest(unittest.TestCase):
         # Bob probe: must be current to hit the forge barrier rather than Git's
         # local stale check.
         self.fixture.client_commit(
-            "bob", "shared/probe.txt", b"probe\n", "bob probe", 1_900_000_100
+            "bob", "shared/probe.txt", b"probe\n", "bob probe", 1_700_000_100
         )
         bob_push = self.controller.run_actor(
             ["git", "push", "-q", "origin", "main"],
             cwd=self.fixture.bob,
         )
-        worker_probe = self._worker(1_900_000_200)
+        worker_probe = self._worker(1_700_000_200)
         sync_probe = self._sync("bob")
 
         self.assertNotEqual(0, bob_push.returncode)
@@ -276,7 +276,7 @@ class ProcessConcurrencyTest(unittest.TestCase):
             "shared/confirmed.txt",
             b"confirmed\n",
             "alice confirmed",
-            1_900_000_000,
+            1_700_000_000,
         )
 
         alice_actor = self.controller.start_actor(
@@ -315,10 +315,10 @@ class ProcessConcurrencyTest(unittest.TestCase):
 
     def test_two_workers_cannot_claim_same_leased_job(self) -> None:
         self.fixture.admin_update(
-            "shared/job.txt", b"job\n", "admin visible", 1_900_000_000
+            "shared/job.txt", b"job\n", "admin visible", 1_700_000_000
         )
         # Complete Alice's job, leaving Bob's job pending.
-        self.assertTrue(self.fixture.run_worker(1_900_000_000))
+        self.assertTrue(self.fixture.run_worker(1_700_000_000))
 
         worker_a = self.controller.start_actor(
             [
@@ -326,7 +326,7 @@ class ProcessConcurrencyTest(unittest.TestCase):
                 str(self.controller.ACTOR_PY),
                 "worker",
                 str(self.fixture.forge),
-                str(1_900_000_000),
+                str(1_700_000_000),
             ],
             checkpoint="worker.claim_persisted",
         )
@@ -339,7 +339,7 @@ class ProcessConcurrencyTest(unittest.TestCase):
                 str(self.controller.ACTOR_PY),
                 "worker",
                 str(self.fixture.forge),
-                str(1_900_000_000),
+                str(1_700_000_000),
             ]
         )
         self.assertEqual(0, worker_b.returncode)
@@ -365,7 +365,7 @@ class ProcessConcurrencyTest(unittest.TestCase):
 
     def test_two_workers_progress_independent_views(self) -> None:
         self.fixture.admin_update(
-            "shared/indep.txt", b"indep\n", "admin indep", 1_900_000_000
+            "shared/indep.txt", b"indep\n", "admin indep", 1_700_000_000
         )
 
         worker_a = self.controller.start_actor(
@@ -374,7 +374,7 @@ class ProcessConcurrencyTest(unittest.TestCase):
                 str(self.controller.ACTOR_PY),
                 "worker",
                 str(self.fixture.forge),
-                str(1_900_000_000),
+                str(1_700_000_000),
             ],
             checkpoint="worker.claim_persisted",
         )
@@ -389,7 +389,7 @@ class ProcessConcurrencyTest(unittest.TestCase):
                 str(self.controller.ACTOR_PY),
                 "worker",
                 str(self.fixture.forge),
-                str(1_900_000_000),
+                str(1_700_000_000),
             ]
         )
         self.assertEqual(0, worker_b.returncode)
@@ -415,10 +415,10 @@ class ProcessConcurrencyTest(unittest.TestCase):
 
     def test_receive_cannot_publish_through_unfinished_projection(self) -> None:
         self.fixture.admin_update(
-            "team-b/bob-only.txt", b"bob only\n", "admin bob-only", 1_900_000_000
+            "team-b/bob-only.txt", b"bob only\n", "admin bob-only", 1_700_000_000
         )
         # Complete Alice's hidden-only job.
-        self.assertTrue(self.fixture.run_worker(1_900_000_000))
+        self.assertTrue(self.fixture.run_worker(1_700_000_000))
 
         bob_worker = self.controller.start_actor(
             [
@@ -426,7 +426,7 @@ class ProcessConcurrencyTest(unittest.TestCase):
                 str(self.controller.ACTOR_PY),
                 "worker",
                 str(self.fixture.forge),
-                str(1_900_000_000),
+                str(1_700_000_000),
             ],
             checkpoint="worker.claim_persisted",
         )
@@ -435,7 +435,7 @@ class ProcessConcurrencyTest(unittest.TestCase):
 
         # Bob push must be rejected because Bob has unfinished projection work.
         self.fixture.client_commit(
-            "bob", "shared/bob-receive.txt", b"bob\n", "bob receive", 1_900_000_100
+            "bob", "shared/bob-receive.txt", b"bob\n", "bob receive", 1_700_000_100
         )
         bob_push = self.controller.run_actor(
             ["git", "push", "-q", "origin", "main"],
@@ -449,7 +449,7 @@ class ProcessConcurrencyTest(unittest.TestCase):
             "team-a/alice-hidden.txt",
             b"alice hidden\n",
             "alice hidden",
-            1_900_000_200,
+            1_700_000_200,
         )
         alice_push = self.controller.run_actor(
             ["git", "push", "-q", "origin", "main"],
@@ -470,10 +470,10 @@ class ProcessConcurrencyTest(unittest.TestCase):
 
     def test_killed_projected_ref_publisher_is_adopted(self) -> None:
         self.fixture.admin_update(
-            "shared/adopt.txt", b"adopt\n", "admin adopt", 1_900_000_000
+            "shared/adopt.txt", b"adopt\n", "admin adopt", 1_700_000_000
         )
         # Complete Alice's job, leaving Bob's job pending.
-        self.assertTrue(self.fixture.run_worker(1_900_000_000))
+        self.assertTrue(self.fixture.run_worker(1_700_000_000))
 
         worker_actor = self.controller.start_actor(
             [
@@ -481,7 +481,7 @@ class ProcessConcurrencyTest(unittest.TestCase):
                 str(self.controller.ACTOR_PY),
                 "worker",
                 str(self.fixture.forge),
-                str(1_900_000_000),
+                str(1_700_000_000),
             ],
             checkpoint="projection.ref_published",
         )
@@ -505,7 +505,7 @@ class ProcessConcurrencyTest(unittest.TestCase):
         # Reclaim after deterministic lease expiry.
         self.fixture.recover()
         self.assertTrue(
-            self.fixture.run_worker(1_900_000_000 + worker.LEASE_SECONDS + 1)
+            self.fixture.run_worker(1_700_000_000 + worker.LEASE_SECONDS + 1)
         )
         self.fixture.recover()
         stable_check(self.fixture.forge, self)

@@ -66,10 +66,12 @@ def parser() -> argparse.ArgumentParser:
     principal = commands.add_parser("add-principal")
     principal.add_argument("root", type=Path)
     principal.add_argument("principal")
+    principal.add_argument("--email", action="append", default=[])
     service = commands.add_parser("add-service-account")
     service.add_argument("root", type=Path)
     service.add_argument("service")
     service.add_argument("--owner", required=True)
+    service.add_argument("--email", action="append", default=[])
     team = commands.add_parser("add-team")
     team.add_argument("root", type=Path)
     team.add_argument("team")
@@ -131,9 +133,9 @@ def main() -> int:
         if args.command == "init":
             init_forge(args.root, args.source, args.branch)
         elif args.command == "add-principal":
-            _add_principal(args.root, args.principal)
+            _add_principal(args.root, args.principal, args.email)
         elif args.command == "add-service-account":
-            _add_service_account(args.root, args.service, args.owner)
+            _add_service_account(args.root, args.service, args.owner, args.email)
         elif args.command == "add-team":
             _add_team(args.root, args.team, args.member)
         elif args.command == "add-role":

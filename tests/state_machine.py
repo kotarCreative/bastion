@@ -182,7 +182,7 @@ class Scenario:
 
     def _commit(self, repository: Path, message: str, step: int, index: int = 0) -> str:
         git(repository, "add", "-A")
-        timestamp = 1_800_000_000 + step * 10 + index
+        timestamp = 1_600_000_000 + step * 10 + index
         environment = self.environment | {"GIT_AUTHOR_DATE": f"{timestamp} +0000", "GIT_COMMITTER_DATE": f"{timestamp} +0000"}
         git(repository, "commit", "-q", "-m", message, env=environment)
         return git(repository, "rev-parse", "HEAD").stdout.decode().strip()

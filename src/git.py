@@ -194,6 +194,26 @@ def commit_message(repo: Path, oid: str, env: dict[str, str] | None = None) -> b
     return raw.split(b"\n\n", 1)[1] if b"\n\n" in raw else b""
 
 
+def commit_metadata(
+    repo: Path, oid: str, env: dict[str, str] | None = None
+) -> tuple[bytes, int, int]:
+    """Return the author email and author/committer epoch timestamps."""
+    values = (
+        git(repo, "show", "-s", "--format=%ae%x00%at%x00%ct", oid, env=env)
+        .stdout.rstrip(b"\n")
+        .split(b"\0")
+    )
+    if len(values) != 3:
+        raise ForgeError("unsupported commit metadata")
+    email = values[0].strip().lower()
+    try:
+        author_ts = int(values[1])
+        committer_ts = int(values[2])
+    except ValueError as error:
+        raise ForgeError("malformed commit timestamps") from error
+    return email, author_ts, committer_ts
+
+
 def author_environment(
     repo: Path,
     oid: str,

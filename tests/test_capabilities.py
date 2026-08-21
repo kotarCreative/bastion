@@ -26,7 +26,7 @@ from service import add_view as service_add_view
 
 EMPTY_DENY = {key: [] for key in (
     "read", "create", "modify", "delete", "mode", "symlink",
-    "branch", "merge", "admin",
+    "branch", "merge", "admin", "tag",
 )}
 
 
@@ -376,7 +376,7 @@ class AdminCapabilityTest(unittest.TestCase):
 
 class MigrationUpgradeUnitTest(unittest.TestCase):
     def test_v2_catalog_upgrades_to_capability_roles_and_fresh_descriptors(self) -> None:
-        from migration import _upgrade_catalog_to_v3
+        from migration import _upgrade_catalog_to_v3, _upgrade_catalog_to_v4
 
         state = {
             "version": 2,
@@ -422,9 +422,18 @@ class MigrationUpgradeUnitTest(unittest.TestCase):
         for capability in ("create", "modify", "delete", "mode", "symlink"):
             self.assertEqual(["shared/code"], role["allow"][capability])
         self.assertEqual(role["deny"], {key: [] for key in role["allow"]})
-        descriptor = next(iter(candidate["view_descriptors"].values()))
-        self.assertEqual("capabilities-v1", descriptor["algorithm"])
+        intermediate_descriptor = next(iter(candidate["view_descriptors"].values()))
+        self.assertEqual("capabilities-v1", intermediate_descriptor["algorithm"])
+
+        candidate = _upgrade_catalog_to_v4(candidate)
+        self.assertEqual(4, candidate["version"])
+        self.assertIn("tag", candidate["roles"]["legacy"]["allow"])
+        self.assertEqual([], candidate["roles"]["legacy"]["deny"]["tag"])
+        descriptor = candidate["view_descriptors"][candidate["views"]["alice"]["descriptor_id"]]
+        self.assertEqual("capabilities-v2", descriptor["algorithm"])
+        self.assertIn("tag", descriptor["capabilities"])
         self.assertEqual(["shared"], descriptor["capabilities"]["read"])
+        self.assertEqual(1, candidate["views"]["alice"]["descriptor_generation"])
 
 
 if __name__ == "__main__":

@@ -181,6 +181,55 @@ def _build_candidate(state: dict) -> dict:
     return candidate
 
 
+_V3_CAPABILITIES = tuple(
+    capability for capability in identity.CAPABILITIES if capability != "tag"
+)
+_WRITE_EFFECTS = ("create", "modify", "delete", "mode", "symlink")
+
+
+def _empty_map(capabilities: tuple[str, ...]) -> dict[str, list[str]]:
+    return {capability: [] for capability in capabilities}
+
+
+def _v3_descriptor(
+    candidate: dict, principal_id: str, canonical_ref: str
+) -> dict:
+    """Resolve a faithful version-3 descriptor (nine keys, capabilities-v1)."""
+    team_ids, binding_ids, role_ids = identity.resolve_principal(
+        candidate, principal_id
+    )
+    allow_union = _empty_map(_V3_CAPABILITIES)
+    deny_union = _empty_map(_V3_CAPABILITIES)
+    for role_id in role_ids:
+        role = candidate["roles"][role_id]
+        for capability in _V3_CAPABILITIES:
+            allow_union[capability].extend(role["allow"][capability])
+            deny_union[capability].extend(role["deny"][capability])
+    payload = {
+        "algorithm": "capabilities-v1",
+        "principal_id": principal_id,
+        "principal_kind": candidate["principals"][principal_id]["kind"],
+        "canonical_ref": canonical_ref,
+        "team_ids": team_ids,
+        "role_ids": role_ids,
+        "binding_ids": binding_ids,
+        "capabilities": {
+            capability: identity.minimize_prefixes(areas)
+            for capability, areas in allow_union.items()
+        },
+        "restrictions": {
+            capability: identity.minimize_prefixes(areas)
+            for capability, areas in deny_union.items()
+        },
+    }
+    record = {"id": identity.compute_descriptor_id(payload)}
+    record.update(payload)
+    existing = candidate["view_descriptors"].setdefault(record["id"], record)
+    if existing != record:
+        raise ForgeError("descriptor identity collision with different content")
+    return record
+
+
 def _upgrade_catalog_to_v3(candidate: dict) -> dict:
     """Rewrite roles to capability maps and rebind current view assignments.
 
@@ -193,13 +242,12 @@ def _upgrade_catalog_to_v3(candidate: dict) -> dict:
     for role in candidate["roles"].values():
         read = role.pop("read")
         write = role.pop("write")
-        allow = identity.empty_capability_map()
+        allow = _empty_map(_V3_CAPABILITIES)
         allow["read"] = list(read)
-        for capability in ("create", "modify", "delete", "mode", "symlink"):
+        for capability in _WRITE_EFFECTS:
             allow[capability] = list(write)
         role["allow"] = allow
-        role["deny"] = identity.empty_capability_map()
-    canonical_ref = f"refs/heads/{candidate['canonical_branch']}"
+        role["deny"] = _empty_map(_V3_CAPABILITIES)
     # Historical administrative updates predate acting-principal attribution;
     # they are stamped with a dedicated synthetic administrator.
     unattributed = [
@@ -209,12 +257,12 @@ def _upgrade_catalog_to_v3(candidate: dict) -> dict:
     ]
     if unattributed:
         identity.add_principal(candidate, "legacy-admin")
-        admin_allow = identity.empty_capability_map()
+        admin_allow = _empty_map(_V3_CAPABILITIES)
         admin_allow["admin"] = [""]
         candidate["roles"]["legacy-admin-root"] = {
             "id": "legacy-admin-root",
             "allow": admin_allow,
-            "deny": identity.empty_capability_map(),
+            "deny": _empty_map(_V3_CAPABILITIES),
         }
         binding_id = identity.binding_identifier(
             "principal", "legacy-admin", "legacy-admin-root"
@@ -227,12 +275,28 @@ def _upgrade_catalog_to_v3(candidate: dict) -> dict:
         }
         for transaction in unattributed:
             transaction["principal_id"] = "legacy-admin"
+    canonical_ref = f"refs/heads/{candidate['canonical_branch']}"
+    for view_name, view in sorted(candidate["views"].items()):
+        fresh = _v3_descriptor(candidate, view["principal_id"], canonical_ref)
+        view["descriptor_id"] = fresh["id"]
+    candidate["version"] = 3
+    return candidate
+
+
+def _upgrade_catalog_to_v4(candidate: dict) -> dict:
+    """Insert the reserved tag capability and recompute fresh descriptors."""
+    candidate = copy.deepcopy(candidate)
+    for role in candidate["roles"].values():
+        for capability_map in ("allow", "deny"):
+            if "tag" not in role[capability_map]:
+                role[capability_map]["tag"] = []
+    canonical_ref = f"refs/heads/{candidate['canonical_branch']}"
     for view_name, view in sorted(candidate["views"].items()):
         fresh = identity.effective_descriptor(
             candidate, view["principal_id"], canonical_ref
         )
         view["descriptor_id"] = fresh["id"]
-    candidate["version"] = 3
+    candidate["version"] = 4
     return candidate
 
 
@@ -241,19 +305,21 @@ def migrate_identities(root: Path) -> None:
     with locked_unversioned(root):
         state = load_state(root)
         version = state.get("version")
-        if version == 3:
+        if version == 4:
             return
-        if version not in (1, 2):
+        if version not in (1, 2, 3):
             raise ForgeError(f"unsupported forge state version: {version!r}")
         refs = collect_layout(root, state)
         check_loaded(root, state, *refs)
         require_quiescent(root, state)
+        candidate = copy.deepcopy(state)
         if version == 1:
             candidate = _build_candidate(state)
             check_loaded(root, candidate, *refs)
-        else:
-            candidate = copy.deepcopy(state)
-        candidate = _upgrade_catalog_to_v3(candidate)
+        if candidate["version"] == 2:
+            candidate = _upgrade_catalog_to_v3(candidate)
+            check_loaded(root, candidate, *refs)
+        candidate = _upgrade_catalog_to_v4(candidate)
         check_loaded(root, candidate, *refs)
         save_state(root, candidate)
     check_invariants(root)

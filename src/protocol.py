@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import time
 from pathlib import Path
 
 import identity
@@ -12,6 +13,7 @@ from errors import ForgeError
 from failpoints import checkpoint
 from git import (
     clean_env,
+    commit_metadata,
     copy_submitted_closure,
     git,
     ref,
@@ -54,6 +56,22 @@ def promote_objects(source: Path, canonical: Path) -> None:
             os.link(object_path, target)
 
 
+def validate_commit_metadata(
+    state: dict,
+    destination: Path,
+    commits: list[str],
+    principal_id: str,
+    hook_env: dict[str, str],
+) -> None:
+    """Enforce author binding and timestamp bounds before any promotion."""
+    deadline = time.time() + identity.TIMESTAMP_SKEW_SECONDS
+    for submitted_oid in commits:
+        email, author_ts, committer_ts = commit_metadata(destination, submitted_oid, hook_env)
+        identity.require_author_binding(state, principal_id, email)
+        if author_ts > deadline or committer_ts > deadline:
+            raise ForgeError("submission carries a future-dated commit")
+
+
 def prepare_submission(
     root: Path,
     name: str,
@@ -62,11 +80,16 @@ def prepare_submission(
     old: str,
     new: str,
     hook_env: dict[str, str],
+    state: dict | None = None,
 ) -> tuple[str, str, list[dict[str, str | None]], Path]:
     destination = view_repo(root, name)
     canonical = canonical_repo(root)
     commits = submitted_commits(destination, old, new, hook_env)
     verify_no_extra_objects(destination, new, hook_env)
+    if state is not None:
+        validate_commit_metadata(
+            state, destination, commits, view["principal_id"], hook_env
+        )
     canonical_old = ref(canonical, view["canonical_ref"])
     if git(
         canonical,
@@ -139,7 +162,7 @@ def pre_receive(root: Path, name: str, updates: bytes) -> None:
             raise ForgeError("view has pending projection work; retry after synchronization")
         hook_env = os.environ.copy()
         canonical_old, canonical_new, mappings, transaction_objects = prepare_submission(
-            root, name, view, descriptor, old, new, hook_env
+            root, name, view, descriptor, old, new, hook_env, state=state
         )
         try:
             validate_change_ids(
@@ -158,6 +181,7 @@ def pre_receive(root: Path, name: str, updates: bytes) -> None:
             "principal_id": view["principal_id"],
             "descriptor_id": descriptor["id"],
             "descriptor_generation": view["descriptor_generation"],
+            "received_at": int(time.time()),
             "target_descriptors": {
                 other_name: {
                     "descriptor_id": other["descriptor_id"],

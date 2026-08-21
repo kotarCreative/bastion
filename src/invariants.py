@@ -186,6 +186,11 @@ def _transaction_schema(state: dict, version: int) -> None:
                     _fail("STATE_SCHEMA", identifier, "pending views exceed captured targets")
             else:
                 _string(transaction, "principal", identifier)
+            if version >= 4 and "received_at" in transaction and not (
+                isinstance(transaction["received_at"], (int, float))
+                and not isinstance(transaction["received_at"], bool)
+            ):
+                _fail("STATE_SCHEMA", identifier, "received_at must be numeric")
             if not isinstance(transaction["mappings"], list):
                 _fail("STATE_SCHEMA", identifier, "mappings must be a list")
             for mapping in transaction["mappings"]:
@@ -249,11 +254,13 @@ def _schema_v3(state: dict) -> None:
     _outbox_job_schema(state, 3)
 
 
-def _capability_map_schema(role: dict, field: str, role_id: str) -> None:
+def _capability_map_schema(
+    role: dict, field: str, role_id: str, capabilities: tuple[str, ...]
+) -> None:
     value = role[field]
-    if not isinstance(value, dict) or set(value) != set(identity.CAPABILITIES):
-        _fail("IDENTITY", role_id, f"{field} must hold exactly the nine capabilities")
-    for capability in identity.CAPABILITIES:
+    if not isinstance(value, dict) or set(value) != set(capabilities):
+        _fail("IDENTITY", role_id, f"{field} must hold exactly the {len(capabilities)} capabilities")
+    for capability in capabilities:
         grants = value[capability]
         if not isinstance(grants, list) or not all(isinstance(item, str) for item in grants):
             _fail("IDENTITY", role_id, f"{field}.{capability} must be a list of strings")
@@ -277,16 +284,28 @@ def _schema_catalog(state: dict, version: int) -> None:
             _fail("IDENTITY", identifier, "principal key does not match id")
         kind = principal.get("kind")
         if kind == "user":
-            if set(principal) != {"id", "kind"}:
-                _fail("IDENTITY", identifier, "user record has unexpected fields")
+            expected_shape = {"id", "kind"}
         elif kind == "service_account":
-            if set(principal) != {"id", "kind", "owner_principal_id"}:
-                _fail("IDENTITY", identifier, "service account has unexpected fields")
+            expected_shape = {"id", "kind", "owner_principal_id"}
             owner = principal["owner_principal_id"]
             if not isinstance(owner, str) or state["principals"].get(owner, {}).get("kind") != "user":
                 _fail("IDENTITY", identifier, "service-account owner must be an existing user")
         else:
             _fail("IDENTITY", identifier, "principal kind is invalid")
+        unexpected = set(principal) - expected_shape - {"emails"}
+        if version < 4 and "emails" in principal:
+            unexpected.add("emails")
+        if unexpected:
+            _fail("IDENTITY", identifier, "principal record has unexpected fields")
+        if version >= 4 and "emails" in principal:
+            emails = principal["emails"]
+            if (
+                not isinstance(emails, list)
+                or not all(isinstance(item, str) for item in emails)
+                or emails != sorted(set(emails))
+                or any(email != email.lower() for email in emails)
+            ):
+                _fail("IDENTITY", identifier, "principal emails must be sorted, unique, and lowercase")
     for identifier, team in sorted(state["teams"].items()):
         try:
             identity.validate_identifier(identifier)
@@ -320,11 +339,16 @@ def _schema_catalog(state: dict, version: int) -> None:
             if not role["read"] and not role["write"]:
                 _fail("IDENTITY", role_id, "role has no grants")
         else:
+            capabilities = (
+                identity.CAPABILITIES
+                if version >= 4
+                else tuple(c for c in identity.CAPABILITIES if c != "tag")
+            )
             if role["id"] != role_id or set(role) != {"id", "allow", "deny"}:
                 _fail("IDENTITY", role_id, "role record does not match its id or shape")
-            _capability_map_schema(role, "allow", role_id)
-            _capability_map_schema(role, "deny", role_id)
-            if not any(role["allow"][capability] for capability in identity.CAPABILITIES):
+            _capability_map_schema(role, "allow", role_id, capabilities)
+            _capability_map_schema(role, "deny", role_id, capabilities)
+            if not any(role["allow"][capability] for capability in capabilities):
                 _fail("IDENTITY", role_id, "role has no allow grants")
     for identifier, binding in sorted(state["role_bindings"].items()):
         if binding["id"] != identifier or set(binding) != {"id", "subject_kind", "subject_id", "role_id"}:
@@ -468,18 +492,11 @@ def _provenance_schema(payload: dict, identifier: str) -> None:
 def _validate_descriptor_shape(payload: dict, identifier: str) -> str:
     algorithm = payload.get("algorithm")
     if algorithm == identity.DESCRIPTOR_ALGORITHM:
-        if set(payload) != _CAPABILITY_DESCRIPTOR_KEYS:
-            _fail("DESCRIPTOR", identifier, "descriptor has invalid shape")
-        for field in ("capabilities", "restrictions"):
-            value = payload[field]
-            if not isinstance(value, dict) or set(value) != set(identity.CAPABILITIES):
-                _fail("DESCRIPTOR", identifier, f"descriptor {field} must hold nine capabilities")
-            for capability in identity.CAPABILITIES:
-                areas = value[capability]
-                if not isinstance(areas, list) or not all(isinstance(item, str) for item in areas):
-                    _fail("DESCRIPTOR", identifier, f"descriptor {field}.{capability} must be a list of strings")
-                if areas != identity.minimize_prefixes(areas):
-                    _fail("DESCRIPTOR", identifier, f"descriptor {field}.{capability} is not minimized")
+        capabilities = identity.CAPABILITIES
+    elif algorithm == "capabilities-v1":
+        capabilities = tuple(
+            capability for capability in identity.CAPABILITIES if capability != "tag"
+        )
     elif algorithm == identity.LEGACY_DESCRIPTOR_ALGORITHM:
         if set(payload) != _LEGACY_DESCRIPTOR_KEYS:
             _fail("DESCRIPTOR", identifier, "legacy descriptor has invalid shape")
@@ -487,10 +504,48 @@ def _validate_descriptor_shape(payload: dict, identifier: str) -> str:
             _string_list(payload, field, identifier)
             if payload[field] != identity.minimize_prefixes(payload[field]):
                 _fail("DESCRIPTOR", identifier, f"legacy descriptor {field} is not minimized")
+        _provenance_schema(payload, identifier)
+        return algorithm
     else:
         _fail("DESCRIPTOR", identifier, "unknown descriptor algorithm")
+    if set(payload) != _CAPABILITY_DESCRIPTOR_KEYS:
+        _fail("DESCRIPTOR", identifier, "descriptor has invalid shape")
+    for field in ("capabilities", "restrictions"):
+        value = payload[field]
+        if not isinstance(value, dict) or set(value) != set(capabilities):
+            _fail(
+                "DESCRIPTOR",
+                identifier,
+                f"descriptor {field} must hold the {len(capabilities)} {algorithm} capabilities",
+            )
+        for capability in capabilities:
+            areas = value[capability]
+            if not isinstance(areas, list) or not all(isinstance(item, str) for item in areas):
+                _fail("DESCRIPTOR", identifier, f"descriptor {field}.{capability} must be a list of strings")
+            if areas != identity.minimize_prefixes(areas):
+                _fail("DESCRIPTOR", identifier, f"descriptor {field}.{capability} is not minimized")
     _provenance_schema(payload, identifier)
     return algorithm
+
+
+def _state_capabilities(state: dict) -> tuple[str, ...]:
+    if state.get("version") is not None and state["version"] >= 4:
+        return identity.CAPABILITIES
+    return tuple(capability for capability in identity.CAPABILITIES if capability != "tag")
+
+
+def _scoped_effective_areas(
+    state: dict, role_ids: list[str], capabilities: tuple[str, ...]
+) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    """Union role grants over exactly the given capability set."""
+    effective: list[dict[str, list[str]]] = [{}, {}]
+    for index, field in enumerate(("allow", "deny")):
+        for capability in capabilities:
+            union: list[str] = []
+            for role_id in role_ids:
+                union.extend(state["roles"][role_id][field][capability])
+            effective[index][capability] = identity.minimize_prefixes(union)
+    return effective[0], effective[1]
 
 
 def _recompute_descriptor(state: dict, identifier: str, payload: dict) -> None:
@@ -502,13 +557,18 @@ def _recompute_descriptor(state: dict, identifier: str, payload: dict) -> None:
     # Catalog additions are dormant until a policy transition, so the
     # descriptor is recomputed from its recorded provenance over the
     # current (append-only) catalog rather than from live selection.
+    algorithm_capabilities = (
+        set(identity.CAPABILITIES)
+        if payload["algorithm"] == identity.DESCRIPTOR_ALGORITHM
+        else {capability for capability in identity.CAPABILITIES if capability != "tag"}
+    )
     for role_id in payload["role_ids"]:
         if role_id not in state["roles"]:
             _fail("DESCRIPTOR", identifier, "descriptor role does not exist")
-    try:
-        allow, deny = identity.effective_grants(state, payload["role_ids"])
-    except ForgeError as error:
-        _fail("DESCRIPTOR", identifier, f"cannot resolve descriptor roles: {error}")
+            raise AssertionError
+    allow, deny = _scoped_effective_areas(
+        state, payload["role_ids"], tuple(sorted(algorithm_capabilities))
+    )
     if [allow, deny] != [payload["capabilities"], payload["restrictions"]]:
         _fail("DESCRIPTOR", identifier, "descriptor effective grants differ from resolution")
     computed = identity.compute_descriptor_id(payload)
@@ -836,7 +896,20 @@ def _source_transactions(root: Path, state: dict, canonical_history: list[str], 
             except ForgeError: _fail("MAPPING", identifier, "mapping contains unauthorized or invalid changes")
             if applied != _flat(canonical, canon, "MAPPING") or _filter_by_policy(_flat(canonical, canon, "MAPPING"), policy) != submitted_entries: _fail("MAPPING", identifier, "mapping tree does not reconcile exactly")
             if message != canonical_message or mapping["change_id"] != parse_change_id(message): _fail("MAPPING", identifier, "mapping message or Change-Id differs")
-            if _identity(submitted_lines, b"author ", "MAPPING", submitted) != _identity(canonical_lines, b"author ", "MAPPING", canon): _fail("MAPPING", identifier, "canonical author differs from submission")
+            submitted_author = _identity(submitted_lines, b"author ", "MAPPING", submitted)
+            canonical_author = _identity(canonical_lines, b"author ", "MAPPING", canon)
+            if submitted_author != canonical_author: _fail("MAPPING", identifier, "canonical author differs from submission")
+            if version >= 4:
+                declared = (state["principals"].get(tx["principal_id"]) or {}).get("emails") or []
+                if declared:
+                    address = canonical_author[1].decode(errors="surrogateescape").strip().lower()
+                    if address not in declared:
+                        _fail("METADATA", identifier, "mapping author is not a declared identity of the principal")
+                received_at = tx.get("received_at")
+                if isinstance(received_at, (int, float)) and not isinstance(received_at, bool):
+                    epoch = int(canonical_author[2].split()[0])
+                    if epoch > received_at + identity.TIMESTAMP_SKEW_SECONDS:
+                        _fail("METADATA", identifier, "mapping commit is future-dated beyond the skew window")
             _name, _email, author_date = _identity(submitted_lines, b"author ", "MAPPING", submitted)
             committer = _identity(canonical_lines, b"committer ", "MAPPING", canon)
             if committer != (b"Bastion Forge", b"forge@localhost", author_date): _fail("MAPPING", identifier, "canonical committer metadata differs")
@@ -883,7 +956,9 @@ def _admin_transactions(root: Path, state: dict, canonical_history: list[str], t
                     _fail("ADMIN", identifier, "administrative transaction lacks an existing acting principal")
                 try:
                     _team_ids, _binding_ids, role_ids = identity.resolve_principal(state, principal_id)
-                    allow, restrictions = identity.effective_grants(state, role_ids)
+                    allow, restrictions = _scoped_effective_areas(
+                        state, role_ids, _state_capabilities(state)
+                    )
                 except ForgeError as error:
                     _fail("ADMIN", identifier, f"cannot resolve acting principal: {error}")
                 before = _flat(canonical, tx["canonical_old"], "CANONICAL_REF")
@@ -1328,6 +1403,19 @@ def _schema_dispatch(state: dict) -> None:
         _schema_v2(state)
     elif version == 3 and not isinstance(version, bool):
         _schema_v3(state)
+    elif version == 4 and not isinstance(version, bool):
+        if set(state) != VERSION_2_KEYS:
+            _fail("STATE_SCHEMA", "state", "top-level keys do not match version 4")
+        catalog_keys = VERSION_2_KEYS - VERSION_1_KEYS - {"version"}
+        _common_map_skeleton(state, VERSION_2_KEYS - {"version"})
+        for name in sorted(catalog_keys):
+            for key, value in state[name].items():
+                if not isinstance(key, str) or not isinstance(value, dict):
+                    _fail("STATE_SCHEMA", name, "catalog identifiers and records must be strings and dictionaries")
+        _schema_catalog(state, 4)
+        _schema_views(state, 4)
+        _transaction_schema(state, 4)
+        _outbox_job_schema(state, 4)
     else:
         _fail("STATE_SCHEMA", "state", f"unsupported forge state version: {version!r}")
 
