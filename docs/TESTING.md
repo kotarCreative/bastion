@@ -17,7 +17,6 @@ Git repositories, hooks, clones, fetches, rebases, and pushes.
 | `tests/test_capabilities.py` | Capability effect classification and enforcement, longest-match deny adjudication, expansion/contraction transitions with adjustment commits, quiescence gating, admin coverage |
 | `tests/test_metadata.py` | Author identity binding, timestamp skew bounds, email admission and immutability, service-account ownership, reserved `tag` capability resolution |
 | `tests/test_identity_integration.py` | Principal/view separation, shared descriptors, cross-view `Change-Id` continuation, service accounts, team grants, environment resistance |
-| `tests/test_identity_migration.py` | Quiescent chained v1-to-v3 migration, idempotency, non-quiescence rejection, v1 runtime lockout, kill-during-save atomicity |
 | `tests/test_validation.py` | Prefix matching, descriptor authorization, modes, tree effects, refs, and `Change-Id` parsing |
 | `tests/test_git_adapter.py` | Git environment isolation |
 | `tests/test_tree_operations.py` | Directed source and administrative delete, rename, mode, symlink, directory-boundary, and rejection behavior |
@@ -110,8 +109,7 @@ The tests currently demonstrate:
 - OID-only closure validation, including quarantined extra-object rejection;
 - shared-visible modify/modify, delete/modify, and mode/content conflicts serialized through fetch/rebase;
 - rejection immutability for force pushes, stale updates, merge commits, non-linear history, unauthorized paths, unsupported entries, structural conflicts, duplicate `Change-Id` ownership, administrative validation failures, and sync barriers;
-- principal-based identity: two views per principal share one descriptor and fanout excludes only the physical source; service accounts own their changes; owners gain no claim through ownership; environment variables cannot override state-selected identity;
-- quiescent version-1 migration that preserves every ref, object ID, hook file, and transaction identifier, rejects non-quiescent forges without byte changes, and survives process kills at either atomic state-save point.
+- principal-based identity: two views per principal share one descriptor and fanout excludes only the physical source; service accounts own their changes; owners gain no claim through ownership; environment variables cannot override state-selected identity.
 
 The directed tree modules use `tests/tree_harness.py`, an independent binary Git
 plumbing helper. It reads `ls-tree -rz` records and writes temporary-index trees
@@ -204,12 +202,6 @@ under their own IDs:
 
 ```bash
 python3 forge.py add-service-account /tmp/bastion-forge build-bot --owner alice
-```
-
-Upgrading a legacy version-1 forge is one explicit quiescent command:
-
-```bash
-python3 forge.py migrate-identities /tmp/bastion-forge
 ```
 
 Clone through Git transport rather than local object linking:

@@ -355,8 +355,6 @@ class Controller:
                 f"rc={actor.returncode}\n{actor.stderr}"
             )
         payload = json.loads(actor.marker_path.read_text())
-        if payload.get("version") != 1:
-            raise AssertionError(f"unexpected marker version: {payload}")
         if payload.get("checkpoint") != actor.checkpoint:
             raise AssertionError(
                 f"checkpoint mismatch: wanted {actor.checkpoint}, got {payload}"

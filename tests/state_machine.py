@@ -1,4 +1,4 @@
-"""Deterministic real-Git state-machine harness for the version-1 forge.
+"""Deterministic real-Git state-machine harness.
 
 This module deliberately is not discovered as a test module.  The small public
 surface is used by ``tests.test_state_machine`` and is also useful when reducing

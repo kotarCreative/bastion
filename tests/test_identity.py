@@ -17,7 +17,6 @@ from identity import (
     add_team,
     bind_role,
     effective_descriptor,
-    intersect_prefixes,
     minimize_prefixes,
     resolve_principal,
 )
@@ -35,7 +34,6 @@ def reference_descriptor_id(payload: dict) -> str:
 
 def catalog() -> dict:
     return {
-        "version": 4,
         "canonical_branch": "main",
         "principals": {},
         "teams": {},
@@ -133,13 +131,6 @@ class PrefixAlgebraTest(unittest.TestCase):
             ["shared", "shared-secret/deep/file"],
             minimize_prefixes(["shared-secret/deep/file", "shared"]),
         )
-
-    def test_intersection_keeps_the_narrower_area(self) -> None:
-        self.assertEqual(["shared/a"], intersect_prefixes(["shared"], ["shared/a"]))
-        self.assertEqual(["shared/a"], intersect_prefixes(["shared/a"], ["shared"]))
-        self.assertEqual([], intersect_prefixes(["team-a"], ["team-b"]))
-        self.assertEqual(["team-a"], minimize_prefixes(intersect_prefixes([""], ["team-a", "team-a/private"])))
-        self.assertEqual(["shared/x/y"], intersect_prefixes(["shared/x/y"], ["shared"]))
 
     def test_roles_carry_allow_and_deny_maps(self) -> None:
         state = catalog()

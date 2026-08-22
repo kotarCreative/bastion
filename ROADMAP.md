@@ -26,26 +26,20 @@ The local prototype currently has:
 - systematic rejection immutability for every major validation and barrier path;
 - an experimental smart-HTTP endpoint with per-view token authorization,
   uniform unknown/unauthorized view responses, and protocol v2 support;
-- state schema version 2 with principals (users and service accounts),
-  immutable direct-member teams, immutable roles and role bindings,
-  deterministic resolution, content-addressed effective view descriptors
-  bound to every view at generation 1, descriptor capture on transactions,
-  events, jobs, plans, anchors, and revisions, principal-based `Change-Id`
-  ownership, a version-2 invariant checker, and an explicit quiescent
-  version-1 migration;
-- state schema version 3 with path-scoped capabilities (read, create, modify,
-  delete, mode, symlink, branch, merge, admin), additive allow and deny maps
-  adjudicated by longest match, an unfrozen catalog where additions stay
-  dormant until quiescent `transition-principal` policy transitions that
-  publish policy-adjustment commits, era-stamped anchors with stale-policy
-  retention, explicitly non-revocable downloaded data, admin-gated
-  administrative canonical updates, a version-3 invariant checker, and a
-  chained quiescent migration from versions 1 and 2;
-- state schema version 4 with metadata permissions: declared principal
-  author identities enforced at receive time and re-verified by the checker,
-  a fixed future-dating skew window recorded as `received_at` evidence, and
-  the reserved `tag` capability under algorithm `capabilities-v2`, plus a
-  chained migration from versions 1 through 3.
+- principals (users and service accounts), immutable direct-member teams,
+  immutable roles and role bindings, deterministic resolution, and
+  content-addressed effective view descriptors bound to every view,
+  captured on transactions, events, jobs, plans, anchors, and revisions;
+- path-scoped capabilities (read, create, modify, delete, mode, symlink,
+  branch, merge, admin, tag) with additive allow and deny maps adjudicated by
+  longest match, an unfrozen catalog where additions stay dormant until
+  quiescent `transition-principal` policy transitions that publish
+  policy-adjustment commits, era-stamped anchors with stale-policy retention,
+  explicitly non-revocable downloaded data, and admin-gated administrative
+  canonical updates;
+- metadata permissions: declared principal author identities enforced at
+  receive time and re-verified by the checker, and a fixed future-dating skew
+  window recorded as `received_at` evidence.
 
 The roadmap is ordered by architectural risk, not product visibility.
 
@@ -78,7 +72,8 @@ Exit criteria:
 
 ## Phase 2: Permission Lifecycle
 
-Goal: replace immutable view prefixes with versioned current authorization.
+Goal: replace immutable view prefixes with capability-based authorization
+captured in content-addressed, generation-stamped descriptors.
 
 - [done] Define principals, teams, roles, service accounts, and immutable
   effective view descriptors (.specs/005-principals-roles-and-effective-view-descriptors.md).

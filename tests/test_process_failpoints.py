@@ -1,4 +1,4 @@
-"""Real-process failpoint crash matrix for the version-1 forge."""
+"""Real-process failpoint crash matrix."""
 
 from __future__ import annotations
 

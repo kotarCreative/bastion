@@ -333,20 +333,37 @@ def locked(
     with (root / "state.lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         state = load_state(root)
-        version = state.get("version")
-        if version != 4:
-            if version in (1, 2, 3):
-                raise ForgeError(
-                    f"forge state version {version} requires migrate-identities"
-                )
-            raise ForgeError(f"unsupported forge state version: {version!r}")
         recoverer(root, state)
         yield state
 
 
-@contextlib.contextmanager
-def locked_unversioned(root: Path) -> Iterator[dict]:
-    """Exclusive state lock without a schema-version gate (migration only)."""
-    with (root / "state.lock").open("a+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        yield load_state(root)
+def require_quiescent(root: Path, state: dict) -> None:
+    """Require global quiescence: no unfinished work anywhere in the forge."""
+    for identifier, transaction in sorted(state["transactions"].items()):
+        if transaction["status"] not in {"published", "aborted"}:
+            raise ForgeError(f"forge has unfinished transactions; this operation requires global quiescence: {identifier}")
+        if transaction["status"] == "published" and transaction.get("pending_views"):
+            raise ForgeError(f"published transaction retains pending views: {identifier}")
+        if "view_errors" in transaction and transaction["view_errors"]:
+            raise ForgeError(f"transaction retains view errors: {identifier}")
+    for identifier, event in sorted(state["outbox"].items()):
+        if event["status"] != "dispatched":
+            raise ForgeError(f"forge has undispatched events: {identifier}")
+    for identifier, job in sorted(state["projection_jobs"].items()):
+        if job["status"] != "completed":
+            raise ForgeError(f"forge has unfinished projection jobs: {identifier}")
+        if job.get("lease_token") is not None or "lease_expires_at" in job or "plan" in job:
+            raise ForgeError(f"completed job retains active fields: {identifier}")
+    receivers = root / "receivers"
+    if receivers.exists() and any(receivers.iterdir()):
+        raise ForgeError("forge has receiver markers")
+    from layout import canonical_repo, view_repo
+    from git import ref as git_ref
+
+    for name, view in sorted(state["views"].items()):
+        actual = git_ref(view_repo(root, name), view["projected_ref"])
+        if actual != view["projected_tip"]:
+            raise ForgeError(f"view ref differs from its persisted cursor: {name}")
+    actual = git_ref(canonical_repo(root), f"refs/heads/{state['canonical_branch']}")
+    if actual == ZERO_OID:
+        raise ForgeError("canonical branch is missing")

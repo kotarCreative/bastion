@@ -37,14 +37,6 @@ def normalize_prefix(raw: str) -> str:
     return value
 
 
-def allowed(path: bytes, prefixes: list[str]) -> bool:
-    for raw in prefixes:
-        prefix = os.fsencode(raw)
-        if not prefix or path == prefix or path.startswith(prefix + b"/"):
-            return True
-    return False
-
-
 def longest_covering(path: bytes, prefixes: list[str]) -> str | None:
     """The longest normalized prefix whose area contains the byte path."""
     best: str | None = None

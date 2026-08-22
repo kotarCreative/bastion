@@ -6,7 +6,6 @@ from errors import ForgeError
 from identity import CAPABILITIES
 from layout import ZERO_OID
 from validation import (
-    allowed,
     apply_changes,
     authorize_changes,
     capability_allowed,
@@ -43,13 +42,13 @@ def descriptor(
 
 class PathPolicyTest(unittest.TestCase):
     def test_prefix_matches_only_whole_path_component(self) -> None:
-        self.assertTrue(allowed(b"visible", ["visible"]))
-        self.assertTrue(allowed(b"visible/file.txt", ["visible"]))
-        self.assertFalse(allowed(b"visible-secret/file.txt", ["visible"]))
-        self.assertFalse(allowed(b"visibl", ["visible"]))
+        self.assertTrue(capability_allowed(["visible"], [], b"visible"))
+        self.assertTrue(capability_allowed(["visible"], [], b"visible/file.txt"))
+        self.assertFalse(capability_allowed(["visible"], [], b"visible-secret/file.txt"))
+        self.assertFalse(capability_allowed(["visibl"], [], b"visible"))
 
     def test_root_prefix_allows_every_path(self) -> None:
-        self.assertTrue(allowed(b"any/raw/\xff/path", [""]))
+        self.assertTrue(capability_allowed([""], [], b"any/raw/\xff/path"))
 
     def test_prefix_normalization_and_validation(self) -> None:
         self.assertEqual("visible", normalize_prefix("/visible/"))

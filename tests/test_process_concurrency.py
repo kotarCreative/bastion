@@ -1,4 +1,4 @@
-"""Real-process concurrency schedules for the version-1 forge."""
+"""Real-process concurrency schedules."""
 
 from __future__ import annotations
 

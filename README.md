@@ -92,10 +92,4 @@ python3 forge.py serve /tmp/bastion-forge --port 8000
 git clone http://alice:TOKEN@127.0.0.1:8000/alice.git alice-http
 ```
 
-Legacy version-1 through version-3 forges upgrade in place while quiescent:
-
-```bash
-python3 forge.py migrate-identities /tmp/bastion-forge
-```
-
 Run `python3 forge.py --help` for all experimental commands.

@@ -1,6 +1,6 @@
 """Inert-by-default named checkpoint seam for real-process testing.
 
-A checkpoint publishes a versioned marker and stops its own process with
+A checkpoint publishes a marker and stops its own process with
 ``SIGSTOP`` only when explicitly armed through the environment.  The test
 controller then decides whether to resume the barrier with ``SIGCONT`` or to
 inject a crash with ``SIGKILL``.
@@ -83,7 +83,6 @@ def checkpoint(root: Path, name: str) -> None:
         )
 
     payload = {
-        "version": 1,
         "checkpoint": name,
         "root": str(root.resolve()),
         "pid": pid,

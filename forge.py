@@ -109,8 +109,6 @@ def parser() -> argparse.ArgumentParser:
     transition = commands.add_parser("transition-principal")
     transition.add_argument("root", type=Path)
     transition.add_argument("principal")
-    migrate = commands.add_parser("migrate-identities")
-    migrate.add_argument("root", type=Path)
     pre = commands.add_parser("pre-receive")
     pre.add_argument("root", type=Path)
     pre.add_argument("name")
@@ -164,10 +162,6 @@ def main() -> int:
             update_canonical_ref(args.root, args.expected, args.new, args.principal)
         elif args.command == "transition-principal":
             transition_principal(args.root, args.principal)
-        elif args.command == "migrate-identities":
-            from migration import migrate_identities
-
-            migrate_identities(args.root)
         elif args.command == "pre-receive":
             pre_receive(args.root, args.name, sys.stdin.buffer.read())
         elif args.command == "post-receive":

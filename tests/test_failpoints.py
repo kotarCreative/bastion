@@ -57,7 +57,7 @@ class FailpointCheckpointTest(unittest.TestCase):
         hasattr(os, "fork") and hasattr(signal, "SIGSTOP"),
         "requires POSIX fork and SIGSTOP",
     )
-    def test_marker_contains_version_and_identities(self) -> None:
+    def test_marker_contains_identities(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             marker = root / "marker.json"
@@ -74,7 +74,6 @@ class FailpointCheckpointTest(unittest.TestCase):
 
             self._wait_for_file(marker, 10.0)
             payload = self._read_marker(marker)
-            self.assertEqual(1, payload["version"])
             self.assertEqual("test.point", payload["checkpoint"])
             self.assertEqual(str(root.resolve()), payload["root"])
             self.assertIsInstance(payload["pid"], int)

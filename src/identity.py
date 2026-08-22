@@ -26,7 +26,6 @@ CAPABILITIES = (
     "tag",
 )
 DESCRIPTOR_ALGORITHM = "capabilities-v2"
-LEGACY_DESCRIPTOR_ALGORITHM = "effective-view-v1"
 DESCRIPTOR_DOMAIN = b"bastion-effective-view-v1\0"
 TIMESTAMP_SKEW_SECONDS = 600
 
@@ -67,18 +66,6 @@ def minimize_prefixes(values: list[str]) -> list[str]:
 
 def empty_capability_map() -> dict[str, list[str]]:
     return {capability: [] for capability in CAPABILITIES}
-
-
-def intersect_prefixes(read: list[str], write: list[str]) -> list[str]:
-    """Component-wise read/write intersection keeping the narrower area."""
-    result: set[str] = set()
-    for reader in read:
-        for writer in write:
-            if prefix_covers(reader, writer):
-                result.add(writer)
-            elif prefix_covers(writer, reader):
-                result.add(reader)
-    return minimize_prefixes(sorted(result))
 
 
 def normalize_capability_map(raw: object, subject: str) -> dict[str, list[str]]:

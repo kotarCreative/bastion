@@ -25,7 +25,7 @@ ADMIN_PRINCIPAL = "forge-admin"
 
 
 def capability_grants(read: list[str], write: list[str]) -> tuple[dict, dict]:
-    """Expand legacy read/write prefix lists into v3 allow/deny maps."""
+    """Expand read/write prefix lists into allow/deny capability maps."""
     allow = {capability: [] for capability in
              ("read", "create", "modify", "delete", "mode", "symlink",
               "branch", "merge", "admin", "tag")}
@@ -100,7 +100,7 @@ def add_view(
             if "already exists" not in str(error):
                 raise
         if read or write:
-            role_id = f"legacy-{name}"
+            role_id = f"role-{name}"
             allow, deny = capability_grants(list(read), list(write))
             add_role(root, role_id, allow, deny)
             bind_role(root, role_id, "principal", name)

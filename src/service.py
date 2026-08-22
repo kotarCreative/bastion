@@ -20,6 +20,7 @@ from state import (
     is_ancestor,
     locked,
     record_change_representation,
+    require_quiescent,
     save_state,
     source_publication_pending,
 )
@@ -47,7 +48,6 @@ def init_forge(root: Path, source: Path, branch: str) -> None:
     save_state(
         root,
         {
-            "version": 4,
             "canonical_branch": branch,
             "principals": {},
             "teams": {},
@@ -432,8 +432,6 @@ def update_canonical_ref(root: Path, expected: str, new: str, principal_id: str)
 def transition_principal(root: Path, principal_id: str) -> None:
     """Apply a quiescent policy transition for every view of one principal."""
     with locked(root) as state:
-        from migration import require_quiescent
-
         require_quiescent(root, state)
         identity.validate_identifier(principal_id)
         if principal_id not in state["principals"]:
