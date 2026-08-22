@@ -9,6 +9,9 @@ from pathlib import Path
 
 import forge
 from tests import identity_harness
+from tests.storage_helpers import document_bytes, read_document
+
+
 
 
 def command(*args: str, cwd: Path | None = None, check: bool = True,
@@ -70,7 +73,7 @@ class ForgeTest(unittest.TestCase):
         return forge.ref(self.remote, "refs/heads/main")
 
     def state(self) -> dict:
-        return json.loads((self.forge / "state.json").read_text())
+        return read_document(self.forge)
 
     def admin_change(self, path: str, contents: str, message: str, timestamp: int) -> str:
         admin = self.root / f"admin-{timestamp}"

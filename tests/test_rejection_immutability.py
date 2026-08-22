@@ -1,3 +1,5 @@
+
+
 """Systematic verification that rejected operations leave authoritative state unchanged.
 
 This module covers the roadmap item:
@@ -24,6 +26,7 @@ from tests import identity_harness
 from errors import ForgeError
 from state import locked
 from tests.tree_harness import TreeFixture, build_commit, clean_environment, command, empty_subtree_commit, git, gitlink_commit, oid, tree_at
+from tests.storage_helpers import document_bytes, read_document
 
 
 def _make_commit(repo: Path, parent: str, effects: dict[bytes, tuple[bytes, bytes] | None], message: bytes, timestamp: int) -> str:
@@ -368,7 +371,7 @@ class SyncBarrierImmutabilityTest(unittest.TestCase):
         return checkout
 
     def _state(self) -> dict:
-        return json.loads((self.forge / "state.json").read_text())
+        return read_document(self.forge)
 
     def _refs(self) -> dict[str, tuple[tuple[str, str, str], ...]]:
         result: dict[str, tuple[tuple[str, str, str], ...]] = {}
@@ -379,7 +382,7 @@ class SyncBarrierImmutabilityTest(unittest.TestCase):
 
     def _rejection_snapshot(self) -> tuple[bytes, dict[str, tuple[tuple[str, str, str], ...]], tuple[str, ...]]:
         markers = self.forge / "receivers"
-        return ((self.forge / "state.json").read_bytes(), self._refs(), tuple(sorted(path.name for path in markers.iterdir())) if markers.exists() else ())
+        return (document_bytes(self.forge), self._refs(), tuple(sorted(path.name for path in markers.iterdir())) if markers.exists() else ())
 
     def _assert_rejection(self, before: tuple[bytes, dict[str, tuple[tuple[str, str, str], ...]], tuple[str, ...]]) -> None:
         self.assertEqual(before, self._rejection_snapshot())

@@ -13,6 +13,8 @@ from tests.identity_harness import add_view as fixture_add_view
 
 import forge
 from service import (
+
+
     add_principal,
     add_role,
     add_service_account,
@@ -20,6 +22,7 @@ from service import (
     bind_role,
     sync_view,
 )
+from tests.storage_helpers import document_bytes, read_document
 
 
 def command(*args: str, cwd: Path | None = None, check: bool = True, env: dict | None = None) -> subprocess.CompletedProcess[str]:
@@ -85,7 +88,7 @@ class IdentityIntegrationTest(unittest.TestCase):
         self.temporary.cleanup()
 
     def state(self) -> dict:
-        return json.loads((self.forge / "state.json").read_text())
+        return read_document(self.forge)
 
     def descriptor_of(self, view: str) -> dict:
         state = self.state()
@@ -245,14 +248,14 @@ class IdentityIntegrationTest(unittest.TestCase):
         git(reader, "config", "user.email", "reader@example.test")
 
         before_refs = forge.ref(forge.canonical_repo(self.forge), "refs/heads/main")
-        before_state = (self.forge / "state.json").read_bytes()
+        before_state = document_bytes(self.forge)
         (reader / "shared" / "write.txt").write_text("unauthorized\n")
         commit(reader, "reader write attempt", 1_700_000_900)
         rejected = git(reader, "push", "origin", "main", check=False)
         self.assertNotEqual(0, rejected.returncode)
         self.assertIn("outside current authorization", rejected.stderr)
         self.assertEqual(before_refs, forge.ref(forge.canonical_repo(self.forge), "refs/heads/main"))
-        self.assertEqual(before_state, (self.forge / "state.json").read_bytes())
+        self.assertEqual(before_state, document_bytes(self.forge))
 
     def test_environment_cannot_override_the_state_selected_identity(self) -> None:
         bob = self.clients["bob"]

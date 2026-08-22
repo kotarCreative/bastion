@@ -152,6 +152,9 @@ class TransactionStateTest(unittest.TestCase):
                 },
             }
             # The Git reads fail to resolve and return ZERO_OID, representing a CAS miss.
+            from store import initialize_store
+
+            initialize_store(root).close()
             save_state(root, state)
             recover(root, state)
             self.assertEqual("aborted", state["transactions"]["tx"]["status"])

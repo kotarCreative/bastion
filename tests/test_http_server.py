@@ -14,6 +14,9 @@ from git import ref
 from http_server import add_token, make_server
 from invariants import check_invariants
 from layout import ZERO_OID, canonical_repo
+from tests.storage_helpers import document_bytes, read_document
+
+
 
 
 def command(*args: str, cwd: Path | None = None, check: bool = True,
@@ -126,7 +129,7 @@ class HttpForgeTest(unittest.TestCase):
 
     def test_push_rejected_over_http_keeps_state(self) -> None:
         alice = self.clone("alice", self.root / "alice-reject", self.alice_token)
-        before_state = (self.forge / "state.json").read_bytes()
+        before_state = document_bytes(self.forge)
         before_canonical = ref(canonical_repo(self.forge), "refs/heads/main")
         git(alice, "checkout", "-q", "-b", "feature")
         (alice / "visible" / "other.txt").write_text("wrong branch\n")
@@ -134,7 +137,7 @@ class HttpForgeTest(unittest.TestCase):
         git(alice, "commit", "-q", "-m", "unauthorized branch")
         result = git(alice, "push", "origin", "feature", check=False)
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual((self.forge / "state.json").read_bytes(), before_state)
+        self.assertEqual(document_bytes(self.forge), before_state)
         self.assertEqual(ref(canonical_repo(self.forge), "refs/heads/main"), before_canonical)
         check_invariants(self.forge)
 

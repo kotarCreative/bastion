@@ -12,6 +12,9 @@ import forge
 from tests import identity_harness
 from errors import ForgeError
 from invariants import check_invariants
+from tests.storage_helpers import document_bytes, read_document
+
+
 
 
 def command(*args: str, cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -82,25 +85,25 @@ class InvariantTest(unittest.TestCase):
         return {str(repo): command("git", "--git-dir", str(repo), "for-each-ref", "--format=%(refname):%(objectname)").stdout for repo in repos}
 
     def test_healthy_forge_is_read_only(self) -> None:
-        before_state = (self.forge / "state.json").read_bytes()
+        before_state = document_bytes(self.forge)
         before_refs = self._refs()
         before_objects = {repo: command("git", "--git-dir", repo, "count-objects", "-v").stdout for repo in before_refs}
         check_invariants(self.forge)
-        self.assertEqual(before_state, (self.forge / "state.json").read_bytes())
+        self.assertEqual(before_state, document_bytes(self.forge))
         self.assertEqual(before_refs, self._refs())
         self.assertEqual(before_objects, {repo: command("git", "--git-dir", repo, "count-objects", "-v").stdout for repo in before_refs})
 
     def test_failing_check_is_read_only(self) -> None:
-        state = json.loads((self.forge / "state.json").read_text())
+        state = read_document(self.forge)
         state["next_transaction_sequence"] = 0
         forge.save_state(self.forge, state)
-        before_state = (self.forge / "state.json").read_bytes()
+        before_state = document_bytes(self.forge)
         before_refs = self._refs()
         repos = [forge.canonical_repo(self.forge), forge.view_repo(self.forge, "alice"), forge.view_repo(self.forge, "bob")]
         before_objects = {str(repo): command("git", "--git-dir", str(repo), "count-objects", "-v").stdout for repo in repos}
         with self.assertRaisesRegex(ForgeError, r"invariant STATE_SCHEMA failed for state"):
             check_invariants(self.forge)
-        self.assertEqual(before_state, (self.forge / "state.json").read_bytes())
+        self.assertEqual(before_state, document_bytes(self.forge))
         self.assertEqual(before_refs, self._refs())
         self.assertEqual(before_objects, {str(repo): command("git", "--git-dir", str(repo), "count-objects", "-v").stdout for repo in repos})
 
@@ -128,7 +131,7 @@ class InvariantTest(unittest.TestCase):
         check_invariants(empty)
 
     def test_hidden_canonical_change_does_not_move_tip(self) -> None:
-        before = json.loads((self.forge / "state.json").read_text())
+        before = read_document(self.forge)
         alice_old_tip = before["views"]["alice"]["projected_tip"]
         alice_old_frontier = before["views"]["alice"]["canonical_frontier"]
         old_tip = self._canonical_tip()
@@ -136,7 +139,7 @@ class InvariantTest(unittest.TestCase):
         identity_harness.update_canonical(self.forge, old_tip, new_tip)
         forge.drain_projection_jobs(self.forge)
         check_invariants(self.forge)
-        after = json.loads((self.forge / "state.json").read_text())
+        after = read_document(self.forge)
         self.assertNotEqual(alice_old_frontier, after["views"]["alice"]["canonical_frontier"])
         self.assertEqual(alice_old_tip, after["views"]["alice"]["projected_tip"])
 
@@ -158,7 +161,7 @@ class InvariantTest(unittest.TestCase):
         identity_harness.update_canonical(self.forge, old_tip, new_tip)
         forge.drain_projection_jobs(self.forge)
         check_invariants(self.forge)
-        state = json.loads((self.forge / "state.json").read_text())
+        state = read_document(self.forge)
         self.assertIn(change_id, state["changes"])
         self.assertNotIn("owner", state["changes"][change_id])
         self.assertNotIn("canonical_ref", state["changes"][change_id])
@@ -178,10 +181,10 @@ class InvariantTest(unittest.TestCase):
         new = command("git", "rev-parse", "HEAD", cwd=checkout).stdout.strip()
         forge.run("git", "--git-dir", str(forge.view_repo(self.forge, "alice")), "fetch", "-q", str(checkout), new)
         forge.pre_receive(self.forge, "alice", f"{old} {new} refs/heads/main\n".encode())
-        transaction = next(iter(json.loads((self.forge / "state.json").read_text())["transactions"].values()))
+        transaction = next(iter(read_document(self.forge)["transactions"].values()))
         (self.forge / "receivers" / transaction["id"]).unlink(missing_ok=True)
         forge.drain_projection_jobs(self.forge)
-        state = json.loads((self.forge / "state.json").read_text())
+        state = read_document(self.forge)
         tx = state["transactions"][transaction["id"]]
         self.assertEqual("source_unconfirmed", tx["status"])
         self.assertEqual("blocked", state["outbox"][tx["event_id"]]["status"])
@@ -200,7 +203,7 @@ class InvariantTest(unittest.TestCase):
             check_invariants(self.forge)
 
     def test_frontier_off_canonical_history_fails(self) -> None:
-        state = json.loads((self.forge / "state.json").read_text())
+        state = read_document(self.forge)
         state["views"]["alice"]["canonical_frontier"] = "f" * 40
         forge.save_state(self.forge, state)
         with self.assertRaisesRegex(ForgeError, r"invariant FRONTIER failed for alice"):
@@ -213,7 +216,7 @@ class InvariantTest(unittest.TestCase):
             check_invariants(self.forge)
 
     def test_duplicate_transaction_sequence_fails(self) -> None:
-        state = json.loads((self.forge / "state.json").read_text())
+        state = read_document(self.forge)
         for name, oid in (("fake1", "a"), ("fake2", "b")):
             state["transactions"][name] = {
                 "id": name,
@@ -239,7 +242,7 @@ class InvariantTest(unittest.TestCase):
         state = load_state(self.forge)
         recover(self.forge, state)
         save_state(self.forge, state)
-        state = json.loads((self.forge / "state.json").read_text())
+        state = read_document(self.forge)
         event_id = next(iter(state["outbox"]))
         state["outbox"][event_id]["status"] = "blocked"
         forge.save_state(self.forge, state)
@@ -256,7 +259,7 @@ class InvariantTest(unittest.TestCase):
         state = load_state(self.forge)
         recover(self.forge, state)
         save_state(self.forge, state)
-        state = json.loads((self.forge / "state.json").read_text())
+        state = read_document(self.forge)
         jobs = sorted(
             (job for job in state["projection_jobs"].values() if job["view"] == "alice"),
             key=lambda job: job["sequence"],
@@ -279,7 +282,7 @@ class InvariantTest(unittest.TestCase):
         command("git", "add", "-A", cwd=checkout)
         command("git", "commit", "-q", "-m", "rev\n\nChange-Id: I1111111111111111111111111111111111111112", cwd=checkout)
         command("git", "push", "-q", "origin", "main", cwd=checkout)
-        state = json.loads((self.forge / "state.json").read_text())
+        state = read_document(self.forge)
         change_id = "I1111111111111111111111111111111111111112"
         self.assertIn(change_id, state["changes"])
         state["changes"][change_id]["revisions"] = []
@@ -317,7 +320,7 @@ class InvariantTest(unittest.TestCase):
         new = command("git", "rev-parse", "HEAD", cwd=checkout).stdout.strip()
         command("git", "push", "-q", "origin", "main", cwd=checkout)
         check_invariants(self.forge)
-        state = json.loads((self.forge / "state.json").read_text())
+        state = read_document(self.forge)
         self.assertIn(new, state["views"]["alice"]["anchors"])
         self.assertNotIn(new, state["views"]["bob"]["anchors"])
 
@@ -329,7 +332,7 @@ class InvariantTest(unittest.TestCase):
         state = load_state(self.forge)
         recover(self.forge, state)
         save_state(self.forge, state)
-        state = json.loads((self.forge / "state.json").read_text())
+        state = read_document(self.forge)
         self.assertTrue(any(job["status"] == "pending" for job in state["projection_jobs"].values()))
         check_invariants(self.forge)
 
@@ -345,7 +348,7 @@ class InvariantTest(unittest.TestCase):
         claimed = claim_projection_job(self.forge)
         self.assertIsNotNone(claimed)
         fail_projection_job(self.forge, claimed, RuntimeError("temporary failure"))
-        state = json.loads((self.forge / "state.json").read_text())
+        state = read_document(self.forge)
         job = state["projection_jobs"][claimed["id"]]
         self.assertEqual("retry", job["status"])
         self.assertNotIn("plan", job)
@@ -368,7 +371,7 @@ class InvariantTest(unittest.TestCase):
         state["projection_jobs"][claimed["id"]]["plan"] = plan
         save_state(self.forge, state)
         fail_projection_job(self.forge, claimed, RuntimeError("temporary failure"))
-        state = json.loads((self.forge / "state.json").read_text())
+        state = read_document(self.forge)
         job = state["projection_jobs"][claimed["id"]]
         self.assertEqual("retry", job["status"])
         self.assertIn("plan", job)
@@ -398,7 +401,7 @@ class InvariantTest(unittest.TestCase):
         from worker import claim_projection_job
         claimed = claim_projection_job(self.forge)
         self.assertIsNotNone(claimed)
-        state = json.loads((self.forge / "state.json").read_text())
+        state = read_document(self.forge)
         state["projection_jobs"][claimed["id"]]["status"] = "ready"
         forge.save_state(self.forge, state)
         with self.assertRaisesRegex(ForgeError, r"invariant JOB failed for project:"):
@@ -409,7 +412,7 @@ class InvariantTest(unittest.TestCase):
         new_tip = self._admin_commit("shared/x.txt", "x\n", "admin")
         identity_harness.update_canonical(self.forge, old_tip, new_tip)
         from state import recover, save_state
-        state = json.loads((self.forge / "state.json").read_text())
+        state = read_document(self.forge)
         # Dispatch without changing the claimed job's durable ref boundary.
         recover(self.forge, state)
         save_state(self.forge, state)
@@ -417,7 +420,7 @@ class InvariantTest(unittest.TestCase):
         from service import build_projection_plan
         claimed = claim_projection_job(self.forge, now=1)
         plan = build_projection_plan(self.forge, claimed["view"], claimed["view_state"], claimed["descriptor"], claimed["canonical_to"])
-        state = json.loads((self.forge / "state.json").read_text())
+        state = read_document(self.forge)
         state["projection_jobs"][claimed["id"]]["status"] = "ready"
         state["projection_jobs"][claimed["id"]]["plan"] = plan
         forge.save_state(self.forge, state)
@@ -429,7 +432,7 @@ class InvariantTest(unittest.TestCase):
         new_tip = self._admin_commit("shared/x.txt", "x\n", f"admin\n\nChange-Id: {change_id}")
         identity_harness.update_canonical(self.forge, old_tip, new_tip)
         from state import recover, save_state
-        state = json.loads((self.forge / "state.json").read_text())
+        state = read_document(self.forge)
         recover(self.forge, state)
         save_state(self.forge, state)
         from worker import claim_projection_job
@@ -444,7 +447,7 @@ class InvariantTest(unittest.TestCase):
         new_projected = forge.git(forge.view_repo(self.forge, claimed["view"]), "hash-object", "-w", "-t", "commit", "--stdin", data=replacement).stdout.decode().strip()
         plan["anchors"] = {new_projected: {**anchor, "change_id": wrong}}
         plan["new_tip"] = new_projected
-        state = json.loads((self.forge / "state.json").read_text())
+        state = read_document(self.forge)
         state["projection_jobs"][claimed["id"]]["status"] = "ready"
         state["projection_jobs"][claimed["id"]]["plan"] = plan
         forge.save_state(self.forge, state)
@@ -458,10 +461,10 @@ class InvariantTest(unittest.TestCase):
         second_new = self._admin_commit("shared/second.txt", "second\n", "second")
         identity_harness.update_canonical(self.forge, first_new, second_new)
         from state import recover, save_state
-        state = json.loads((self.forge / "state.json").read_text())
+        state = read_document(self.forge)
         recover(self.forge, state)
         save_state(self.forge, state)
-        state = json.loads((self.forge / "state.json").read_text())
+        state = read_document(self.forge)
         first_tx = next(tx for tx in state["transactions"].values() if tx["canonical_new"] == first_new)
         first_tx["pending_views"] = []
         first_tx["status"] = "published"
@@ -483,7 +486,7 @@ class InvariantTest(unittest.TestCase):
         tree = result.stdout.decode().strip()
         candidate = command("git", "--git-dir", str(canonical), "commit-tree", tree, "-p", parent, "-m", "invalid candidate").stdout.strip()
         command("git", "--git-dir", str(canonical), "update-ref", "refs/staging/invalid-candidate", candidate)
-        state = json.loads((self.forge / "state.json").read_text())
+        state = read_document(self.forge)
         sequence = state["next_transaction_sequence"]
         identifier = f"canonical:{sequence}:{candidate}"
         state["next_transaction_sequence"] += 1
@@ -546,7 +549,7 @@ class InvariantTest(unittest.TestCase):
         command("git", "add", "-A", cwd=checkout)
         command("git", "commit", "-q", "-m", "x\n\nChange-Id: I2222222222222222222222222222222222222222", cwd=checkout)
         command("git", "push", "-q", "origin", "main", cwd=checkout)
-        state = json.loads((self.forge / "state.json").read_text())
+        state = read_document(self.forge)
         submitted_oid = next(oid for oid, anchor in state["views"]["alice"]["anchors"].items() if anchor["kind"] == "submitted")
         state["views"]["alice"]["anchors"][submitted_oid]["kind"] = "synthetic"
         state["views"]["alice"]["anchors"][submitted_oid]["change_id"] = None
@@ -560,7 +563,7 @@ class InvariantTest(unittest.TestCase):
         command("git", "add", "-A", cwd=checkout)
         command("git", "commit", "-q", "-m", "x\n\nChange-Id: I3333333333333333333333333333333333333333", cwd=checkout)
         command("git", "push", "-q", "origin", "main", cwd=checkout)
-        state = json.loads((self.forge / "state.json").read_text())
+        state = read_document(self.forge)
         submitted_oid = next(oid for oid, anchor in state["views"]["alice"]["anchors"].items() if anchor["kind"] == "submitted")
         del state["views"]["alice"]["anchors"][submitted_oid]
         forge.save_state(self.forge, state)
@@ -569,7 +572,7 @@ class InvariantTest(unittest.TestCase):
             check_invariants(self.forge)
 
     def test_extra_anchor_fails(self) -> None:
-        state = json.loads((self.forge / "state.json").read_text())
+        state = read_document(self.forge)
         alice = state["views"]["alice"]
         fake_oid = "c" * 40
         state["views"]["alice"]["anchors"][fake_oid] = {
@@ -601,7 +604,7 @@ class InvariantTest(unittest.TestCase):
 
             # Forge-generated commits must ignore the hostile config.
             identity_harness.add_view(self.forge, "encoded", ["shared"], ["shared"], "main")
-        state = json.loads((self.forge / "state.json").read_text())
+        state = read_document(self.forge)
         tip = state["views"]["encoded"]["projected_tip"]
         raw = forge.git(forge.view_repo(self.forge, "encoded"), "cat-file", "commit", tip).stdout
         self.assertNotIn(b"encoding ", raw)
@@ -609,7 +612,7 @@ class InvariantTest(unittest.TestCase):
         check_invariants(self.forge)
 
     def test_bad_persisted_tip_reports_view_ref(self) -> None:
-        state = json.loads((self.forge / "state.json").read_text())
+        state = read_document(self.forge)
         state["views"]["alice"]["projected_tip"] = "f" * 40
         forge.save_state(self.forge, state)
         with self.assertRaisesRegex(ForgeError, r"invariant VIEW_REF failed for alice"):
@@ -621,7 +624,7 @@ class InvariantTest(unittest.TestCase):
         self.assertEqual(0, healthy.returncode)
         self.assertEqual("", healthy.stdout)
         self.assertEqual("", healthy.stderr)
-        state = json.loads((self.forge / "state.json").read_text())
+        state = read_document(self.forge)
         state["next_transaction_sequence"] = 0
         forge.save_state(self.forge, state)
         failed = command("python3", str(script), "check", str(self.forge), check=False)

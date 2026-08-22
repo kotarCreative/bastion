@@ -9,6 +9,8 @@ from pathlib import Path
 import forge
 from errors import ForgeError
 from service import (
+
+
     add_principal,
     add_role,
     add_team,
@@ -22,6 +24,7 @@ from tests.identity_harness import (
     update_canonical,
 )
 from service import add_view as service_add_view
+from tests.storage_helpers import document_bytes, read_document
 
 
 EMPTY_DENY = {key: [] for key in (
@@ -87,7 +90,7 @@ class CapabilityFixture:
         git(self.client, "config", "user.email", "alice@example.test")
 
     def state(self) -> dict:
-        return json.loads((self.forge / "state.json").read_text())
+        return read_document(self.forge)
 
     def push(self, change_id: str, timestamp: int = 1_700_100_000) -> subprocess.CompletedProcess[str]:
         commit(self.client, f"change\n\nChange-Id: {change_id}", timestamp)
@@ -283,9 +286,9 @@ class TransitionTest(unittest.TestCase):
 
     def test_second_transition_without_changes_is_a_silent_noop(self) -> None:
         transition_principal(self.fixture.forge, "alice")
-        before = (self.fixture.forge / "state.json").read_bytes()
+        before = document_bytes(self.fixture.forge)
         transition_principal(self.fixture.forge, "alice")
-        self.assertEqual(before, (self.fixture.forge / "state.json").read_bytes())
+        self.assertEqual(before, document_bytes(self.fixture.forge))
 
     def test_unknown_or_viewless_principals_are_rejected(self) -> None:
         with self.assertRaisesRegex(ForgeError, "unknown principal"):
@@ -360,14 +363,14 @@ class AdminCapabilityTest(unittest.TestCase):
             update_canonical(self.forge, old, new, "scoped-admin")
         canonical = forge.canonical_repo(self.forge)
         self.assertEqual(old, forge.ref(canonical, "refs/heads/main"))
-        state = json.loads((self.forge / "state.json").read_text())
+        state = read_document(self.forge)
         self.assertEqual({}, state["transactions"])
 
     def test_update_within_coverage_is_recorded_with_the_actor(self) -> None:
         old, new = self._stage("team-a/approved.txt", "allowed\n")
         update_canonical(self.forge, old, new, "scoped-admin")
         forge.drain_projection_jobs(self.forge)
-        state = json.loads((self.forge / "state.json").read_text())
+        state = read_document(self.forge)
         transaction = next(iter(state["transactions"].values()))
         self.assertEqual("canonical_update", transaction["kind"])
         self.assertEqual("scoped-admin", transaction["principal_id"])

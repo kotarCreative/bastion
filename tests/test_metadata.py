@@ -11,6 +11,8 @@ from errors import ForgeError
 from identity import normalize_emails
 from invariants import check_invariants
 from service import (
+
+
     add_principal,
     add_role,
     add_service_account,
@@ -22,6 +24,7 @@ from tests.identity_harness import (
     provision_admin,
 )
 from service import add_view as service_add_view
+from tests.storage_helpers import document_bytes, read_document
 
 
 def git(repo: Path, *args: str, check: bool = True, env: dict | None = None):
@@ -82,7 +85,7 @@ class MetadataFixture:
         git(self.client, "config", "user.email", "alice@example.test")
 
     def state(self) -> dict:
-        return json.loads((self.forge / "state.json").read_text())
+        return read_document(self.forge)
 
     def push(self, message: str = "change\n", timestamp: int = 1_700_100_000,
              author_email: str | None = None) -> subprocess.CompletedProcess[str]:
@@ -223,7 +226,7 @@ class EmailAdmissionTest(unittest.TestCase):
             forge_root = root / "forge"
             forge.init_forge(forge_root, source, "main")
             add_principal(forge_root, "dave", ["dave@example.test"])
-            state = json.loads((forge_root / "state.json").read_text())
+            state = read_document(forge_root)
             self.assertEqual(
                 ["dave@example.test"],
                 state["principals"]["dave"]["emails"],
@@ -255,7 +258,7 @@ class TagCapabilityTest(unittest.TestCase):
         add_role(self.forge, "tagger", allow, deny)
         bind_role(self.forge, "tagger", "principal", "alice")
         service_add_view(self.forge, "alice", "alice", "main", ENTRYPOINT)
-        state = json.loads((self.forge / "state.json").read_text())
+        state = read_document(self.forge)
         descriptor = state["view_descriptors"][state["views"]["alice"]["descriptor_id"]]
         self.assertEqual([""], descriptor["capabilities"]["tag"])
         self.assertEqual([], descriptor["restrictions"]["tag"])

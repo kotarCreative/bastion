@@ -1,3 +1,5 @@
+
+
 """Binary Git plumbing and independent snapshot checks for tree-operation tests."""
 
 from __future__ import annotations
@@ -10,6 +12,7 @@ from pathlib import Path
 
 import forge
 from tests import identity_harness
+from tests.storage_helpers import document_bytes, read_document
 
 
 Tree = dict[bytes, tuple[bytes, str, bytes]]
@@ -276,7 +279,7 @@ class TreeFixture:
         return commits
 
     def state(self) -> dict:
-        return json.loads((self.root / "state.json").read_text())
+        return read_document(self.root)
 
     def refs(self) -> dict[str, tuple[tuple[str, str, str], ...]]:
         repositories = {"canonical": forge.canonical_repo(self.root)} | {name: forge.view_repo(self.root, name) for name in self.policies}
@@ -288,7 +291,7 @@ class TreeFixture:
 
     def rejection_snapshot(self) -> tuple[bytes, dict[str, tuple[tuple[str, str, str], ...]], tuple[str, ...]]:
         markers = self.root / "receivers"
-        return ((self.root / "state.json").read_bytes(), self.refs(), tuple(sorted(path.name for path in markers.iterdir())) if markers.exists() else ())
+        return (document_bytes(self.root), self.refs(), tuple(sorted(path.name for path in markers.iterdir())) if markers.exists() else ())
 
     def assert_rejection(self, before: tuple[bytes, dict[str, tuple[tuple[str, str, str], ...]], tuple[str, ...]]) -> None:
         if before != self.rejection_snapshot():

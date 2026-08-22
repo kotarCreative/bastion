@@ -8,6 +8,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tests.state_machine import (
+
+
     Operation,
     Scenario,
     filtered,
@@ -17,6 +19,7 @@ from tests.state_machine import (
     under_prefix,
     _format_failure,
 )
+from tests.storage_helpers import document_bytes, read_document
 
 
 SMOKE_SEEDS = (0x5EED, 0xC0FFEE)
@@ -87,7 +90,7 @@ class StateMachineTest(unittest.TestCase):
             first = {"path": "shared/a.txt", "action": "create", "contents": "first\n", "change_id": "I" + "1" * 40}
             second = {"path": "team-a/a.txt", "action": "create", "contents": "second\n"}
             scenario.execute(Operation("authorized_push", {"view": "alice", "edits": [first, second]}), 0)
-            state = json.loads((scenario.root / "state.json").read_text())
+            state = read_document(scenario.root)
             transaction = next(tx for tx in state["transactions"].values() if tx.get("view") == "alice")
             self.assertEqual(2, len(transaction["mappings"]))
             self.assertEqual(scenario.clients["alice"]["oid"], scenario._refs()["alice"]["refs/heads/main"])

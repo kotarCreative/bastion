@@ -16,6 +16,9 @@ from tests import identity_harness
 from git import git as repo_git, ref
 from http_server import add_token, make_server
 from layout import ZERO_OID, canonical_repo, view_repo
+from tests.storage_helpers import document_bytes, read_document
+
+
 
 
 def command(*args: str, cwd: Path | None = None, check: bool = True,
@@ -106,7 +109,7 @@ class HttpSecurityTest(unittest.TestCase):
 
     def forge_snapshot(self) -> tuple[bytes, bytes, dict[str, str]]:
         return (
-            (self.forge / "state.json").read_bytes(),
+            document_bytes(self.forge),
             (self.forge / "tokens.json").read_bytes(),
             self.refs_snapshot(),
         )

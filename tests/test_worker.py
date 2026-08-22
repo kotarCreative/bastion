@@ -12,12 +12,15 @@ from tests import identity_harness
 from service import build_projection_plan
 from state import save_state
 from worker import (
+
+
     claim_projection_job,
     complete_projection_job,
     drain_projection_jobs,
     fail_projection_job,
 )
 from errors import ForgeError
+from tests.storage_helpers import document_bytes, read_document
 
 
 def command(*args: str, cwd: Path | None = None) -> str:
@@ -109,7 +112,7 @@ class WorkerTest(unittest.TestCase):
         self.temporary.cleanup()
 
     def state(self) -> dict:
-        return json.loads((self.forge / "state.json").read_text())
+        return read_document(self.forge)
 
     def test_worker_builds_outside_lock_and_completes(self) -> None:
         claimed = claim_projection_job(self.forge)

@@ -10,6 +10,9 @@ from pathlib import Path
 import forge
 from tests import identity_harness
 from errors import ForgeError
+from tests.storage_helpers import document_bytes, read_document
+
+
 
 
 def command(
@@ -107,7 +110,7 @@ class CrossViewForgeTest(unittest.TestCase):
         return checkout
 
     def state(self) -> dict:
-        return json.loads((self.forge / "state.json").read_text())
+        return read_document(self.forge)
 
     def remote_tip(self, remote: Path) -> str:
         return forge.ref(remote, "refs/heads/main")

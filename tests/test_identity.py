@@ -11,6 +11,8 @@ import forge
 import identity
 from errors import ForgeError
 from identity import (
+
+
     add_principal,
     add_role,
     add_service_account,
@@ -22,6 +24,7 @@ from identity import (
 )
 from service import add_view as service_add_view
 from tests.identity_harness import capability_grants
+from tests.storage_helpers import document_bytes, read_document
 
 
 def reference_descriptor_id(payload: dict) -> str:
@@ -428,7 +431,7 @@ class ServiceIntegrationTest(unittest.TestCase):
         with self.assertRaisesRegex(ForgeError, "no effective readable path"):
             service_add_view(self.forge, "w", "writer", "main", entrypoint)
         self.assertFalse((self.forge / "views" / "w.git").exists())
-        state = json.loads((self.forge / "state.json").read_text())
+        state = read_document(self.forge)
         self.assertEqual({}, state["views"])
 
 

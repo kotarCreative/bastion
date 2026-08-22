@@ -12,6 +12,9 @@ from service import init_forge, update_canonical_ref
 import forge
 
 from tests.identity_harness import provision_admin
+from tests.storage_helpers import document_bytes, read_document
+
+
 
 
 class ForgeInitializationTest(unittest.TestCase):
@@ -136,7 +139,7 @@ class ForgeInitializationTest(unittest.TestCase):
                 check=True,
             )
             update_canonical_ref(forge_root, old, new, provision_admin(forge_root))
-            state = json.loads((forge_root / "state.json").read_text())
+            state = read_document(forge_root)
             self.assertEqual("published", next(iter(state["transactions"].values()))["status"])
 
     @unittest.skipIf(os.pathsep not in ":;", "unexpected object path separator")

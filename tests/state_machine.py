@@ -1,3 +1,5 @@
+
+
 """Deterministic real-Git state-machine harness.
 
 This module deliberately is not discovered as a test module.  The small public
@@ -25,6 +27,7 @@ from errors import ForgeError
 from invariants import check_invariants
 from service import build_projection_plan
 from state import locked, load_state, save_state
+from tests.storage_helpers import document_bytes, read_document
 
 
 PATHS = (
@@ -245,7 +248,7 @@ class Scenario:
     def rejection_snapshot(self) -> tuple[bytes, dict[str, str], str, str]:
         state = load_state(self.root)
         refs = {name: refs["refs/heads/main"] for name, refs in self._refs().items()}
-        return ((self.root / "state.json").read_bytes(), refs,
+        return (document_bytes(self.root), refs,
                 json.dumps(state["changes"], sort_keys=True),
                 json.dumps({key: value.get("mappings") for key, value in state["transactions"].items()}, sort_keys=True))
 
@@ -363,7 +366,12 @@ class Scenario:
             with patch("worker.time.time", return_value=self.logical_now):
                 worker.fail_projection_job(self.root, claimed, RuntimeError("generated temporary failure"))
             self.checkpoint()
-            self.logical_now += worker.RETRY_SECONDS + 1
+            state = load_state(self.root)
+            retry_at = max(
+                (job.get("next_attempt_at") or 0 for job in state["projection_jobs"].values() if job["status"] == "retry"),
+                default=0,
+            )
+            self.logical_now = max(self.logical_now, retry_at) + 1
             if not self._worker():
                 raise AssertionError("retry was not claimed")
         elif kind in {"worker_crash_before_ref", "worker_crash_after_ref_and_recover"}:
@@ -542,7 +550,15 @@ class Scenario:
             incomplete = [job for job in state["projection_jobs"].values() if job["status"] != "completed"]
             if not incomplete:
                 break
-            self.logical_now += worker.RETRY_SECONDS + 1
+            candidates = [
+                (job.get("next_attempt_at") or 0)
+                for job in incomplete
+                if job["status"] in {"pending", "retry"}
+            ]
+            if candidates:
+                self.logical_now = max(self.logical_now, max(candidates)) + 1
+            else:
+                self.logical_now += worker.LEASE_SECONDS + 1
             self.execute(Operation("worker_complete", {"phase": "epilogue"}), self.steps)
 
 
@@ -577,7 +593,7 @@ def _run(seed: int, steps: int, operations: list[Operation] | None) -> RunResult
             state = load_state(scenario.root)
             if any(job["status"] != "completed" for job in state["projection_jobs"].values()):
                 raise AssertionError("scenario did not settle all projection jobs")
-            return RunResult(seed, steps, list(scenario.trace), (scenario.root / "state.json").read_bytes(), scenario._refs())
+            return RunResult(seed, steps, list(scenario.trace), document_bytes(scenario.root), scenario._refs())
         except (AssertionError, ForgeError, KeyError, StopIteration) as error:
             operation = scenario.trace[-1] if scenario.trace else Operation("fixture", {})
             raise _format_failure(seed, steps, position if operations is not None else min(steps, len(scenario.trace) // 2), operation, scenario.trace, error) from error

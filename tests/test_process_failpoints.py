@@ -1,3 +1,5 @@
+
+
 """Real-process failpoint crash matrix."""
 
 from __future__ import annotations
@@ -6,10 +8,12 @@ import os
 import sys
 import unittest
 from pathlib import Path
+from tests.storage_helpers import document_bytes, read_document
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import outbox
 import worker
 
 from identity_harness import ADMIN_PRINCIPAL
@@ -603,7 +607,7 @@ class ProcessFailpointTest(unittest.TestCase):
 
         fresh.recover()
         # Settle remaining work deterministically after B's retry deadline.
-        now = 1_700_000_000 + worker.LEASE_SECONDS + 1 + worker.RETRY_SECONDS + 1
+        now = 1_700_000_000 + worker.LEASE_SECONDS + 1 + outbox.retry_delay(2) + 1
         while fresh.run_worker(now):
             now += 1
         fresh.recover()
@@ -708,8 +712,9 @@ class ProcessFailpointTest(unittest.TestCase):
             action="SIGKILL",
         )
         self.assertNotEqual(0, actor.returncode)
-        data = (fresh.forge / "state.json").read_text()
-        self.assertTrue(data.startswith("{"))
+        data = read_document(fresh.forge)
+        self.assertIsInstance(data, dict)
+        self.assertIn("views", data)
         parsed = fresh.state()
         self.assertEqual(old_sequence + 5, parsed["next_transaction_sequence"])
         stable_check(fresh.forge, self)

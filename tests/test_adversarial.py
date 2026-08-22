@@ -1,3 +1,5 @@
+
+
 """Adversarial tests: hostile clients attacking every supported entry point.
 
 Each test plays an attacker who controls Git plumbing, raw protocol bytes,
@@ -33,6 +35,8 @@ from tests.tree_harness import (
     oid,
     tree_at,
 )
+
+from tests.storage_helpers import document_bytes, read_document
 
 ZERO = "0" * 40
 SECRET_BYTES = b"unshared hidden secret bytes"
@@ -411,7 +415,7 @@ class AdversarialHttpWireTest(unittest.TestCase):
 
     def snapshot(self) -> tuple[bytes, bytes, str]:
         return (
-            (self.forge / "state.json").read_bytes(),
+            document_bytes(self.forge),
             (self.forge / "tokens.json").read_bytes(),
             subprocess.run(
                 ["git", "--git-dir", str(canonical_repo(self.forge)), "for-each-ref"],
