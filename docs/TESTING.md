@@ -265,29 +265,35 @@ non-fast-forwards, empty subtrees, gitlinks, and unsupported modes.
 
 ## State Inspection
 
-The local durable model is stored at:
+State lives in `store.sqlite3` (or PostgreSQL) as document rows; inspect it read-only:
 
-```text
-/tmp/bastion-forge/state.json
+```bash
+python3 forge.py stats /tmp/bastion-forge
+python3 forge.py audit /tmp/bastion-forge
 ```
 
-Useful sections are:
+`stats` prints backend, schema version, per-status counts for transactions,
+events, and jobs, active leases, dead letters, and store size. The same
+sections (`views`, `transactions`, `outbox`, `projection_jobs`, ...) exist as
+tables of JSON documents. Do not edit state during normal manual testing;
+tests mutate it only to recreate precise crash windows.
 
-```text
-principals
-teams
-roles
-role_bindings
-view_descriptors
-views
-transactions
-changes
-outbox
-projection_jobs
+### Postgres matrix
+
+The full suite runs unchanged against PostgreSQL when every forge is created
+on a shared server:
+
+```bash
+docker run -d --name bastion-pg -e POSTGRES_PASSWORD=bastion \
+  -e POSTGRES_USER=bastion -e POSTGRES_DB=bastion -p 127.0.0.1:15432:5432 postgres:18-alpine
+BASTION_DATABASE="postgres://bastion:bastion@127.0.0.1:15432" \
+  python3 -m unittest discover tests 'test_*.py'
 ```
 
-Do not edit state during normal manual testing. Tests mutate it only to recreate
-precise crash windows.
+Each forge root receives its own database on that server. Storage-level
+tamper/lease/concurrency assertions additionally run against both backends in
+`tests/test_storage.py`; adversarial storage attacks live in
+`tests/test_storage_adversarial.py`.
 
 ## Manual Test Priorities
 

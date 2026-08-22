@@ -19,11 +19,15 @@ restrictions:
 - every tree transition is authorized before the canonical ref moves;
 - canonical and projected publication is recoverable and idempotent;
 - secondary-view publication uses a durable outbox and ordered jobs;
-- logical `Change-Id` metadata links different Git representations.
+- logical `Change-Id` metadata links different Git representations;
+- durable state lives in SQLite (default) or PostgreSQL as versioned,
+  checksummed document rows guarded by lease-based sessions, with idempotent
+  receives, retry schedules, dead-lettering, observability stats, backups,
+  and legacy-JSON migration.
 
 This is a local architecture experiment, not a production security boundary.
-Authentication, network transports, resource controls, transactional database
-storage, and the wider forge surface remain roadmap work.
+Authentication, network transports, and the wider forge surface remain
+roadmap work.
 
 ## Documentation
 

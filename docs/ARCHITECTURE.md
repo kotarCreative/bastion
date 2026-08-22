@@ -151,7 +151,8 @@ The implementation is under `src/`.
 | `git.py` | Git process, object, tree, commit, and quarantine adapter |
 | `projection.py` | Tree filtering, hidden-only elision, and synthetic commits |
 | `reconciliation.py` | Canonical transition replay and round-trip verification |
-| `state.py` | Durable JSON state, mappings, locking, and recovery |
+| `state.py` | Session leases, mappings, and forward-only recovery |
+| `store.py` | SQLite/PostgreSQL document store: versions, checksums, leases, backups |
 | `outbox.py` | Event dispatch, ordered jobs, leases, and completion rules |
 | `worker.py` | Projection job claim, build, publish, failure, and retry |
 | `invariants.py` | Read-only global persisted-state and Git-history verification |
@@ -161,6 +162,29 @@ The implementation is under `src/`.
 
 Pure security decisions are kept separate from Git subprocesses. Expensive
 projection runs outside the global state lock.
+
+## Durable State Storage
+
+Forge state lives in a real database, not a JSON file
+(.specs/009-production-transaction-storage.md). Every aggregate — principals,
+teams, roles, bindings, descriptors, views, transactions, logical changes,
+outbox events, projection jobs — is one document row with an optimistic
+`version` and a SHA-256 `checksum`. Two backends implement the identical
+contract:
+
+- `sqlite` (default): `store.sqlite3` in WAL mode inside the forge root;
+- `postgres`: chosen at `init --database postgres://...`; each forge root gets
+  its own database on the shared server.
+
+Saves are short transactions with version-guarded upserts. Sessions replace
+the old filesystem lock with lease rows in `storage_locks`: scope `global`
+covers recovery-bearing operations (receives, administration), and
+`view:<name>` scopes are available for partitioned workers. A lease records
+its owner's PID identity, so crashed holders are stolen immediately instead
+of waiting out the TTL. Loading verifies every checksum; tampered rows are
+refused by name. Idempotency keys, an audit log, exponential retry schedules,
+dead-lettering, heartbeats, cancellation, `stats`, backup/restore, and
+legacy-JSON migration complete the production-storage surface.
 
 ## Current Restrictions
 
@@ -174,7 +198,6 @@ projection runs outside the global state lock.
 - readable and writable positive path prefixes only
 - immutable generation-1 descriptors; no policy mutation or revocation yet
 - local bare-repository transport and development identity model
-- JSON state and a filesystem lock
 - direct writes to `canonical.git` are unsupported
 
 These restrictions are deliberate proof boundaries, not intended final product

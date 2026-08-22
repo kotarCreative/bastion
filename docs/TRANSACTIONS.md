@@ -16,6 +16,18 @@ Git refs and the state store cannot participate in one atomic transaction.
 Bastion therefore records durable intent, observes Git state during recovery, and
 only advances transaction status forward.
 
+## Durable Storage
+
+State is stored in SQLite (default) or PostgreSQL as versioned, checksummed
+document rows (.specs/009-production-transaction-storage.md). Each durable
+point in the lifecycles below is one short database transaction with
+version-guarded upserts. Mutually exclusive operations hold lease rows for
+their scope instead of a filesystem lock; a save verifies and heartbeats its
+leases inside the same transaction that persists rows, so a process that lost
+its lease can never write. The JSON-writer failpoints (`state.replaced` and
+companions) now fire at the equivalent database boundaries, keeping the
+crash-recovery matrix meaningful.
+
 ## Source Push Lifecycle
 
 ```text

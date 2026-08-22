@@ -39,7 +39,13 @@ The local prototype currently has:
   canonical updates;
 - metadata permissions: declared principal author identities enforced at
   receive time and re-verified by the checker, and a fixed future-dating skew
-  window recorded as `received_at` evidence.
+  window recorded as `received_at` evidence;
+- production transaction storage: SQLite (default) and PostgreSQL backends
+  behind one contract, versioned checksummed document rows with optimistic
+  short transactions, PID-liveness lease sessions replacing the filesystem
+  lock, idempotent receives with durable retry schedules, worker heartbeats,
+  cancellation, dead-lettering, audit logging, observability stats,
+  backup/restore, corruption detection, and legacy-JSON migration.
 
 The roadmap is ordered by architectural risk, not product visibility.
 
@@ -98,16 +104,25 @@ Exit criteria:
 
 Goal: replace JSON and the global filesystem lock.
 
-- Move repository, view, anchor, submission, logical change, outbox, job, and
-  audit state to PostgreSQL.
-- Use short database transactions and optimistic versions.
-- Partition canonical sequencing by `(repository, canonical_ref)`.
-- Partition projection ordering by `(repository, view, projected_ref)`.
-- Add idempotency keys and durable retry schedules.
-- Add worker heartbeats, cancellation, dead-letter handling, and observability.
-- Add backups, migrations, corruption detection, and disaster recovery tests.
-- Preserve Git-ref observation and forward-only recovery because PostgreSQL and
-  Git refs cannot share one atomic transaction.
+- [done] Move repository, view, anchor, submission, logical change, outbox,
+  job, and audit state to a real database: SQLite by default and PostgreSQL
+  behind one identical contract (.specs/009-production-transaction-storage.md).
+- [done] Use short database transactions and optimistic versions; saves are
+  checksum-verified, version-guarded upserts scoped to mutated rows.
+- [done] Implement partition scope keys (`global`, `canonical:<branch>`,
+  `view:<name>`), PID-liveness lease stealing, and multi-process convergence
+  tests proving unrelated scopes progress concurrently without loss;
+  receive-path sequencing currently claims the global scope until
+  multi-repository support arrives.
+- [done] Add idempotency keys on the receive path and durable exponential
+  retry schedules capped at ten minutes.
+- [done] Add worker heartbeats, cancellation, dead-letter handling, audit
+  logging, and a read-only `stats` command.
+- [done] Add backups, restore verification, legacy-JSON migration,
+  corruption detection naming tampered rows, and disaster-recovery tests on
+  both backends.
+- [done] Preserve Git-ref observation and forward-only recovery because
+  PostgreSQL and Git refs cannot share one atomic transaction.
 
 Exit criteria:
 
