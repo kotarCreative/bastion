@@ -11,9 +11,10 @@ import identity
 from errors import ForgeError
 from failpoints import checkpoint
 from layout import canonical_repo
-from outbox import next_job, requeue_expired_jobs, update_transaction_status
+from outbox import MAX_JOB_ATTEMPTS, fail_job, next_job, requeue_expired_jobs, update_transaction_status
 from service import build_projection_plan, publish_projection_plan
 from state import (
+    audit_event,
     has_unconfirmed_source,
     is_ancestor,
     locked,
@@ -45,9 +46,20 @@ def claim_projection_job(root: Path, now: float | None = None) -> dict | None:
                     continue
                 view = state["views"].get(job["view"])
                 if not view:
-                    job["status"] = "retry"
-                    job["last_error"] = "unknown projection view"
-                    job["next_attempt_at"] = now + RETRY_SECONDS
+                    job["attempts"] += 1
+                    dead = fail_job(job, "unknown projection view", now)
+                    if dead:
+                        transaction = state["transactions"].get(job["transaction_id"])
+                        if transaction is not None:
+                            transaction.setdefault("view_errors", {})[job["view"]] = (
+                                "unknown projection view"
+                            )
+                            audit_event(
+                                root,
+                                "job.dead_letter",
+                                job["id"],
+                                f"exhausted {MAX_JOB_ATTEMPTS} attempts: unknown projection view",
+                            )
                     excluded.add(job["id"])
                     continue
                 if (
@@ -100,15 +112,67 @@ def fail_projection_job(
         job = state["projection_jobs"].get(claimed["id"])
         if not job or job.get("lease_token") != claimed["lease_token"]:
             return
-        job["status"] = "retry"
-        job["lease_token"] = None
-        job["last_error"] = str(error)
-        job["next_attempt_at"] = now + RETRY_SECONDS
+        dead = fail_job(job, str(error), now)
         transaction = state["transactions"][job["transaction_id"]]
         transaction.setdefault("view_errors", {})[job["view"]] = str(error)
         update_transaction_status(state, job["transaction_id"])
         save_state(root, state)
+        if dead:
+            audit_event(
+                root,
+                "job.dead_letter",
+                claimed["id"],
+                f"exhausted {MAX_JOB_ATTEMPTS} attempts: {error}",
+            )
         checkpoint(root, "worker.retry_persisted")
+
+
+def cancel_projection_job(root: Path, job_id_value: str) -> None:
+    """Cancel a queued, retrying, dead, or expired-lease job."""
+    now = time.time()
+    with locked(root) as state:
+        requeue_expired_jobs(state, now)
+        job = state["projection_jobs"].get(job_id_value)
+        if not job:
+            raise ForgeError(f"unknown projection job: {job_id_value}")
+        if job["status"] == "completed":
+            raise ForgeError("projection job already completed")
+        if job["status"] == "running" and job.get("lease_expires_at", 0) > now:
+            raise ForgeError("projection job is running under an active lease")
+        if job["status"] == "cancelled":
+            return
+        previous = job["status"]
+        job["status"] = "cancelled"
+        job["lease_token"] = None
+        job.pop("lease_expires_at", None)
+        job["next_attempt_at"] = None
+        transaction = state["transactions"][job["transaction_id"]]
+        transaction.setdefault("view_errors", {})[job["view"]] = (
+            "cancelled by operator"
+        )
+        update_transaction_status(state, job["transaction_id"])
+        save_state(root, state)
+        audit_event(root, "job.cancelled", job_id_value, f"previous status: {previous}")
+
+
+def requeue_projection_job(root: Path, job_id_value: str) -> None:
+    """Requeue a dead or cancelled job with attempts reset."""
+    with locked(root) as state:
+        job = state["projection_jobs"].get(job_id_value)
+        if not job:
+            raise ForgeError(f"unknown projection job: {job_id_value}")
+        if job["status"] not in {"dead", "cancelled"}:
+            raise ForgeError(f"projection job is not dead or cancelled: {job['status']}")
+        previous = job["status"]
+        job["status"] = "pending"
+        job["attempts"] = 0
+        job["last_error"] = None
+        job["next_attempt_at"] = 0
+        transaction = state["transactions"][job["transaction_id"]]
+        transaction.get("view_errors", {}).pop(job["view"], None)
+        update_transaction_status(state, job["transaction_id"])
+        save_state(root, state)
+        audit_event(root, "job.requeued", job_id_value, f"previous status: {previous}")
 
 
 def complete_projection_job(

@@ -133,6 +133,7 @@ def prepare_submission(
 
 def pre_receive(root: Path, name: str, updates: bytes) -> None:
     parsed = parse_updates(updates)
+    idempotency_key = os.environ.get("BASTION_IDEMPOTENCY_KEY")
     with locked(root) as state:
         view = state["views"].get(name)
         if not view:
@@ -140,6 +141,25 @@ def pre_receive(root: Path, name: str, updates: bytes) -> None:
         descriptor = identity.descriptor_for_view(state, name)
         from outbox import view_has_unfinished_jobs
         from state import has_unconfirmed_source, source_publication_pending
+
+        # Idempotent replay is decided before ref validation so a retried
+        # push whose outcome was already recorded returns that outcome
+        # instead of a derived rejection.
+        fingerprint = {
+            "view": name,
+            "old": parsed[0][0] if parsed else "",
+            "new": parsed[0][1] if parsed else "",
+        }
+        if idempotency_key:
+            from state import idempotency_lookup
+
+            recorded = idempotency_lookup(root, idempotency_key)
+            if recorded is not None:
+                if recorded["fingerprint"] != fingerprint:
+                    raise ForgeError(
+                        "idempotency key was already used for a different request"
+                    )
+                return
 
         old, new, _updated_ref = validate_ref_update(view, parsed)
         retry_id = transaction_id(name, old, new)
@@ -207,6 +227,15 @@ def pre_receive(root: Path, name: str, updates: bytes) -> None:
         write_receiver_marker(root, txid, os.getppid())
         state["transactions"][txid] = transaction
         save_state(root, state)
+        if idempotency_key:
+            from state import idempotency_record
+
+            idempotency_record(
+                root,
+                idempotency_key,
+                fingerprint,
+                {"status": "prepared", "transaction_id": txid},
+            )
         checkpoint(root, "source.prepared_persisted")
         from service import update_canonical_ref_locked
 

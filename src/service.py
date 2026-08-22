@@ -27,7 +27,7 @@ from state import (
 from validation import capability_allowed, validate_view_name
 
 
-def init_forge(root: Path, source: Path, branch: str) -> None:
+def init_forge(root: Path, source: Path, branch: str, database: str | None = None) -> None:
     if run("git", "check-ref-format", "--branch", branch, check=False).returncode:
         raise ForgeError(f"invalid branch name: {branch}")
     if os.pathsep in str(root.resolve()):
@@ -38,7 +38,10 @@ def init_forge(root: Path, source: Path, branch: str) -> None:
         raise ForgeError(f"forge root is not empty: {root}")
     root.mkdir(parents=True, exist_ok=True)
     (root / "views").mkdir()
-    (root / "state.lock").touch()
+    from store import initialize_store
+
+    store = initialize_store(root, database)
+    store.close()
     run("git", "clone", "--bare", "--no-local", str(source), str(canonical_repo(root)))
     if output(canonical_repo(root), "rev-parse", "--show-object-format") != "sha1":
         raise ForgeError("this experiment currently supports SHA-1 repositories only")
@@ -62,6 +65,52 @@ def init_forge(root: Path, source: Path, branch: str) -> None:
             "next_transaction_sequence": 1,
         },
     )
+
+
+def migrate_storage(root: Path, database: str | None = None) -> None:
+    """Import a legacy JSON forge into the configured database backend."""
+    import json
+
+    from store import backend_record_path, initialize_store, open_store
+
+    legacy = root / "state.json"
+    try:
+        document = json.loads(legacy.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise ForgeError(f"cannot read legacy forge state: {error}") from error
+    if not isinstance(document.get("canonical_branch"), str):
+        raise ForgeError("legacy forge state is not a valid forge document")
+    if backend_record_path(root).exists():
+        raise ForgeError("forge already has a storage backend record")
+    store = initialize_store(root, database)
+    try:
+        store.save_document(document, [], None)
+        reloaded = store.load_document()
+    except Exception:
+        store.close()
+        _rollback_failed_migration(root)
+        raise
+    normalized_document = json.loads(json.dumps(document, sort_keys=True))
+    normalized_reloaded = json.loads(json.dumps(reloaded, sort_keys=True))
+    try:
+        if normalized_document != normalized_reloaded:
+            raise ForgeError("migrated document differs from the legacy JSON")
+        os.replace(legacy, root / "state.json.imported")
+    except Exception:
+        _rollback_failed_migration(root)
+        raise
+    finally:
+        store.close()
+
+
+def _rollback_failed_migration(root: Path) -> None:
+    from store import backend_record_path
+
+    for name in ("store.sqlite3", "store.sqlite3-wal", "store.sqlite3-shm"):
+        candidate = root / name
+        if candidate.exists():
+            candidate.unlink(missing_ok=True)
+    backend_record_path(root).unlink(missing_ok=True)
 
 
 def install_hooks(root: Path, name: str, entrypoint: Path) -> None:

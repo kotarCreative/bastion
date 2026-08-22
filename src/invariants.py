@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import fcntl
 import os
 import re
 from pathlib import Path
@@ -1107,16 +1106,18 @@ def _history_phases(
 
 def check_invariants(root: Path) -> None:
     """Raise ForgeError if the forge violates a global invariant."""
-    lock_path = root / "state.lock"
-    try:
-        with lock_path.open("r") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            state = copy.deepcopy(load_state(root))
+    from state import locked
+
+    with locked(root, recoverer=lambda _root, _state: None, scopes=("global",)):
+        state = copy.deepcopy(load_state(root))
+        try:
             _phase("STATE_SCHEMA", lambda: _schema(state))
             _identity_and_descriptor_checks(state)
-            canonical_refs, view_refs = _phase("FORGE_LAYOUT", lambda: _layout_and_refs(root, state))
-    except ForgeError:
-        raise
-    except OSError as error:
-        _fail("STATE_SCHEMA", "state", f"cannot acquire snapshot: {error}")
+            canonical_refs, view_refs = _phase(
+                "FORGE_LAYOUT", lambda: _layout_and_refs(root, state)
+            )
+        except ForgeError:
+            raise
+        except OSError as error:
+            _fail("STATE_SCHEMA", "state", f"cannot acquire snapshot: {error}")
     _history_phases(root, state, canonical_refs, view_refs)

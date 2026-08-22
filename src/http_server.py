@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import binascii
-import fcntl
 import gzip
 import json
 import os
@@ -121,13 +120,14 @@ def load_tokens(root: Path) -> dict[str, str]:
 
 
 def add_token(root: Path, view: str) -> str:
+    from state import locked
+
     state = load_state(root)
     if view not in state["views"]:
         raise ForgeError(f"unknown view: {view}")
     token = secrets.token_urlsafe(32)
     target = tokens_path(root)
-    with (root / "state.lock").open("a+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with locked(root, recoverer=lambda _root, _state: None):
         tokens = load_tokens(root)
         tokens[token] = view
         temporary = target.with_suffix(".tmp")
@@ -142,6 +142,7 @@ def run_service(
     advertise: bool,
     payload: bytes,
     protocol: str | None,
+    extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     arguments = ["git", SERVICE_COMMANDS[service], "--stateless-rpc"]
     if advertise:
@@ -150,6 +151,8 @@ def run_service(
     env = clean_env()
     if protocol:
         env["GIT_PROTOCOL"] = protocol
+    if extra_env:
+        env.update(extra_env)
     try:
         return subprocess.run(
             arguments,
@@ -228,7 +231,13 @@ class BastionRequestHandler(BaseHTTPRequestHandler):
         else:
             raw = self._read_body()
             payload = decode_body(raw, self.headers.get("Content-Encoding"))
-            completed = run_service(repo, target, False, payload, protocol)
+            extra_env: dict[str, str] = {}
+            idempotency_key = self.headers.get("Idempotency-Key")
+            if idempotency_key and target == "git-receive-pack":
+                if len(idempotency_key) > 256 or not idempotency_key.strip():
+                    raise HttpError(400, b"invalid Idempotency-Key")
+                extra_env["BASTION_IDEMPOTENCY_KEY"] = idempotency_key
+            completed = run_service(repo, target, False, payload, protocol, extra_env)
             if completed.returncode:
                 raise HttpError(500, completed.stderr[:4096])
             body = completed.stdout

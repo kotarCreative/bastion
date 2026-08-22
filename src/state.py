@@ -1,11 +1,20 @@
-"""Durable state, locking, and cross-repository transaction recovery."""
+"""Durable state, session leases, and cross-repository transaction recovery.
+
+State persistence is delegated to `store.py` (`.specs/009-production-
+transaction-storage.md`): short optimistic transactions against SQLite or
+PostgreSQL, lease-based session exclusion instead of a filesystem lock, and
+checksum-verified document loads.
+"""
 
 from __future__ import annotations
 
 import contextlib
-import fcntl
+import copy
 import json
 import os
+import threading
+import time
+import uuid
 from pathlib import Path
 from typing import Callable, Iterator
 
@@ -14,35 +23,54 @@ from failpoints import checkpoint
 from git import git, ref
 from identity import require_matching_descriptor
 from layout import ZERO_OID, canonical_repo, view_repo
+from store import LEASE_TTL_SECONDS, backend_record_path, open_store
+
+
+class _Sessions(threading.local):
+    def __init__(self) -> None:
+        self.active: dict[str, dict] = {}
+
+
+_sessions = _Sessions()
+
+
+def _session_for(root: Path) -> dict | None:
+    return _sessions.active.get(str(root.resolve()))
 
 
 def state_path(root: Path) -> Path:
+    """Legacy location of the pre-storage JSON document (imports only)."""
     return root / "state.json"
 
 
 def load_state(root: Path) -> dict:
+    store = open_store(root)
     try:
-        return json.loads(state_path(root).read_text())
-    except (OSError, json.JSONDecodeError) as error:
-        raise ForgeError(f"cannot read forge state: {error}") from error
+        return store.load_document()
+    finally:
+        store.close()
 
 
 def save_state(root: Path, state: dict) -> None:
-    target = state_path(root)
-    temporary = target.with_suffix(".tmp")
-    with temporary.open("w") as output_file:
-        output_file.write(json.dumps(state, indent=2, sort_keys=True) + "\n")
-        output_file.flush()
-        os.fsync(output_file.fileno())
-    checkpoint(root, "state.temporary_fsynced")
-    os.replace(temporary, target)
-    checkpoint(root, "state.replaced")
-    directory = os.open(root, os.O_RDONLY)
+    session = _session_for(root)
+    if session is not None:
+        leases = [(scope, session["owner"]) for scope in session["scopes"]]
+        session["store"].save_document(
+            state, leases, root, baseline=session.get("baseline")
+        )
+        return
+    if not backend_record_path(root).exists():
+        from store import database_uri, initialize_store
+
+        uri = database_uri(root)
+        if uri.startswith("postgres://") or uri.startswith("postgresql://"):
+            raise ForgeError("a postgres forge must be created by init or migration")
+        initialize_store(root).close()
+    store = open_store(root)
     try:
-        os.fsync(directory)
+        store.save_document(state, [], root)
     finally:
-        os.close(directory)
-    checkpoint(root, "state.directory_fsynced")
+        store.close()
 
 
 def apply_transaction_state(state: dict, transaction: dict) -> None:
@@ -326,15 +354,93 @@ def recover(root: Path, state: dict) -> None:
         checkpoint(root, "recovery.state_persisted")
 
 
+def idempotency_lookup(root: Path, key: str) -> dict | None:
+    session = _session_for(root)
+    if session is not None:
+        return session["store"].lookup_idempotency(key)
+    store = open_store(root)
+    try:
+        return store.lookup_idempotency(key)
+    finally:
+        store.close()
+
+
+def idempotency_record(root: Path, key: str, fingerprint: dict, outcome: dict) -> None:
+    session = _session_for(root)
+    if session is not None:
+        session["store"].record_idempotency(key, fingerprint, outcome)
+        return
+    store = open_store(root)
+    try:
+        store.record_idempotency(key, fingerprint, outcome)
+    finally:
+        store.close()
+
+
+def audit_event(root: Path, kind: str, subject: str, detail: str) -> None:
+    session = _session_for(root)
+    if session is not None:
+        session["store"].audit(kind, subject, detail)
+        return
+    store = open_store(root)
+    try:
+        store.audit(kind, subject, detail)
+    finally:
+        store.close()
+
+
 @contextlib.contextmanager
 def locked(
-    root: Path, recoverer: Callable[[Path, dict], None] = recover
+    root: Path,
+    recoverer: Callable[[Path, dict], None] = recover,
+    scopes: tuple[str, ...] = ("global",),
 ) -> Iterator[dict]:
-    with (root / "state.lock").open("a+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        state = load_state(root)
+    resolved = str(root.resolve())
+    if _sessions.active.get(resolved) is not None:
+        raise ForgeError("forge session is already active in this thread")
+    from store import process_identity
+
+    store = open_store(root)
+    owner = f"{uuid.uuid4().hex}:{process_identity()}"
+    store.acquire_leases(list(scopes), owner)
+    session = {
+        "store": store,
+        "owner": owner,
+        "scopes": list(scopes),
+        "baseline": None,
+    }
+    _sessions.active[resolved] = session
+    try:
+        state = store.load_document()
         recoverer(root, state)
+        # Deletion diffing starts from what this session observed after
+        # recovery, so concurrent rows from other scopes are never deleted.
+        session["baseline"] = copy.deepcopy(state)
         yield state
+    finally:
+        _sessions.active.pop(resolved, None)
+        try:
+            store.release_leases(list(scopes), owner)
+        finally:
+            store.close()
+
+
+def heartbeat_session(root: Path, token: str, seconds: float | None = None) -> float:
+    """Extend every lease owned by ``token``; returns the new expiry."""
+    session = _session_for(root)
+    store = open_store(root)
+    try:
+        expiry = time.time() + (seconds or LEASE_TTL_SECONDS)
+        scopes = store.scopes_for_owner(token)
+        if not scopes:
+            raise ForgeError("no active storage lease carries this token")
+        for scope in scopes:
+            store.heartbeat_lease(scope, token, expiry)
+        if session is not None and session["owner"] == token:
+            session["expires_at"] = expiry
+        return expiry
+    finally:
+        store.close()
 
 
 def require_quiescent(root: Path, state: dict) -> None:

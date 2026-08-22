@@ -24,12 +24,17 @@ from service import (
     add_view as _add_view,
     bind_role as _bind_role,
     init_forge,
+    migrate_storage,
     sync_view,
     transition_principal,
     update_canonical_ref,
 )
 from state import save_state
-from worker import drain_projection_jobs
+from worker import (
+    cancel_projection_job,
+    drain_projection_jobs,
+    requeue_projection_job,
+)
 
 
 def add_view(
@@ -63,6 +68,10 @@ def parser() -> argparse.ArgumentParser:
     init.add_argument("root", type=Path)
     init.add_argument("source", type=Path)
     init.add_argument("--branch", default="main")
+    init.add_argument(
+        "--database",
+        help="storage backend URI: sqlite (default) or postgres://...",
+    )
     principal = commands.add_parser("add-principal")
     principal.add_argument("root", type=Path)
     principal.add_argument("principal")
@@ -122,6 +131,36 @@ def parser() -> argparse.ArgumentParser:
     serve.add_argument("root", type=Path)
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
+    stats = commands.add_parser("stats")
+    stats.add_argument("root", type=Path)
+    migrate = commands.add_parser("migrate-storage")
+    migrate.add_argument("root", type=Path)
+    migrate.add_argument(
+        "--database",
+        help="target storage backend URI: sqlite (default) or postgres://...",
+    )
+    backup = commands.add_parser("backup")
+    backup.add_argument("root", type=Path)
+    backup.add_argument("destination", type=Path)
+    restore = commands.add_parser("restore")
+    restore.add_argument("backup", type=Path)
+    restore.add_argument("root", type=Path)
+    restore.add_argument(
+        "--database",
+        help="target storage backend URI for the restored forge",
+    )
+    cancel_job = commands.add_parser("cancel-job")
+    cancel_job.add_argument("root", type=Path)
+    cancel_job.add_argument("job_id")
+    requeue_job = commands.add_parser("requeue-job")
+    requeue_job.add_argument("root", type=Path)
+    requeue_job.add_argument("job_id")
+    heartbeat = commands.add_parser("heartbeat")
+    heartbeat.add_argument("root", type=Path)
+    heartbeat.add_argument("token")
+    heartbeat.add_argument("--seconds", type=float)
+    audit_command = commands.add_parser("audit")
+    audit_command.add_argument("root", type=Path)
     return result
 
 
@@ -129,7 +168,7 @@ def main() -> int:
     args = parser().parse_args()
     try:
         if args.command == "init":
-            init_forge(args.root, args.source, args.branch)
+            init_forge(args.root, args.source, args.branch, args.database)
         elif args.command == "add-principal":
             _add_principal(args.root, args.principal, args.email)
         elif args.command == "add-service-account":
@@ -174,6 +213,48 @@ def main() -> int:
             from http_server import serve
 
             serve(args.root, args.host, args.port)
+        elif args.command == "stats":
+            import json as _json
+
+            from store import open_store
+
+            store = open_store(args.root)
+            try:
+                print(_json.dumps(store.stats(), indent=2, sort_keys=True))
+            finally:
+                store.close()
+        elif args.command == "migrate-storage":
+            migrate_storage(args.root, args.database)
+        elif args.command == "backup":
+            from store import backup_forge
+
+            print(backup_forge(args.root, args.destination))
+        elif args.command == "restore":
+            from store import restore_forge
+
+            print(restore_forge(args.backup, args.root, args.database))
+        elif args.command == "cancel-job":
+            cancel_projection_job(args.root, args.job_id)
+        elif args.command == "requeue-job":
+            requeue_projection_job(args.root, args.job_id)
+        elif args.command == "heartbeat":
+            from state import heartbeat_session
+
+            print(heartbeat_session(args.root, args.token, args.seconds))
+        elif args.command == "audit":
+            from state import load_state as _load
+
+            from store import open_store as _open
+
+            store = _open(args.root)
+            try:
+                for entry in store.recent_audit(100):
+                    print(
+                        f"{entry['seq']}\t{entry['at']:.0f}\t{entry['kind']}\t"
+                        f"{entry['subject']}\t{entry['detail']}"
+                    )
+            finally:
+                store.close()
         return 0
     except ForgeError as error:
         print(f"bastion: {error}", file=sys.stderr)

@@ -5,6 +5,10 @@ from __future__ import annotations
 import copy
 import time
 
+MAX_JOB_ATTEMPTS = 5
+RETRY_BASE_SECONDS = 60
+RETRY_MAX_SECONDS = 600
+
 
 def event_id(transaction_id: str) -> str:
     return f"canonical.committed:{transaction_id}"
@@ -12,6 +16,26 @@ def event_id(transaction_id: str) -> str:
 
 def job_id(transaction_id: str, view: str) -> str:
     return f"project:{transaction_id}:{view}"
+
+
+def retry_delay(attempts: int) -> int:
+    """Exponential backoff capped at RETRY_MAX_SECONDS."""
+    return min(RETRY_BASE_SECONDS * 2 ** max(attempts - 1, 0), RETRY_MAX_SECONDS)
+
+
+def fail_job(job: dict, error_text: str, now: float) -> bool:
+    """Move a failed job to retry or dead; returns True when dead-lettered."""
+    job["status"] = "retry"
+    job["lease_token"] = None
+    job["last_error"] = error_text
+    if job["attempts"] >= MAX_JOB_ATTEMPTS:
+        job["status"] = "dead"
+        job["next_attempt_at"] = None
+        job.pop("lease_expires_at", None)
+        return True
+    job["next_attempt_at"] = now + retry_delay(job["attempts"])
+    job.pop("lease_expires_at", None)
+    return False
 
 
 def enqueue_canonical_committed(
@@ -96,7 +120,7 @@ def next_job(
             job
             for job in jobs.values()
             if job["status"] in {"pending", "retry"}
-            and job.get("next_attempt_at", 0) <= now
+            and (job.get("next_attempt_at") or 0) <= now
             and job["id"] not in (excluded or set())
         ),
         key=lambda item: (item["sequence"], item["id"]),
