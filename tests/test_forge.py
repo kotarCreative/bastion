@@ -10,6 +10,7 @@ from pathlib import Path
 import forge
 from tests import identity_harness
 from tests.storage_helpers import document_bytes, read_document
+from tests.transport import attach_intake_push
 
 
 
@@ -60,6 +61,7 @@ class ForgeTest(unittest.TestCase):
         self.remote = forge.view_repo(self.forge, "alice")
         self.alice = self.root / "alice"
         command("git", "clone", "-q", "--no-local", str(self.remote), str(self.alice))
+        attach_intake_push(self.forge, self.alice, "alice")
         git(self.alice, "config", "user.name", "Alice")
         git(self.alice, "config", "user.email", "alice@example.test")
 
@@ -264,6 +266,7 @@ class ForgeTest(unittest.TestCase):
         collision_remote = forge.view_repo(self.forge, "collision")
         collision = self.root / "collision"
         command("git", "clone", "-q", "--no-local", str(collision_remote), str(collision))
+        attach_intake_push(self.forge, collision, "collision")
         git(collision, "config", "user.name", "Collision")
         git(collision, "config", "user.email", "collision@example.test")
         canonical = forge.canonical_repo(self.forge)

@@ -51,17 +51,8 @@ class IdempotencyTest(unittest.TestCase):
         after = sorted(load_state(self.fixture.root)["transactions"])
         if after == before:
             return False
-        # Receive-pack would now move the view ref; then post-receive runs.
-        old, new, _ref = updates.decode().strip().split(" ")
-        command(
-            "git",
-            "-C",
-            self.view_repo,
-            "update-ref",
-            "refs/heads/main",
-            new,
-            old,
-        )
+        # Pre-receive publishes the source publication itself under the
+        # intake boundary; only post-receive confirmation follows.
         with patch_dict(environment):
             post_receive(self.fixture.root, view, updates)
         drain_projection_jobs(self.fixture.root)

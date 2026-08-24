@@ -25,6 +25,7 @@ from tests.identity_harness import (
 )
 from service import add_view as service_add_view
 from tests.storage_helpers import document_bytes, read_document
+from tests.transport import attach_intake_push
 
 
 EMPTY_DENY = {key: [] for key in (
@@ -86,6 +87,7 @@ class CapabilityFixture:
 
         self.client = root / "client"
         command("git", "clone", "-q", "--no-local", str(forge.view_repo(self.forge, "alice")), str(self.client))
+        attach_intake_push(self.forge, self.client, "alice")
         git(self.client, "config", "user.name", "Alice")
         git(self.client, "config", "user.email", "alice@example.test")
 

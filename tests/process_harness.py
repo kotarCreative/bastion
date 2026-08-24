@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import forge
 from tests import identity_harness
+from tests.transport import attach_intake_push
 import worker
 from errors import ForgeError
 from git import clean_env
@@ -134,12 +135,14 @@ class Fixture:
         checkout = self.root / name
         run_git("clone", "-q", "--no-local", str(self.view_repo(name)), str(checkout))
         self._configure(checkout, name.title(), f"{name}@example.test")
+        attach_intake_push(self.forge, checkout, name)
         return checkout
 
     def extra_clone(self, name: str, suffix: str) -> Path:
         checkout = self.root / f"{name}-{suffix}"
         run_git("clone", "-q", "--no-local", str(self.view_repo(name)), str(checkout))
         self._configure(checkout, name.title(), f"{name}@example.test")
+        attach_intake_push(self.forge, checkout, name)
         return checkout
 
     def _commit(

@@ -27,6 +27,7 @@ from errors import ForgeError
 from state import locked
 from tests.tree_harness import TreeFixture, build_commit, clean_environment, command, empty_subtree_commit, git, gitlink_commit, oid, tree_at
 from tests.storage_helpers import document_bytes, read_document
+from tests.transport import attach_intake_push
 
 
 def _make_commit(repo: Path, parent: str, effects: dict[bytes, tuple[bytes, bytes] | None], message: bytes, timestamp: int) -> str:
@@ -220,6 +221,7 @@ class RejectionImmutabilityTest(unittest.TestCase):
         identity_harness.add_view(self.fixture.root, "narrow", ["container/visible"], ["container/visible"], "main")
         checkout = self.fixture.directory / "client-narrow"
         command("git", "clone", "-q", "--no-local", os.fsdecode(forge.view_repo(self.fixture.root, "narrow")), os.fsdecode(checkout))
+        attach_intake_push(self.fixture.root, checkout, "narrow")
         self.fixture.policies["narrow"] = (["container/visible"], ["container/visible"])
         self.fixture.clients["narrow"] = checkout
         self._reject_push(
@@ -366,6 +368,7 @@ class SyncBarrierImmutabilityTest(unittest.TestCase):
     def _clone(self, name: str, remote: Path) -> Path:
         checkout = self.root / name
         command("git", "clone", "-q", "--no-local", os.fsdecode(remote), os.fsdecode(checkout))
+        attach_intake_push(self.forge, checkout, name)
         command("git", "-C", os.fsdecode(checkout), "config", "user.name", name.title())
         command("git", "-C", os.fsdecode(checkout), "config", "user.email", f"{name}@example.test")
         return checkout
@@ -405,6 +408,8 @@ class SyncBarrierImmutabilityTest(unittest.TestCase):
         new = self._commit(self.alice, "active receive", 1_700_000_100)
         forge.run("git", "--git-dir", os.fsdecode(self.alice_remote), "fetch", "-q", os.fsdecode(self.alice), new)
         forge.pre_receive(self.forge, "alice", f"{old} {new} refs/heads/main\n".encode())
+        # Recreate the crash window: canonical committed, source unpublished.
+        forge.git(self.alice_remote, "update-ref", "refs/heads/main", old)
         self._recover()
         before = self._rejection_snapshot()
         with self.assertRaisesRegex(ForgeError, "active receive transaction"):
@@ -418,6 +423,8 @@ class SyncBarrierImmutabilityTest(unittest.TestCase):
         new = self._commit(self.alice, "unconfirmed source", 1_700_000_100)
         forge.run("git", "--git-dir", os.fsdecode(self.alice_remote), "fetch", "-q", os.fsdecode(self.alice), new)
         forge.pre_receive(self.forge, "alice", f"{old} {new} refs/heads/main\n".encode())
+        # Rewind the source publication so recovery classifies it unconfirmed.
+        forge.git(self.alice_remote, "update-ref", "refs/heads/main", old)
         transaction = next(iter(self._state()["transactions"].values()))
         (self.forge / "receivers" / transaction["id"]).unlink(missing_ok=True)
         self._recover()
@@ -433,7 +440,6 @@ class SyncBarrierImmutabilityTest(unittest.TestCase):
         new = self._commit(self.alice, "pending projection", 1_700_000_100)
         forge.run("git", "--git-dir", os.fsdecode(self.alice_remote), "fetch", "-q", os.fsdecode(self.alice), new)
         forge.pre_receive(self.forge, "alice", f"{old} {new} refs/heads/main\n".encode())
-        forge.git(self.alice_remote, "update-ref", "refs/heads/main", new, old)
         self._recover()
         before = self._rejection_snapshot()
         with self.assertRaisesRegex(ForgeError, "pending projection work"):
