@@ -72,6 +72,16 @@ Catalog additions stay dormant until an explicit transition applies them:
 python3 forge.py transition-principal /tmp/bastion-forge alice
 ```
 
+Every view has a separate authenticated intake repository — the only push
+target. Published view repositories are fetch-only and reject direct pushes.
+Clients clone over HTTP with one token per view:
+
+```bash
+python3 forge.py add-token /tmp/bastion-forge alice
+python3 forge.py serve /tmp/bastion-forge --port 8000
+git clone http://alice:TOKEN@127.0.0.1:8000/alice.git alice
+```
+
 Use normal Git inside `alice`:
 
 ```bash
@@ -80,20 +90,13 @@ git -C alice commit -m "change"
 git -C alice push origin main
 ```
 
-Receive hooks synchronously validate and reconcile the source push, then drain
-ready secondary-view jobs. Jobs can also be processed explicitly:
+Receive hooks synchronously validate and reconcile the submitted pack from
+intake quarantine, then drain ready secondary-view jobs. Jobs can also be
+processed explicitly:
 
 ```bash
 python3 forge.py work /tmp/bastion-forge
 python3 forge.py check /tmp/bastion-forge
-```
-
-Views can also be served over HTTP with one token per view:
-
-```bash
-python3 forge.py add-token /tmp/bastion-forge alice
-python3 forge.py serve /tmp/bastion-forge --port 8000
-git clone http://alice:TOKEN@127.0.0.1:8000/alice.git alice-http
 ```
 
 Run `python3 forge.py --help` for all experimental commands.

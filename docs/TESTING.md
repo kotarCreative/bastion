@@ -37,6 +37,7 @@ Git repositories, hooks, clones, fetches, rebases, and pushes.
 | `tests/test_http_unit.py` | HTTP route grammar, credential parsing, gzip bodies, and token management |
 | `tests/test_http_server.py` | Clone, push, fanout, protocol v2, and shallow clones over loopback HTTP |
 | `tests/test_http_security.py` | Authentication, cross-view isolation, traversal probes, hidden-object wants, and state immutability over HTTP |
+| `tests/test_transport_security.py` | Intake quarantine isolation, push limits with stable categories, audit identity, SSH command grammar, and view-store byte immutability on rejection |
 
 Also run syntax and repository checks:
 
@@ -204,12 +205,18 @@ under their own IDs:
 python3 forge.py add-service-account /tmp/bastion-forge build-bot --owner alice
 ```
 
-Clone through Git transport rather than local object linking:
+Clone through the authenticated HTTP boundary so pushes exercise the intake
+quarantine exactly as network clients do:
 
 ```bash
-git clone --no-local /tmp/bastion-forge/views/alice.git alice
-git clone --no-local /tmp/bastion-forge/views/bob.git bob
+python3 forge.py add-token /tmp/bastion-forge alice
+git clone http://alice:TOKEN@127.0.0.1:8000/alice.git alice
 ```
+
+Process-oriented fixtures push to the local `intake/<view>.git` path instead,
+which runs the same wrapped receive pipeline with test failpoint context.
+Direct pushes to published view repositories are refused by a reject-all
+hook in every suite that verifies transport isolation.
 
 Generate an optional review identity:
 

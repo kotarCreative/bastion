@@ -33,18 +33,30 @@ Trusted in the prototype:
 - forge code and Git executable;
 - canonical repository storage;
 - immutable identity catalog and effective view descriptors in state;
-- local state file and lock;
-- canonical update coordinator.
+- local state file and lease-backed storage sessions;
+- canonical update coordinator;
+- the server process environment handed to receive hooks (operator-owned;
+  clients cannot set environment variables, and trusted identity keys are
+  injected last so they override anything inherited).
 
-Hooks receive only a physical view name. `pre_receive` derives principal,
-descriptor, and generation from trusted server state; stdin, push options,
-environment variables, commit metadata, and client refs cannot select or
-alter identity. This separates endpoint and principal semantics but provides
-no authentication: Phase 4 must bind an authenticated network identity to an
-allowed endpoint.
+Hooks receive a physical view name and, on network transports, a wrapper
+identity context (`BASTION_VIEW`, `BASTION_PRINCIPAL_ID`, `BASTION_TRANSPORT`,
+`BASTION_REMOTE_ADDR`) that must match the routed repository. `pre_receive`
+derives principal, descriptor, and generation from trusted server state;
+stdin, push options, client environment, commit metadata, and client refs
+cannot select or alter identity.
 
-Production must add authenticated principals, protected service storage,
-database authorization, and controlled HTTP/SSH endpoints.
+The transport boundary is the authenticated intake repository. Pushes over
+HTTP (and the SSH command shim) land in intake quarantine; rejected pushes
+are discarded without touching view or canonical storage, and accepted
+pushes are promoted only after full validation and canonical reconciliation.
+Published view repositories are fetch-only: they carry an unconditional
+reject-all pre-receive hook, so direct pushes — local or remote — are refused
+with a stable message. Same-user local processes remain trusted operators of
+the filesystem itself; the enforced boundary is the network surface.
+
+Production must add TLS, real sshd integration calling a forge entry point,
+protected service storage, database authorization, and rate limiting.
 
 ## Hard Invariants
 

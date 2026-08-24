@@ -20,22 +20,36 @@ remain authoritative for snapshots and fast-forward behavior.
 ## Repository Model
 
 ```text
-                         canonical.git
-                    complete trees and history
-                              |
-                 deterministic path projection
-                              |
-             +----------------+----------------+
-             |                                 |
-       views/alice.git                    views/bob.git
-      shared/ + team-a/                  shared/ + team-b/
-             |                                 |
-       ordinary Git client                ordinary Git client
+                          canonical.git
+                     complete trees and history
+                               |
+                  deterministic path projection
+                               |
+              +----------------+----------------+
+              |                                 |
+        views/alice.git                    views/bob.git
+       shared/ + team-a/                  shared/ + team-b/
+              ^                                 ^
+              | fetch only                      | fetch only
+       intake/alice.git                   intake/bob.git
+         authenticated push target (quarantined)
+              |                                 |
+        ordinary Git client                ordinary Git client
 ```
 
 Each view is a valid bare Git repository with its own refs and authorization-
 safe object closure. It has no alternate pointing to the canonical object
-database.
+database. Every view has a sibling intake repository — the only push target.
+Intake objects start in Git's receive quarantine; rejected pushes are
+discarded without touching published storage, and accepted pushes migrate
+into canonical plus the submitting view through the validated pipeline. The
+intake store reads from its sibling view's objects via an alternates entry
+(never canonical), so advertised tips resolve and thin-pack fixup finds
+bases among already-visible objects. View repositories carry an
+unconditional reject-all pre-receive hook: pushes are refused everywhere
+except the authenticated intake boundary. The intake ref mirrors the
+authoritative projected tip as advertisement bookkeeping and is repaired
+after every projection, confirmation, and recovery.
 
 ## Identity Model
 
@@ -156,8 +170,9 @@ The implementation is under `src/`.
 | `outbox.py` | Event dispatch, ordered jobs, leases, and completion rules |
 | `worker.py` | Projection job claim, build, publish, failure, and retry |
 | `invariants.py` | Read-only global persisted-state and Git-history verification |
-| `service.py` | Forge, view, synchronization, and canonical update use cases |
-| `protocol.py` | Receive-pack transaction orchestration |
+| `service.py` | Forge, view, intake, synchronization, and canonical update use cases |
+| `protocol.py` | Intake receive-pack orchestration, limits, and source publication |
+| `http_server.py` | Authenticated smart-HTTP boundary with per-view tokens and limits |
 | `forge.py` | CLI and compatibility facade |
 
 Pure security decisions are kept separate from Git subprocesses. Expensive
