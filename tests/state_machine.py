@@ -28,6 +28,7 @@ from invariants import check_invariants
 from service import build_projection_plan
 from state import locked, load_state, save_state
 from tests.storage_helpers import document_bytes, read_document
+from tests.transport import attach_intake_push
 
 
 PATHS = (
@@ -179,6 +180,7 @@ class Scenario:
     def _clone_client(self, name: str) -> None:
         checkout = self.directory / f"client-{name}"
         git(self.directory, "clone", "-q", "--no-local", str(forge.view_repo(self.root, name)), str(checkout))
+        attach_intake_push(self.root, checkout, name)
         self._configure(checkout, name.title(), f"{name}@example.test")
         oid = git(checkout, "rev-parse", "HEAD").stdout.decode().strip()
         self.clients[name] = {"path": checkout, "oid": oid, "tree": tree_at(checkout, oid), "unpushed": False, "clean": True}
@@ -408,6 +410,9 @@ class Scenario:
             update = f"{old} {new} refs/heads/main\n".encode()
             with patch.dict(os.environ, self.environment, clear=True):
                 forge.pre_receive(self.root, name, update)
+            # Recreate the crashed receive-pack window: canonical committed
+            # while the submitting view ref was never confirmed.
+            forge.git(forge.view_repo(self.root, name), "update-ref", "refs/heads/main", old)
             state = load_state(self.root)
             tx = next(tx for tx in state["transactions"].values() if tx.get("projected_old") == old and tx.get("projected_new") == new)
             (self.root / "receivers" / tx["id"]).unlink(missing_ok=True)
@@ -452,7 +457,6 @@ class Scenario:
             update = f"{old} {new} refs/heads/main\n".encode()
             with patch.dict(os.environ, self.environment, clear=True):
                 forge.pre_receive(self.root, name, update)
-                forge.git(forge.view_repo(self.root, name), "update-ref", "refs/heads/main", new, old)
                 with patch("worker.time.time", return_value=self.logical_now), patch("worker.uuid.uuid4", return_value=SimpleNamespace(hex=f"{self.seed:032x}"[-32:])):
                     forge.post_receive(self.root, name, update)
             client = self.clients[name]; client["unpushed"] = False; client["clean"] = True

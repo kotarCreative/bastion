@@ -11,6 +11,7 @@ import forge
 from tests import identity_harness
 from errors import ForgeError
 from tests.storage_helpers import document_bytes, read_document
+from tests.transport import attach_intake_push
 
 
 
@@ -105,6 +106,7 @@ class CrossViewForgeTest(unittest.TestCase):
     def clone(self, name: str, remote: Path) -> Path:
         checkout = self.root / name
         command("git", "clone", "-q", "--no-local", str(remote), str(checkout))
+        attach_intake_push(self.forge, checkout, name)
         git(checkout, "config", "user.name", name.title())
         git(checkout, "config", "user.email", f"{name}@example.test")
         return checkout
@@ -366,6 +368,9 @@ class CrossViewForgeTest(unittest.TestCase):
             "alice",
             f"{alice_old} {alice_new} refs/heads/main\n".encode(),
         )
+        # Recreate the unconfirmed window: rewind the source publication so
+        # canonical is committed while the submitting ref stays behind.
+        forge.git(self.alice_remote, "update-ref", "refs/heads/main", alice_old)
 
         (self.bob / "shared" / "overlap.txt").write_text("bob shared overlap\n")
         bob_new = commit(self.bob, "bob shared overlap", 1_710_001_100)
@@ -381,6 +386,8 @@ class CrossViewForgeTest(unittest.TestCase):
         bob_update = f"{bob_old} {bob_new} refs/heads/main\n".encode()
         with self.assertRaisesRegex(ForgeError, "unconfirmed source publication"):
             forge.pre_receive(self.forge, "bob", bob_update)
+        # Restore the publication the crashed receive-pack would have
+        # completed, then confirm through post-receive.
         forge.git(
             self.alice_remote,
             "update-ref",
@@ -394,13 +401,6 @@ class CrossViewForgeTest(unittest.TestCase):
             f"{alice_old} {alice_new} refs/heads/main\n".encode(),
         )
         forge.pre_receive(self.forge, "bob", bob_update)
-        forge.git(
-            self.bob_remote,
-            "update-ref",
-            "refs/heads/main",
-            bob_new,
-            bob_old,
-        )
         forge.post_receive(self.forge, "bob", bob_update)
         forge.drain_projection_jobs(self.forge)
         forge.sync_view(self.forge, "bob")
@@ -455,6 +455,9 @@ class CrossViewForgeTest(unittest.TestCase):
         )
         update = f"{old} {new} refs/heads/main\n".encode()
         forge.pre_receive(self.forge, "alice", update)
+        # Rewind the source publication to recreate the crash window in
+        # which canonical committed but the view ref never moved.
+        forge.git(self.alice_remote, "update-ref", "refs/heads/main", old)
         with self.assertRaisesRegex(ForgeError, "active receive transaction"):
             forge.pre_receive(self.forge, "alice", update)
 
@@ -476,6 +479,9 @@ class CrossViewForgeTest(unittest.TestCase):
             "alice",
             f"{old} {new} refs/heads/main\n".encode(),
         )
+        # Recreate the unconfirmed window, then discard the receiver marker
+        # so recovery classifies the transaction as source_unconfirmed.
+        forge.git(self.alice_remote, "update-ref", "refs/heads/main", old)
         transaction = next(iter(self.state()["transactions"].values()))
         (self.forge / "receivers" / transaction["id"]).unlink(missing_ok=True)
         forge.drain_projection_jobs(self.forge)
@@ -495,13 +501,6 @@ class CrossViewForgeTest(unittest.TestCase):
 
         update = f"{old} {new} refs/heads/main\n".encode()
         forge.pre_receive(self.forge, "alice", update)
-        forge.git(
-            self.alice_remote,
-            "update-ref",
-            "refs/heads/main",
-            new,
-            old,
-        )
         forge.post_receive(self.forge, "alice", update)
         retried = self.state()["transactions"][transaction["id"]]
         self.assertEqual(new, self.remote_tip(self.alice_remote))

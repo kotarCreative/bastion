@@ -13,6 +13,7 @@ from tests import identity_harness
 from errors import ForgeError
 from invariants import check_invariants
 from tests.storage_helpers import document_bytes, read_document
+from tests.transport import attach_intake_push
 
 
 
@@ -76,6 +77,7 @@ class InvariantTest(unittest.TestCase):
     def _checkout(self, name: str) -> Path:
         checkout = self.root / name
         command("git", "clone", "-q", "--no-local", str(forge.view_repo(self.forge, name)), str(checkout))
+        attach_intake_push(self.forge, checkout, name)
         command("git", "config", "user.name", name.capitalize(), cwd=checkout)
         command("git", "config", "user.email", f"{name}@example.test", cwd=checkout)
         return checkout
@@ -110,6 +112,7 @@ class InvariantTest(unittest.TestCase):
     def test_source_change_and_synthetic_fanout_pass(self) -> None:
         checkout = self.root / "alice"
         command("git", "clone", "-q", "--no-local", str(forge.view_repo(self.forge, "alice")), str(checkout))
+        attach_intake_push(self.forge, checkout, "alice")
         command("git", "config", "user.name", "Alice", cwd=checkout)
         command("git", "config", "user.email", "alice@example.test", cwd=checkout)
         (checkout / "shared" / "change.txt").write_text("change\n")
@@ -181,6 +184,8 @@ class InvariantTest(unittest.TestCase):
         new = command("git", "rev-parse", "HEAD", cwd=checkout).stdout.strip()
         forge.run("git", "--git-dir", str(forge.view_repo(self.forge, "alice")), "fetch", "-q", str(checkout), new)
         forge.pre_receive(self.forge, "alice", f"{old} {new} refs/heads/main\n".encode())
+        # Rewind the internal source publication to hold the window open.
+        forge.git(forge.view_repo(self.forge, "alice"), "update-ref", "refs/heads/main", old)
         transaction = next(iter(read_document(self.forge)["transactions"].values()))
         (self.forge / "receivers" / transaction["id"]).unlink(missing_ok=True)
         forge.drain_projection_jobs(self.forge)

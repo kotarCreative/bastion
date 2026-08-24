@@ -45,7 +45,13 @@ The local prototype currently has:
   short transactions, PID-liveness lease sessions replacing the filesystem
   lock, idempotent receives with durable retry schedules, worker heartbeats,
   cancellation, dead-lettering, audit logging, observability stats,
-  backup/restore, corruption detection, and legacy-JSON migration.
+  backup/restore, corruption detection, and legacy-JSON migration;
+- an authenticated intake boundary: pushes land in per-view quarantine-
+  separated intake repositories, published views are fetch-only behind a
+  reject-all hook, receive hooks enforce pack/object/depth limits with
+  stable rejection categories, accepted and rejected receives carry audited
+  transport identity, and an SSH command shim exercises the same rules over
+  a loopback backend (.specs/010-authenticated-intake-boundary.md).
 
 The roadmap is ordered by architectural risk, not product visibility.
 
@@ -137,15 +143,27 @@ Goal: replace filesystem-local endpoints with authenticated network services.
 - [done] Add an experimental loopback smart-HTTP endpoint with per-view
   tokens as the transport boundary for security testing
   (.specs/006-smart-http-endpoint.md).
-- Receive pushes into a separate authenticated intake repository or service.
-- Implement wrapped `git-receive-pack` with quarantine and stable opaque errors.
-- Implement authorization-safe `git-upload-pack` for smart HTTP protocol v2 and
-  SSH.
-- Prevent local filesystem clone access.
-- Add authentication, repository discovery, branch ACLs, and audit identity.
-- Add pack size, object count, object size, depth, decompression, and timeout
+- [done] Receive pushes into a separate authenticated intake repository;
+  published view repositories become fetch-only behind a reject-all hook,
+  and rejected pushes never enter view or canonical storage
+  (.specs/010-authenticated-intake-boundary.md).
+- [done] Wrap receive-pack at the intake boundary with Git quarantine,
+  explicit source publication, stable rejection categories, and pack
+  size, object count, object size, depth, decompression, and timeout
   limits.
-- Test direct OID wants, hidden refs, thin packs, and unexpected capabilities.
+- [done] Keep `git-upload-pack` authorization-safe for smart HTTP protocol
+  v2 (allow-listed protocol header, structural hidden-object safety) and
+  prove the SSH command grammar through a loopback shim.
+- [done] Bind audit identity to every accepted and rejected receive and
+  token minting, with repository discovery that keeps unknown and
+  unauthorized views indistinguishable.
+- [done] Test direct OID wants of hidden canonical objects under protocol
+  v0 and v2, advertisement cross-view leakage, thin packs whose bases live
+  only in the view store, malformed framing, decompression bombs,
+  identity-header spoofing, mirror tampering self-healing, and concurrent
+  HTTP pushes (.specs/010-authenticated-intake-boundary.md).
+- [ ] Re-run the want/thin-pack matrix against a streaming server and wire
+      a real sshd entry point for production-style SSH.
 
 Exit criteria:
 

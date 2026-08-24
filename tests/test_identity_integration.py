@@ -23,6 +23,7 @@ from service import (
     sync_view,
 )
 from tests.storage_helpers import document_bytes, read_document
+from tests.transport import attach_intake_push
 
 
 def command(*args: str, cwd: Path | None = None, check: bool = True, env: dict | None = None) -> subprocess.CompletedProcess[str]:
@@ -80,6 +81,7 @@ class IdentityIntegrationTest(unittest.TestCase):
         for name in ("alice-primary", "alice-secondary", "bob"):
             checkout = self.root / name
             command("git", "clone", "-q", "--no-local", str(forge.view_repo(self.forge, name)), str(checkout))
+            attach_intake_push(self.forge, checkout, name)
             git(checkout, "config", "user.name", name.title())
             git(checkout, "config", "user.email", f"{name}@example.test")
             self.clients[name] = checkout
@@ -177,6 +179,7 @@ class IdentityIntegrationTest(unittest.TestCase):
         fixture_add_view(self.forge, "release-bot", ["shared"], ["shared"], "main")
         bot = self.root / "client-release-bot"
         command("git", "clone", "-q", "--no-local", str(forge.view_repo(self.forge, "release-bot")), str(bot))
+        attach_intake_push(self.forge, bot, "release-bot")
         git(bot, "config", "user.name", "Release Bot")
         git(bot, "config", "user.email", "bot@example.test")
 
@@ -244,6 +247,7 @@ class IdentityIntegrationTest(unittest.TestCase):
         fixture_add_view(self.forge, "reader", ["shared"], [], "main")
         reader = self.root / "client-reader"
         command("git", "clone", "-q", "--no-local", str(forge.view_repo(self.forge, "reader")), str(reader))
+        attach_intake_push(self.forge, reader, "reader")
         git(reader, "config", "user.name", "Reader")
         git(reader, "config", "user.email", "reader@example.test")
 
@@ -282,7 +286,6 @@ class IdentityIntegrationTest(unittest.TestCase):
             forge.pre_receive(self.forge, "bob", updates)
         finally:
             os.umask(previous_umask)
-        forge.git(forge.view_repo(self.forge, "bob"), "update-ref", "refs/heads/main", new, old)
         forge.post_receive(self.forge, "bob", updates)
 
         state = self.state()

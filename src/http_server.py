@@ -174,9 +174,10 @@ def run_service(
     if advertise:
         arguments.append("--advertise-refs")
     arguments.append(os.fsencode(repo))
+    # The server process environment is operator-owned and passes through
+    # (limit tuning, failpoints). Trusted identity keys are injected last
+    # so they override anything inherited.
     env = clean_env()
-    for key in [name for name in env if name.startswith("BASTION_")]:
-        env.pop(key, None)
     if protocol and PROTOCOL_HEADER.fullmatch(protocol):
         env["GIT_PROTOCOL"] = protocol
     if alternates is not None:

@@ -25,6 +25,7 @@ from tests.identity_harness import (
 )
 from service import add_view as service_add_view
 from tests.storage_helpers import document_bytes, read_document
+from tests.transport import attach_intake_push
 
 
 def git(repo: Path, *args: str, check: bool = True, env: dict | None = None):
@@ -81,6 +82,7 @@ class MetadataFixture:
         self.client = root / "client-alice"
         command("git", "clone", "-q", "--no-local",
                 str(forge.view_repo(self.forge, "alice")), str(self.client))
+        attach_intake_push(self.forge, self.client, "alice")
         git(self.client, "config", "user.name", "Alice Local")
         git(self.client, "config", "user.email", "alice@example.test")
 
@@ -137,6 +139,7 @@ class AuthorBindingTest(unittest.TestCase):
         carol = self.fixture.root / "client-carol"
         command("git", "clone", "-q", "--no-local",
                 str(forge.view_repo(self.fixture.forge, "carol")), str(carol))
+        attach_intake_push(self.fixture.forge, carol, "carol")
         git(carol, "config", "user.name", "Anyone")
         git(carol, "config", "user.email", "anyone@elsewhere.test")
         (carol / "shared" / "c.txt").write_text("c\n")
@@ -154,6 +157,7 @@ class AuthorBindingTest(unittest.TestCase):
         bot = self.fixture.root / "client-bot"
         command("git", "clone", "-q", "--no-local",
                 str(forge.view_repo(self.fixture.forge, "bot")), str(bot))
+        attach_intake_push(self.fixture.forge, bot, "bot")
         git(bot, "config", "user.name", "Bot")
         git(bot, "config", "user.email", "bot@example.test")
         (bot / "shared" / "b.txt").write_text("b\n")

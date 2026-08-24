@@ -13,6 +13,7 @@ from pathlib import Path
 import forge
 from tests import identity_harness
 from tests.storage_helpers import document_bytes, read_document
+from tests.transport import attach_intake_push
 
 
 Tree = dict[bytes, tuple[bytes, str, bytes]]
@@ -200,6 +201,7 @@ class TreeFixture:
             identity_harness.add_view(self.root, name, read, write, "main")
             checkout = self.directory / f"client-{name}"
             command("git", "clone", "-q", "--no-local", os.fsdecode(forge.view_repo(self.root, name)), os.fsdecode(checkout))
+            attach_intake_push(self.root, checkout, name)
             self.clients[name] = checkout
         self.admin = self.directory / "admin"
         command("git", "clone", "-q", "--no-local", os.fsdecode(forge.canonical_repo(self.root)), os.fsdecode(self.admin))

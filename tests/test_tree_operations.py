@@ -7,6 +7,7 @@ import forge
 from tests import identity_harness
 from errors import ForgeError
 from tests.tree_harness import TreeFixture, command, empty_subtree_commit, git, gitlink_commit, oid
+from tests.transport import attach_intake_push
 
 
 class TreeOperationsTest(unittest.TestCase):
@@ -119,6 +120,7 @@ class TreeOperationsTest(unittest.TestCase):
         identity_harness.add_view(self.fixture.root, "narrow", ["container/visible"], ["container/visible"], "main")
         checkout = self.fixture.directory / "client-narrow"
         command("git", "clone", "-q", "--no-local", os.fsdecode(forge.view_repo(self.fixture.root, "narrow")), os.fsdecode(checkout))
+        attach_intake_push(self.fixture.root, checkout, "narrow")
         self.fixture.policies["narrow"] = (["container/visible"], ["container/visible"])
         self.fixture.clients["narrow"] = checkout
         self._reject_source("narrow", {b"container/visible/child": (b"100644", b"child\n")}, "file/directory authorization boundary")
