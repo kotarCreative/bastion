@@ -157,9 +157,13 @@ Goal: replace filesystem-local endpoints with authenticated network services.
 - [done] Bind audit identity to every accepted and rejected receive and
   token minting, with repository discovery that keeps unknown and
   unauthorized views indistinguishable.
-- [ ] Test direct OID wants, thin packs against canonical-hidden bases,
-      and unexpected capabilities under a streaming server; wire a real
-      sshd entry point for production-style SSH.
+- [done] Test direct OID wants of hidden canonical objects under protocol
+  v0 and v2, advertisement cross-view leakage, thin packs whose bases live
+  only in the view store, malformed framing, decompression bombs,
+  identity-header spoofing, mirror tampering self-healing, and concurrent
+  HTTP pushes (.specs/010-authenticated-intake-boundary.md).
+- [ ] Re-run the want/thin-pack matrix against a streaming server and wire
+      a real sshd entry point for production-style SSH.
 
 Exit criteria:
 
