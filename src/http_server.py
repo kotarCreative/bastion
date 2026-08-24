@@ -18,7 +18,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from errors import ForgeError
 from git import clean_env
-from layout import view_repo
+from layout import intake_repo, view_repo
 from state import load_state
 
 
@@ -28,8 +28,13 @@ ROUTE = re.compile(
 )
 SERVICES = ("git-upload-pack", "git-receive-pack")
 SERVICE_COMMANDS = {"git-upload-pack": "upload-pack", "git-receive-pack": "receive-pack"}
+SERVICE_TIMEOUTS = {"git-upload-pack": 300, "git-receive-pack": 600}
+UPLOAD_MAX_BODY = 32 << 20
+
+from service import MAX_PACK_BYTES as RECEIVE_MAX_BODY
+GZIP_MAX_RATIO = 32
+PROTOCOL_HEADER = re.compile(r"version=2(=[0-9]+)?")
 SUBPROCESS_TIMEOUT = 600
-MAX_BODY = 1 << 30
 
 BODY_401 = b"authentication required"
 BODY_404 = b"not found"
@@ -86,14 +91,20 @@ def parse_authorization(header: str | None) -> str | None:
     return None
 
 
-def decode_body(body: bytes, encoding: str | None) -> bytes:
+def decode_body(
+    body: bytes, encoding: str | None, maximum: int | None = None
+) -> bytes:
     if not encoding or encoding.lower() == "identity":
         return body
     if encoding.lower() == "gzip":
         try:
-            return gzip.decompress(body)
+            decoded = gzip.decompress(body)
         except (OSError, EOFError, zlib.error):
             raise HttpError(400, BODY_400)
+        cap = min(maximum or (1 << 30), GZIP_MAX_RATIO * max(len(body), 1))
+        if len(decoded) > cap:
+            raise HttpError(400, BODY_400)
+        return decoded
     raise HttpError(400, BODY_400)
 
 
@@ -133,7 +144,21 @@ def add_token(root: Path, view: str) -> str:
         temporary = target.with_suffix(".tmp")
         temporary.write_text(json.dumps(tokens, indent=2, sort_keys=True) + "\n")
         os.replace(temporary, target)
+    from state import audit_event
+
+    audit_event(root, "token.issue", f"{view}/-", "transport=http")
     return token
+
+
+def service_repo(root: Path, view: str, service: str) -> tuple[Path, Path | None]:
+    """Resolve a routed view to its backing repository.
+
+    Uploads read from published view storage; receives target the isolated
+    intake repository whose only object source is the sibling view store.
+    """
+    if service == "git-upload-pack":
+        return view_repo(root, view), None
+    return intake_repo(root, view), view_repo(root, view) / "objects"
 
 
 def run_service(
@@ -143,14 +168,20 @@ def run_service(
     payload: bytes,
     protocol: str | None,
     extra_env: dict[str, str] | None = None,
+    alternates: Path | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     arguments = ["git", SERVICE_COMMANDS[service], "--stateless-rpc"]
     if advertise:
         arguments.append("--advertise-refs")
     arguments.append(os.fsencode(repo))
+    # The server process environment is operator-owned and passes through
+    # (limit tuning, failpoints). Trusted identity keys are injected last
+    # so they override anything inherited.
     env = clean_env()
-    if protocol:
+    if protocol and PROTOCOL_HEADER.fullmatch(protocol):
         env["GIT_PROTOCOL"] = protocol
+    if alternates is not None:
+        env["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = str(alternates)
     if extra_env:
         env.update(extra_env)
     try:
@@ -160,7 +191,7 @@ def run_service(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=env,
-            timeout=SUBPROCESS_TIMEOUT,
+            timeout=SERVICE_TIMEOUTS[service],
         )
     except subprocess.TimeoutExpired as error:
         raise HttpError(500, b"git service timed out") from error
@@ -214,30 +245,41 @@ class BastionRequestHandler(BaseHTTPRequestHandler):
             raise HttpError(401, BODY_401, {"WWW-Authenticate": 'Basic realm="bastion"'})
         if tokens[credential] != view:
             raise HttpError(404, BODY_404)
-        repo = view_repo(self.root, view)
+        service = target if target != "info/refs" else parse_service(split.query)
+        if service is None:
+            raise HttpError(404, BODY_404)
+        repo, alternates = service_repo(self.root, view, service)
         if not repo.is_dir():
             raise HttpError(404, BODY_404)
         protocol = self.headers.get("Git-Protocol")
         if target == "info/refs":
-            service = parse_service(split.query)
-            if service is None:
-                raise HttpError(404, BODY_404)
-            completed = run_service(repo, service, True, b"", protocol)
+            completed = run_service(repo, service, True, b"", protocol, None, alternates)
             if completed.returncode:
                 raise HttpError(500, completed.stderr[:4096])
             body = pkt_line(f"# service={service}\n".encode()) + b"0000" + completed.stdout
             content_type = f"application/x-{service}-advertisement"
             extra = dict(CACHE_HEADERS)
         else:
-            raw = self._read_body()
-            payload = decode_body(raw, self.headers.get("Content-Encoding"))
-            extra_env: dict[str, str] = {}
+            raw = self._read_body(service)
+            payload = decode_body(
+                raw,
+                self.headers.get("Content-Encoding"),
+                UPLOAD_MAX_BODY if service == "git-upload-pack" else RECEIVE_MAX_BODY,
+            )
+            extra_env = {
+                "BASTION_VIEW": view,
+                "BASTION_TRANSPORT": "http",
+                "BASTION_REMOTE_ADDR": self.client_address[0],
+            }
+            principal = self._principal_for(view)
+            if principal:
+                extra_env["BASTION_PRINCIPAL_ID"] = principal
             idempotency_key = self.headers.get("Idempotency-Key")
             if idempotency_key and target == "git-receive-pack":
                 if len(idempotency_key) > 256 or not idempotency_key.strip():
                     raise HttpError(400, b"invalid Idempotency-Key")
                 extra_env["BASTION_IDEMPOTENCY_KEY"] = idempotency_key
-            completed = run_service(repo, target, False, payload, protocol, extra_env)
+            completed = run_service(repo, target, False, payload, protocol, extra_env, alternates)
             if completed.returncode:
                 raise HttpError(500, completed.stderr[:4096])
             body = completed.stdout
@@ -245,19 +287,28 @@ class BastionRequestHandler(BaseHTTPRequestHandler):
             extra = {}
         self._respond(200, body, content_type, extra)
 
-    def _read_body(self) -> bytes:
+    def _principal_for(self, view: str) -> str | None:
+        try:
+            state = load_state(self.root)
+        except ForgeError:
+            return None
+        entry = state["views"].get(view)
+        return entry.get("principal_id") if entry else None
+
+    def _read_body(self, service: str) -> bytes:
+        maximum = UPLOAD_MAX_BODY if service == "git-upload-pack" else RECEIVE_MAX_BODY
         transfer_encoding = self.headers.get("Transfer-Encoding", "")
         if "chunked" in transfer_encoding.lower():
-            return self._read_chunked()
+            return self._read_chunked(maximum)
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             raise HttpError(400, BODY_400)
-        if length < 0 or length > MAX_BODY:
+        if length < 0 or length > maximum:
             raise HttpError(400, BODY_400)
         return self.rfile.read(length) if length else b""
 
-    def _read_chunked(self) -> bytes:
+    def _read_chunked(self, maximum: int) -> bytes:
         chunks: list[bytes] = []
         total = 0
         while True:
@@ -273,7 +324,7 @@ class BastionRequestHandler(BaseHTTPRequestHandler):
                         break
                 break
             total += size
-            if total > MAX_BODY:
+            if total > maximum:
                 raise HttpError(400, BODY_400)
             chunks.append(self.rfile.read(size))
             self.rfile.read(2)

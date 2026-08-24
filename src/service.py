@@ -13,7 +13,7 @@ import identity
 from errors import ForgeError
 from failpoints import checkpoint
 from git import clean_env, git, output, ref, run, tree_entries, tree_oid
-from layout import ZERO_OID, canonical_repo, view_repo
+from layout import ZERO_OID, canonical_repo, intake_repo, view_repo
 from projection import project_history, project_tree, synthetic_commit
 from state import (
     has_unconfirmed_source,
@@ -27,6 +27,38 @@ from state import (
 from validation import capability_allowed, validate_view_name
 
 
+MAX_PACK_BYTES = int(os.environ.get("BASTION_MAX_PACK_BYTES", 256 * 1024 * 1024))
+
+REJECT_ALL_HOOK = (
+    "#!/bin/sh\n"
+    "echo 'bastion: pushes are accepted only through the authenticated"
+    " intake boundary' >&2\n"
+    "exit 1\n"
+)
+
+
+def repair_intake_mirror(root: Path, state: dict, name: str) -> None:
+    """Force the intake advertisement ref to the authoritative projected tip."""
+    view = state["views"].get(name)
+    if not view:
+        return
+    intake = intake_repo(root, name)
+    if not intake.is_dir():
+        return
+    projected_ref = view["projected_ref"]
+    target = view["projected_tip"]
+    current = ref(intake, projected_ref)
+    if target == ZERO_OID:
+        if current != ZERO_OID:
+            git(intake, "update-ref", "-d", projected_ref, current)
+        return
+    if current != target:
+        arguments = ["update-ref", projected_ref, target]
+        if current != ZERO_OID:
+            arguments.append(current)
+        git(intake, *arguments)
+
+
 def init_forge(root: Path, source: Path, branch: str, database: str | None = None) -> None:
     if run("git", "check-ref-format", "--branch", branch, check=False).returncode:
         raise ForgeError(f"invalid branch name: {branch}")
@@ -38,6 +70,7 @@ def init_forge(root: Path, source: Path, branch: str, database: str | None = Non
         raise ForgeError(f"forge root is not empty: {root}")
     root.mkdir(parents=True, exist_ok=True)
     (root / "views").mkdir()
+    (root / "intake").mkdir()
     from store import initialize_store
 
     store = initialize_store(root, database)
@@ -114,24 +147,46 @@ def _rollback_failed_migration(root: Path) -> None:
 
 
 def install_hooks(root: Path, name: str, entrypoint: Path) -> None:
-    hooks = view_repo(root, name) / "hooks"
+    python = shlex.quote(sys.executable)
     command = shlex.quote(str(entrypoint.resolve()))
     root_arg = shlex.quote(str(root.resolve()))
     view_arg = shlex.quote(name)
+    receive_script = (
+        f"#!/bin/sh\nexec {python} {command} {{hook}} {root_arg} {view_arg}\n"
+    )
     scripts = {
-        "pre-receive": (
-            f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {command} "
-            f"pre-receive {root_arg} {view_arg}\n"
-        ),
-        "post-receive": (
-            f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {command} "
-            f"post-receive {root_arg} {view_arg}\n"
-        ),
+        view_repo(root, name): {
+            "pre-receive": REJECT_ALL_HOOK,
+        },
+        intake_repo(root, name): {
+            "pre-receive": receive_script.format(hook="pre-receive"),
+            "post-receive": receive_script.format(hook="post-receive"),
+        },
     }
-    for filename, contents in scripts.items():
-        target = hooks / filename
-        target.write_text(contents)
-        target.chmod(0o755)
+    for repo, hooks in scripts.items():
+        for filename, contents in hooks.items():
+            target = repo / "hooks" / filename
+            target.write_text(contents)
+            target.chmod(0o755)
+
+
+def initialize_intake_repo(root: Path, name: str, branch: str) -> Path:
+    """Create the fetch-isolated intake repository for one view."""
+    intake = intake_repo(root, name)
+    run("git", "init", "--bare", "-q", "-b", branch, str(intake))
+    for key, value in (
+        ("receive.denyDeletes", "true"),
+        ("receive.denyNonFastForwards", "true"),
+        ("receive.maxInputSize", str(MAX_PACK_BYTES)),
+        ("core.logAllRefUpdates", "false"),
+    ):
+        git(intake, "config", key, value)
+    info = intake / "objects" / "info"
+    info.mkdir(parents=True, exist_ok=True)
+    alternates = info / "alternates"
+    if not alternates.exists():
+        alternates.write_text(f"{(view_repo(root, name) / 'objects').resolve()}\n")
+    return intake
 
 
 def sync_view_locked(
@@ -259,6 +314,7 @@ def publish_projection_plan(root: Path, state: dict, plan: dict) -> None:
             )
     view["projected_tip"] = plan["new_tip"]
     view["canonical_frontier"] = plan["new_frontier"]
+    repair_intake_mirror(root, state, name)
 
 
 def _catalog_operation(root: Path, operation) -> None:
@@ -333,6 +389,7 @@ def add_view(
             raise ForgeError("principal has no effective readable path")
         destination = view_repo(root, name)
         existed_before = destination.exists()
+        intake_existed_before = intake_repo(root, name).exists()
         run("git", "init", "--bare", "-q", "-b", branch, str(destination))
         try:
             for key, value in (
@@ -343,6 +400,7 @@ def add_view(
                 ("uploadpack.allowTipSHA1InWant", "false"),
             ):
                 git(destination, "config", key, value)
+            initialize_intake_repo(root, name, branch)
             state["views"][name] = {
                 "principal_id": principal_id,
                 "descriptor_id": descriptor["id"],
@@ -358,6 +416,8 @@ def add_view(
         except Exception:
             if not existed_before:
                 shutil.rmtree(destination, ignore_errors=True)
+            if not intake_existed_before:
+                shutil.rmtree(intake_repo(root, name), ignore_errors=True)
             raise
         save_state(root, state)
 
@@ -529,5 +589,6 @@ def transition_principal(root: Path, principal_id: str) -> None:
                     view["projected_tip"] = commit
             view["descriptor_id"] = fresh["id"]
             view["descriptor_generation"] = generation
+            repair_intake_mirror(root, state, name)
         save_state(root, state)
         checkpoint(root, "transition.state_persisted")

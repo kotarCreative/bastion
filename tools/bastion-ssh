@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+"""Loopback SSH transport shim for the Bastion experimental forge.
+
+Emulates the exact argument shapes Git produces for ``ssh://`` remotes and
+relays them to the loopback smart-HTTP backend, so SSH-style traffic
+exercises identical server-side routing, authentication, and limits:
+
+    GIT_SSH_COMMAND="bastion-ssh --backend http://127.0.0.1:8000 --token T" \
+        git clone ssh://alice@127.0.0.1:8000/alice.git
+
+Only ``git-upload-pack`` and ``git-receive-pack`` commands with a single
+quoted absolute repository path are accepted; anything else exits 127.
+"""
+
+from __future__ import annotations
+
+import base64
+import os
+import re
+import sys
+import urllib.error
+import zlib
+import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from validation import VIEW_NAME
+
+COMMAND = re.compile(r"^(git-upload-pack|git-receive-pack) '(/[^']+)'$")
+SERVICE_ANNOUNCEMENT = re.compile(rb"^#[^\x00]*$")
+
+
+def fail(message: str, code: int = 1) -> int:
+    print(f"bastion-ssh: {message}", file=sys.stderr)
+    return code
+
+
+def parse_arguments(argv: list[str]) -> dict:
+    parsed: dict = {"port": None, "user": None, "token": None,
+                    "backend": None, "ssh_user": None}
+    arguments = list(argv)
+    while arguments:
+        head = arguments[0]
+        if head == "--":
+            arguments.pop(0)
+            break
+        if head in ("--backend", "--token", "--ssh-user", "-p", "-l"):
+            if len(arguments) < 2:
+                raise ValueError(f"missing value for {head}")
+            key = {"-p": "port", "-l": "user",
+                   "--ssh-user": "ssh_user"}.get(head, head[2:])
+            parsed[key] = arguments[1]
+            del arguments[:2]
+            continue
+        if head.startswith("-"):
+            if len(arguments) > 1:
+                arguments.pop(1)
+            arguments.pop(0)
+            continue
+        break
+    if not arguments:
+        raise ValueError("destination is required")
+    destination = arguments.pop(0)
+    user, separator, host = destination.rpartition("@")
+    if not separator:
+        host = destination
+    else:
+        parsed.setdefault("user_from_destination", None)
+        parsed["destination_user"] = user
+    if ":" in host and parsed["port"] is None:
+        host, _, port = host.rpartition(":")
+        if port.isdigit():
+            parsed["port"] = port
+    parsed["host"] = host
+    parsed["command"] = " ".join(arguments)
+    return parsed
+
+
+def resolve_target(arguments: dict) -> tuple[str, str]:
+    match = COMMAND.fullmatch(arguments["command"])
+    if not match:
+        raise PermissionError("only git-upload-pack and git-receive-pack are allowed")
+    service, raw_path = match.groups()
+    name = raw_path.lstrip("/")
+    if name.endswith(".git"):
+        name = name[:-4]
+    if not VIEW_NAME.fullmatch(name):
+        raise LookupError("repository path does not resolve to a view")
+    user = (arguments.get("ssh_user")
+            or arguments.get("destination_user")
+            or arguments.get("user"))
+    if user and user != name:
+        raise PermissionError("authenticated identity does not match the repository")
+    return service, name
+
+
+def strip_service_announcement(body: bytes) -> bytes:
+    length = int(body[:4], 16)
+    if length < 5 or not SERVICE_ANNOUNCEMENT.match(body[4:length]):
+        raise ValueError("malformed advertisement")
+    if body[length:length + 4] != b"0000":
+        raise ValueError("malformed advertisement")
+    return body[length + 4:]
+
+
+def request(backend: str, token: str, view: str, service: str,
+            advertise: bool, payload: bytes | None,
+            protocol: str | None) -> bytes:
+    headers = {
+        "Authorization": "Basic "
+        + base64.b64encode(f"bastion:{token}".encode()).decode(),
+        "User-Agent": "bastion-ssh",
+    }
+    if protocol:
+        headers["Git-Protocol"] = protocol
+    if advertise:
+        url = f"{backend}/{view}.git/info/refs?service={service}"
+        payload = None
+    else:
+        url = f"{backend}/{view}.git/{service}"
+        headers["Content-Type"] = f"application/x-{service}-request"
+    request_object = urllib.request.Request(url, data=payload, headers=headers)
+    try:
+        with urllib.request.urlopen(request_object) as response:
+            return response.read()
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode(errors="replace").strip()
+        raise RuntimeError(detail or error.reason) from error
+
+
+def command_blocks(stream, chunk: int = 65536):
+    """Yield protocol-v2 request blocks: pkt-lines up to each flush-pkt.
+
+    Delim-pkts (0001) are ordinary framing inside a request; only the
+    flush-pkt (0000) terminates one.
+    """
+    buf = bytearray()
+    pos = 0
+    eof = False
+
+    def pull(need: int) -> bool:
+        """Ensure at least ``need`` buffered bytes past ``pos``."""
+        nonlocal eof, pos
+        while not eof and len(buf) - pos < need:
+            try:
+                piece = os.read(stream.fileno(), max(chunk, need))
+            except (OSError, ValueError):
+                piece = b""
+            if not piece:
+                eof = True
+                break
+            buf.extend(piece)
+        return len(buf) - pos >= need
+
+    while True:
+        if not pull(4):
+            if pos < len(buf):
+                yield bytes(buf[pos:])
+            return
+        head = bytes(buf[pos:pos + 4])
+        if head == b"0000":
+            block = bytes(buf[:pos + 4])
+            del buf[:pos + 4]
+            pos = 0
+            yield block
+            continue
+        if head == b"0001":
+            pos += 4
+            continue
+        try:
+            length = int(head, 16)
+        except ValueError:
+            raise ValueError("malformed pkt-line framing from client")
+        if not pull(length):
+            yield bytes(buf[pos:])
+            return
+        pos += length
+
+
+class _PackFramer:
+    """Accumulates a receive-pack request body and detects its natural end.
+
+    Body shape: pkt-line ref commands ending at a flush-pkt, then one pack
+    stream: a 12-byte header announcing an object count, self-delimiting
+    zlib-compressed entries, and a 20-byte trailing checksum.  Bytes are
+    only ever consumed once a full field is buffered, so any chunking of
+    the input produces identical results.
+    """
+
+    def __init__(self) -> None:
+        self.buffer = bytearray()
+        self.stage = "commands"
+        self.objects_remaining = 0
+
+        self.entry_size = 0
+        self.entry_kind = 0
+        self.decompressor = None
+
+    def feed(self, chunk: bytes) -> bool:
+        """Absorb bytes; True once the complete request body is buffered."""
+        self.buffer += chunk
+        while True:
+            if self.stage == "commands":
+                end = self._command_flush()
+                if end < 0:
+                    return False
+                del self.buffer[:end]
+                self.stage = "pack_header"
+                continue
+            if self.stage == "pack_header":
+                if len(self.buffer) < 12:
+                    return False
+                head = bytes(self.buffer[:12])
+                if not head.startswith(b"PACK"):
+                    raise ValueError("push did not carry a pack stream")
+                if int.from_bytes(head[4:8], "big") != 2:
+                    raise ValueError("unsupported pack version")
+                self.objects_remaining = int.from_bytes(head[8:12], "big")
+                del self.buffer[:12]
+                self.stage = "header"
+                continue
+            if self.stage == "trailer":
+                return len(self.buffer) >= 20
+            if self.objects_remaining == 0:
+                self.stage = "trailer"
+                continue
+            if self.stage == "header":
+                if not self._entry_header():
+                    return False
+                continue
+            if self.stage == "ofs_delta":
+                if len(self.buffer) < 1:
+                    return False
+                while self.buffer and self.buffer[0] & 0x80:
+                    del self.buffer[0]
+                if not self.buffer:
+                    return False
+                del self.buffer[0]
+                self.decompressor = zlib.decompressobj()
+                self.stage = "payload"
+                continue
+            if self.stage == "ref_delta":
+                if len(self.buffer) < 20:
+                    return False
+                del self.buffer[:20]
+                self.decompressor = zlib.decompressobj()
+                self.stage = "payload"
+                continue
+            if not self._consume_payload():
+                return False
+
+    def _command_flush(self) -> int:
+        offset = 0
+        while offset + 4 <= len(self.buffer):
+            segment = bytes(self.buffer[offset:offset + 4])
+            if segment == b"0000":
+                return offset + 4
+            try:
+                length = int(segment, 16)
+            except ValueError:
+                raise ValueError("malformed ref update commands")
+            if length < 4 or offset + length > len(self.buffer):
+                return -1
+            offset += length
+        return -1
+
+    def _entry_header(self) -> bool:
+        """Parse one entry type/size varint; consumes nothing when hungry."""
+        index = 0
+        if not self.buffer:
+            return False
+        byte = self.buffer[0]
+        kind = (byte >> 4) & 0x07
+        size = byte & 0x0F
+        shift = 4
+        while byte & 0x80:
+            index += 1
+            if index >= len(self.buffer):
+                return False
+            byte = self.buffer[index]
+            size |= (byte & 0x7F) << shift
+            shift += 7
+        del self.buffer[:index + 1]
+        self.entry_kind = kind
+        self.entry_size = size
+        if kind in (0, 5):
+            raise ValueError("unsupported pack entry type")
+        if kind == 6:
+            self.stage = "ofs_delta"
+        elif kind == 7:
+            self.stage = "ref_delta"
+        else:
+            self.decompressor = zlib.decompressobj()
+            self.stage = "payload"
+        return True
+
+    def _consume_payload(self) -> bool:
+        data = bytes(self.buffer)
+        if not data:
+            return False
+        out = self.decompressor.decompress(data)
+        leftover = self.decompressor.unused_data
+        consumed = len(data) - len(leftover)
+        del self.buffer[:consumed]
+        self.entry_size -= len(out)
+        if self.decompressor.eof:
+            # Buffer already sits exactly at the end of the compressed
+            # stream; leftover bytes belong to the next entry.
+            self.decompressor = None
+            self.objects_remaining -= 1
+            self.stage = "header"
+            return True
+        if self.entry_size < 0:
+            raise ValueError("pack entry expanded beyond its declared size")
+        return False
+
+
+def relay_receive_pack(backend, token, view, service, protocol):
+    """Single-shot push relay that terminates on pack completion."""
+    framer = _PackFramer()
+    body = bytearray()
+    fileno = sys.stdin.fileno()
+    while True:
+        try:
+            chunk = os.read(fileno, 65536)
+        except (OSError, ValueError):
+            chunk = b""
+        if chunk:
+            body += chunk
+            if framer.feed(chunk):
+                break
+        else:
+            framer.feed(b"")
+            break
+    result = request(
+        backend, token, view, service, False, bytes(body), protocol
+    )
+    sys.stdout.buffer.write(result)
+    sys.stdout.buffer.flush()
+    return 0
+
+
+def relay_upload_pack(backend, token, view, service, protocol):
+    """Sequential request->response relay for stateless protocol v2."""
+    out = sys.stdout.buffer
+    for block in command_blocks(sys.stdin.buffer):
+        result = request(backend, token, view, service, False, block, protocol)
+        out.write(result)
+        out.flush()
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    try:
+        arguments = parse_arguments(argv)
+        service, view = resolve_target(arguments)
+    except (ValueError, PermissionError, LookupError) as error:
+        return fail(str(error), 127)
+    backend = arguments["backend"] or os.environ.get("BASTION_SSH_BACKEND")
+    token = arguments["token"] or os.environ.get("BASTION_SSH_TOKEN")
+    if not backend or not token:
+        return fail("backend and token are required")
+    protocol = os.environ.get("GIT_PROTOCOL")
+    try:
+        if service.endswith("upload-pack"):
+            advertisement = request(
+                backend, token, view, service, True, None, protocol
+            )
+            sys.stdout.buffer.write(strip_service_announcement(advertisement))
+            sys.stdout.buffer.flush()
+            return relay_upload_pack(backend, token, view, service, protocol)
+        return relay_receive_pack(backend, token, view, service, protocol)
+    except (RuntimeError, OSError, ValueError) as error:
+        return fail(str(error))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

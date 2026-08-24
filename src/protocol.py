@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import identity
@@ -14,14 +16,16 @@ from failpoints import checkpoint
 from git import (
     clean_env,
     commit_metadata,
-    copy_submitted_closure,
+    copy_object,
     git,
+    output,
+    quarantine_objects,
     ref,
     submitted_commits,
     tree_oid,
     verify_no_extra_objects,
 )
-from layout import canonical_repo, view_repo
+from layout import ZERO_OID, canonical_repo, intake_repo, view_repo
 from projection import visible_advance
 from reconciliation import reconcile_commits
 from state import (
@@ -32,6 +36,32 @@ from state import (
     write_receiver_marker,
 )
 from validation import parse_updates, validate_ref_update
+
+
+MAX_PUSH_COMMITS = int(os.environ.get("BASTION_MAX_PUSH_COMMITS", "4096"))
+MAX_PUSH_OBJECTS = int(os.environ.get("BASTION_MAX_PUSH_OBJECTS", "100000"))
+MAX_OBJECT_BYTES = int(os.environ.get("BASTION_MAX_OBJECT_BYTES", str(64 << 20)))
+
+
+@dataclass(frozen=True)
+class ReceiveContext:
+    transport: str
+    principal_id: str | None
+    remote_addr: str | None
+
+
+def receive_context(name: str) -> ReceiveContext:
+    """Trusted wrapper context; clients cannot influence these keys."""
+    declared = os.environ.get("BASTION_VIEW")
+    if declared and declared != name:
+        raise ForgeError(
+            "receive context does not match the target repository", "integrity"
+        )
+    return ReceiveContext(
+        os.environ.get("BASTION_TRANSPORT") or "local",
+        os.environ.get("BASTION_PRINCIPAL_ID") or None,
+        os.environ.get("BASTION_REMOTE_ADDR") or None,
+    )
 
 
 def transaction_id(name: str, old: str, new: str) -> str:
@@ -54,6 +84,42 @@ def promote_objects(source: Path, canonical: Path) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
         if not target.exists():
             os.link(object_path, target)
+
+
+def enforce_pack_limits(repo: Path, old: str, new: str, env: dict[str, str]) -> None:
+    """Reject abusive packs before any validation work begins."""
+    count = output(repo, "rev-list", "--count", f"{old}..{new}", env=env)
+    try:
+        if int(count) > MAX_PUSH_COMMITS:
+            raise ForgeError("push exceeds the commit depth limit", "limits")
+    except ValueError as error:
+        raise ForgeError("push depth could not be measured", "limits") from error
+    quarantined = sorted(quarantine_objects(env))
+    if len(quarantined) > MAX_PUSH_OBJECTS:
+        raise ForgeError("push exceeds the object count limit", "limits")
+    if quarantined:
+        query = ("".join(f"{oid}\n" for oid in quarantined)).encode()
+        listing = git(
+            repo,
+            "cat-file",
+            "--batch-check=%(objectname) %(objecttype) %(objectsize)",
+            data=query,
+            env=env,
+            check=False,
+        ).stdout
+        seen = 0
+        for line in listing.splitlines():
+            fields = line.split()
+            if len(fields) == 3 and fields[1] in {b"blob", b"tree", b"commit", b"tag"}:
+                seen += 1
+                if int(fields[2]) > MAX_OBJECT_BYTES:
+                    raise ForgeError(
+                        "push contains an oversized object", "limits"
+                    )
+        if seen != len(quarantined):
+            raise ForgeError(
+                "quarantined objects could not be inspected", "integrity"
+            )
 
 
 def validate_commit_metadata(
@@ -82,9 +148,10 @@ def prepare_submission(
     hook_env: dict[str, str],
     state: dict | None = None,
 ) -> tuple[str, str, list[dict[str, str | None]], Path]:
-    destination = view_repo(root, name)
+    destination = intake_repo(root, name)
     canonical = canonical_repo(root)
     commits = submitted_commits(destination, old, new, hook_env)
+    enforce_pack_limits(destination, old, new, hook_env)
     verify_no_extra_objects(destination, new, hook_env)
     if state is not None:
         validate_commit_metadata(
@@ -124,15 +191,76 @@ def prepare_submission(
             hook_env,
             candidate_env,
         )
-        copy_submitted_closure(destination, old, new, hook_env)
     except Exception:
         shutil.rmtree(transaction_objects, ignore_errors=True)
         raise
     return canonical_old, canonical_new, mappings, transaction_objects
 
 
+def copy_intake_closure(
+    root: Path, name: str, old: str, new: str, env: dict[str, str]
+) -> None:
+    """Materialize submitted objects into the view store before ref publication."""
+    intake = intake_repo(root, name)
+    destination = view_repo(root, name)
+    object_ids = output(
+        intake, "rev-list", "--objects", "--no-object-names", new, f"^{old}", env=env
+    ).splitlines()
+    for oid in object_ids:
+        copy_object(intake, destination, oid, source_env=env)
+
+
+def publish_source_publication(
+    root: Path, state: dict, name: str, view: dict, old: str, new: str
+) -> None:
+    """Copy the submitted closure into the view and move its ref by CAS.
+
+    Receive-pack used to move this ref implicitly when views were push
+    targets; the intake boundary performs the equivalent step explicitly
+    so crash windows and retries keep their established recovery shape.
+    """
+    if new == ZERO_OID or old == ZERO_OID:
+        raise ForgeError("source publication requires a linear branch update")
+    hook_env = os.environ.copy()
+    copy_intake_closure(root, name, old, new, hook_env)
+    destination = view_repo(root, name)
+    actual = ref(destination, view["projected_ref"])
+    if actual == new:
+        return
+    if actual != old:
+        raise ForgeError("projected ref changed outside synchronization")
+    git(destination, "update-ref", view["projected_ref"], new, old)
+
+
+def hook_pre_receive(root: Path, name: str, updates: bytes) -> int:
+    """CLI hook entry: rejections become a stable category plus the
+    client-safe message, and are recorded in the audit log."""
+    try:
+        pre_receive(root, name, updates)
+    except ForgeError as error:
+        category = error.category or "policy"
+        transport = os.environ.get("BASTION_TRANSPORT") or "local"
+        remote = os.environ.get("BASTION_REMOTE_ADDR") or "-"
+        try:
+            from state import audit_event
+
+            audit_event(
+                root,
+                "receive.reject",
+                f"{name}/-",
+                f"{transport} {remote} {category}",
+            )
+        except Exception:
+            pass
+        print(f"bastion: push rejected [{category}]", file=sys.stderr)
+        print(f"bastion: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def pre_receive(root: Path, name: str, updates: bytes) -> None:
     parsed = parse_updates(updates)
+    context = receive_context(name)
     idempotency_key = os.environ.get("BASTION_IDEMPOTENCY_KEY")
     with locked(root) as state:
         view = state["views"].get(name)
@@ -140,7 +268,16 @@ def pre_receive(root: Path, name: str, updates: bytes) -> None:
             raise ForgeError("exactly one authorized branch may be updated")
         descriptor = identity.descriptor_for_view(state, name)
         from outbox import view_has_unfinished_jobs
+        from service import repair_intake_mirror
         from state import has_unconfirmed_source, source_publication_pending
+
+        # The intake advertisement must match the authoritative tip unless a
+        # crashed receive is still being retried; in that window the mirror
+        # deliberately stays at the old value so the retry CAS succeeds.
+        if not source_publication_pending(root, state, name) and not (
+            has_unconfirmed_source(state)
+        ):
+            repair_intake_mirror(root, state, name)
 
         # Idempotent replay is decided before ref validation so a retried
         # push whose outcome was already recorded returns that outcome
@@ -159,6 +296,29 @@ def pre_receive(root: Path, name: str, updates: bytes) -> None:
                     raise ForgeError(
                         "idempotency key was already used for a different request"
                     )
+                transaction = state["transactions"].get(
+                    recorded.get("outcome", {}).get("transaction_id", "")
+                )
+                if transaction and transaction["status"] in {
+                    "canonical_committed",
+                    "fanout_pending",
+                    "published",
+                }:
+                    from state import is_ancestor
+
+                    destination = view_repo(root, name)
+                    actual = ref(destination, view["projected_ref"])
+                    if actual != fingerprint["new"] and not is_ancestor(
+                        destination, fingerprint["new"], actual
+                    ):
+                        publish_source_publication(
+                            root,
+                            state,
+                            name,
+                            view,
+                            fingerprint["old"],
+                            fingerprint["new"],
+                        )
                 return
 
         old, new, _updated_ref = validate_ref_update(view, parsed)
@@ -173,6 +333,7 @@ def pre_receive(root: Path, name: str, updates: bytes) -> None:
             write_receiver_marker(root, retry_id, os.getppid())
             retry.pop("source_error", None)
             save_state(root, state)
+            publish_source_publication(root, state, name, view, old, new)
             return
         if source_publication_pending(root, state, name):
             raise ForgeError("view has an active receive transaction")
@@ -252,17 +413,31 @@ def pre_receive(root: Path, name: str, updates: bytes) -> None:
         enqueue_canonical_committed(state, transaction)
         save_state(root, state)
         checkpoint(root, "source.canonical_state_persisted")
+        from state import audit_event
+
+        audit_event(
+            root,
+            "receive.accept",
+            f"{name}/{view['principal_id']}",
+            f"{context.transport} {context.remote_addr or '-'}"
+            f" {old}..{new} tx={txid}",
+        )
+        publish_source_publication(root, state, name, view, old, new)
+        checkpoint(root, "source.source_ref_published")
 
 
 def post_receive(root: Path, name: str, updates: bytes) -> None:
     checkpoint(root, "source.ref_published")
     parsed = parse_updates(updates)
     with locked(root) as state:
+        from service import repair_intake_mirror
+
         for old, new, updated_ref in parsed:
             txid = transaction_id(name, old, new)
             transaction = state["transactions"].get(txid)
             if transaction and transaction["projected_ref"] == updated_ref:
                 (root / "receivers" / txid).unlink(missing_ok=True)
+        repair_intake_mirror(root, state, name)
         save_state(root, state)
         checkpoint(root, "source.receiver_cleanup_persisted")
     checkpoint(root, "source.confirmation_persisted")

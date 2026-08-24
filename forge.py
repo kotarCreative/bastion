@@ -15,7 +15,7 @@ from errors import ForgeError
 from invariants import check_invariants
 from git import git, output, ref, run
 from layout import ZERO_OID, canonical_repo, view_repo
-from protocol import post_receive, pre_receive
+from protocol import hook_pre_receive, post_receive, pre_receive
 from service import (
     add_principal as _add_principal,
     add_role as _add_role,
@@ -202,7 +202,9 @@ def main() -> int:
         elif args.command == "transition-principal":
             transition_principal(args.root, args.principal)
         elif args.command == "pre-receive":
-            pre_receive(args.root, args.name, sys.stdin.buffer.read())
+            raise SystemExit(
+                hook_pre_receive(args.root, args.name, sys.stdin.buffer.read())
+            )
         elif args.command == "post-receive":
             post_receive(args.root, args.name, sys.stdin.buffer.read())
         elif args.command == "add-token":
