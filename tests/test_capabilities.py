@@ -18,13 +18,13 @@ from service import (
     transition_principal,
 )
 from tests.identity_harness import (
-    ENTRYPOINT,
+    attach_admin_push,
     capability_grants,
     provision_admin,
     update_canonical,
 )
 from service import add_view as service_add_view
-from tests.storage_helpers import document_bytes, read_document
+from tests.storage_helpers import repository_state, wal_records
 from tests.transport import attach_intake_push
 
 
@@ -83,7 +83,7 @@ class CapabilityFixture:
         allow["create"] = ["shared"]
         add_role(self.forge, "developer", allow, EMPTY_DENY)
         bind_role(self.forge, "developer", "principal", "alice")
-        service_add_view(self.forge, "alice", "alice", "main", ENTRYPOINT)
+        service_add_view(self.forge, "alice", "alice", "main")
 
         self.client = root / "client"
         command("git", "clone", "-q", "--no-local", str(forge.view_repo(self.forge, "alice")), str(self.client))
@@ -92,7 +92,19 @@ class CapabilityFixture:
         git(self.client, "config", "user.email", "alice@example.test")
 
     def state(self) -> dict:
-        return read_document(self.forge)
+        manifest, replay = repository_state(self.forge)
+        return {
+            "views": {
+                name: {
+                    **view,
+                    "canonical_ref": manifest.canonical_ref,
+                    "projected_tip": forge.ref(
+                        forge.view_repo(self.forge, name), view["projected_ref"]
+                    ),
+                }
+                for name, view in replay.active_views.items()
+            }
+        }
 
     def push(self, change_id: str, timestamp: int = 1_700_100_000) -> subprocess.CompletedProcess[str]:
         commit(self.client, f"change\n\nChange-Id: {change_id}", timestamp)
@@ -203,28 +215,25 @@ class DenyRuleTest(unittest.TestCase):
         self.assertNotEqual(0, rejected.returncode)
         self.assertIn("outside current authorization", rejected.stderr)
 
-    def test_previously_projected_history_is_non_revocable(self) -> None:
+    def test_policy_transition_isolates_previously_projected_history(self) -> None:
+        old_tip = forge.ref(
+            forge.view_repo(self.fixture.forge, "alice"), "refs/heads/main"
+        )
         transition_principal(self.fixture.forge, "alice")
-        forge.drain_projection_jobs(self.fixture.forge)
         repo = forge.view_repo(self.fixture.forge, "alice")
-        history = forge.output(repo, "rev-list", "refs/heads/main")
-        self.assertTrue(history.strip())
-        objects = forge.output(
-            repo, "rev-list", "--objects", "--no-object-names", "refs/heads/main"
-        ).split()
-        self.assertTrue(objects)
-        # The adjustment commit rewrote nothing: old commits are still present
-        # and reachable as ancestors of the new projected tip.
         result = forge.run(
             "git",
             "--git-dir",
             str(repo),
             "cat-file",
             "-e",
-            f"{history.splitlines()[0]}^{{commit}}",
+            f"{old_tip}^{{commit}}",
             check=False,
         )
-        self.assertEqual(0, result.returncode)
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual(
+            1, len(forge.output(repo, "rev-list", "refs/heads/main").splitlines())
+        )
 
 
 class TransitionTest(unittest.TestCase):
@@ -241,12 +250,16 @@ class TransitionTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def test_expansion_appends_an_adjustment_commit(self) -> None:
+    def test_expansion_starts_a_parentless_projection_epoch(self) -> None:
         state = self.fixture.state()
         view = state["views"]["alice"]
         old_tip = view["projected_tip"]
         old_generation = view["descriptor_generation"]
-        old_anchor = view["anchors"][old_tip]
+        old_epoch = view["projection_epoch"]
+        old_listing = command(
+            "git", "--git-dir", str(forge.view_repo(self.fixture.forge, "alice")),
+            "ls-tree", "-r", "--name-only", old_tip,
+        ).stdout.splitlines()
 
         transition_principal(self.fixture.forge, "alice")
 
@@ -254,13 +267,16 @@ class TransitionTest(unittest.TestCase):
         view = state["views"]["alice"]
         self.assertNotEqual(old_tip, view["descriptor_id"] and view["projected_tip"])
         self.assertEqual(old_generation + 1, view["descriptor_generation"])
-        adjustment = view["anchors"].get(view["projected_tip"])
-        self.assertIsNotNone(adjustment)
-        self.assertEqual("synthetic", adjustment["kind"])
-        self.assertIsNone(adjustment["change_id"])
-        self.assertEqual(old_anchor["canonical"], adjustment["canonical"])
-        self.assertEqual(view["descriptor_id"], adjustment["descriptor_id"])
-        self.assertEqual(view["descriptor_generation"], adjustment["descriptor_generation"])
+        self.assertEqual(old_epoch + 1, view["projection_epoch"])
+        repo = forge.view_repo(self.fixture.forge, "alice")
+        commit_line = forge.output(
+            repo, "rev-list", "--parents", "-n", "1", view["projected_tip"]
+        ).split()
+        self.assertEqual([view["projected_tip"]], commit_line)
+        self.assertNotEqual(
+            0,
+            forge.git(repo, "cat-file", "-e", old_tip, check=False).returncode,
+        )
 
         listing = command(
             "git",
@@ -271,15 +287,7 @@ class TransitionTest(unittest.TestCase):
             "--name-only",
             view["projected_tip"],
         ).stdout.splitlines()
-        self.assertNotIn("team-b/base.txt", command(
-            "git",
-            "--git-dir",
-            str(forge.view_repo(self.fixture.forge, "alice")),
-            "ls-tree",
-            "-r",
-            "--name-only",
-            old_tip,
-        ).stdout.splitlines())
+        self.assertNotIn("team-b/base.txt", old_listing)
         self.assertIn("team-b/base.txt", listing)
 
         from invariants import check_invariants
@@ -288,9 +296,9 @@ class TransitionTest(unittest.TestCase):
 
     def test_second_transition_without_changes_is_a_silent_noop(self) -> None:
         transition_principal(self.fixture.forge, "alice")
-        before = document_bytes(self.fixture.forge)
+        before = repository_state(self.fixture.forge)[0].head_seq
         transition_principal(self.fixture.forge, "alice")
-        self.assertEqual(before, document_bytes(self.fixture.forge))
+        self.assertEqual(before, repository_state(self.fixture.forge)[0].head_seq)
 
     def test_unknown_or_viewless_principals_are_rejected(self) -> None:
         with self.assertRaisesRegex(ForgeError, "unknown principal"):
@@ -299,9 +307,10 @@ class TransitionTest(unittest.TestCase):
         with self.assertRaisesRegex(ForgeError, "no views"):
             transition_principal(self.fixture.forge, "lonely")
 
-    def test_unfinished_work_blocks_transitions_until_quiescent(self) -> None:
+    def test_transition_orders_after_unmaterialized_canonical_work(self) -> None:
         admin_checkout = self.fixture.root / "admin"
         command("git", "clone", "-q", str(forge.canonical_repo(self.fixture.forge)), str(admin_checkout))
+        attach_admin_push(self.fixture.forge, admin_checkout)
         git(admin_checkout, "config", "user.name", "Admin")
         git(admin_checkout, "config", "user.email", "admin@example.test")
         (admin_checkout / "late.txt").write_text("late\n")
@@ -309,10 +318,10 @@ class TransitionTest(unittest.TestCase):
         old = git(admin_checkout, "rev-parse", "HEAD~1").stdout.strip()
         command("git", "push", "-q", "origin", f"{new}:refs/staging/transition-late", cwd=admin_checkout)
         update_canonical(self.fixture.forge, old, new)
-        with self.assertRaisesRegex(ForgeError, "quiescence"):
-            transition_principal(self.fixture.forge, "alice")
-        forge.drain_projection_jobs(self.fixture.forge)
         transition_principal(self.fixture.forge, "alice")
+        _manifest, replay = repository_state(self.fixture.forge)
+        self.assertEqual("policy_transition", replay.records[-1]["kind"])
+        self.assertEqual(new, replay.active_views["alice"]["canonical_frontier"])
 
 
 class AdminCapabilityTest(unittest.TestCase):
@@ -337,6 +346,7 @@ class AdminCapabilityTest(unittest.TestCase):
         bind_role(self.forge, "team-a-admin", "principal", "scoped-admin")
         self.checkout = self.root / "admin"
         command("git", "clone", "-q", str(forge.canonical_repo(self.forge)), str(self.checkout))
+        attach_admin_push(self.forge, self.checkout)
         git(self.checkout, "config", "user.name", "Admin")
         git(self.checkout, "config", "user.email", "admin@example.test")
 
@@ -363,20 +373,16 @@ class AdminCapabilityTest(unittest.TestCase):
         old, new = self._stage("shared/escalation.txt", "denied\n")
         with self.assertRaisesRegex(ForgeError, "lacks admin coverage"):
             update_canonical(self.forge, old, new, "scoped-admin")
-        canonical = forge.canonical_repo(self.forge)
-        self.assertEqual(old, forge.ref(canonical, "refs/heads/main"))
-        state = read_document(self.forge)
-        self.assertEqual({}, state["transactions"])
+        manifest, replay = repository_state(self.forge)
+        self.assertEqual(old, manifest.canonical_tip)
+        self.assertFalse(any(record["kind"] == "canonical_update" for record in replay.records))
 
     def test_update_within_coverage_is_recorded_with_the_actor(self) -> None:
         old, new = self._stage("team-a/approved.txt", "allowed\n")
         update_canonical(self.forge, old, new, "scoped-admin")
-        forge.drain_projection_jobs(self.forge)
-        state = read_document(self.forge)
-        transaction = next(iter(state["transactions"].values()))
-        self.assertEqual("canonical_update", transaction["kind"])
+        transaction = wal_records(self.forge, "canonical_update")[-1]["payload"]
         self.assertEqual("scoped-admin", transaction["principal_id"])
-        self.assertEqual(new, forge.ref(forge.canonical_repo(self.forge), "refs/heads/main"))
+        self.assertEqual(new, repository_state(self.forge)[0].canonical_tip)
 
 
 if __name__ == "__main__":

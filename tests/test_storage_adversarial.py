@@ -44,7 +44,7 @@ WORKER_SCRIPT = textwrap.dedent(
     key = f"counter-{{scope}}"
 
     for index in range(iterations):
-        with locked(root, scopes=(scope,)) as state:
+        with locked(root, recoverer=lambda _root, _state: None, scopes=(scope,)) as state:
             counters = state.setdefault("changes", {{}})
             counters[key] = {{"value": counters.get(key, {{}}).get("value", 0) + 1}}
             save_state(root, state)
@@ -67,10 +67,12 @@ class AdversarialStorageBase(unittest.TestCase):
             self.root,
             {
                 "canonical_branch": "main",
+                "repository_state": "ready",
+                "repository_id": "a" * 32,
+                "last_indexed_seq": 0,
                 "views": {},
                 "transactions": {},
                 "changes": {},
-                "outbox": {},
                 "projection_jobs": {},
                 "principals": {},
                 "teams": {},
@@ -171,7 +173,7 @@ class LeaseIntegrityTest(AdversarialStorageBase):
         store = open_store(self.root)
         owner = f"{uuid_hex()}:{os.getpid()}:{_start_time()}"
         store.acquire_leases(["global"], owner)
-        baseline = {"canonical_branch": "main"}
+        baseline = store.load_document()
         store.save_document(baseline, [("global", owner)], None)
 
         thief = f"{uuid_hex()}:{os.getpid()}:{_start_time()}"
@@ -183,7 +185,8 @@ class LeaseIntegrityTest(AdversarialStorageBase):
         finally:
             connection.close()
 
-        tampered = {"canonical_branch": "main", "views": {"hijack": {"x": 1}}}
+        tampered = json.loads(json.dumps(baseline))
+        tampered["views"] = {"hijack": {"x": 1}}
         with self.assertRaises(ForgeError):
             store.save_document(tampered, [("global", owner)], None)
 
@@ -192,53 +195,17 @@ class LeaseIntegrityTest(AdversarialStorageBase):
         reloaded = load_state(self.root)
         self.assertNotIn("hijack", reloaded["views"])
 
-    def test_concurrent_idempotency_insert_is_single_record(self) -> None:
-        """Racing recorders of one key converge to one stored fingerprint."""
-        script = textwrap.dedent(
-            """
-            import sys
-            from pathlib import Path
-            sys.path.insert(0, {src!r})
-            from store import open_store
-            root = Path(sys.argv[1])
-            store = open_store(root)
-            try:
-                store.record_idempotency("race-key", {{"n": 1}}, {{"ok": True}})
-                print("recorded")
-            except Exception as error:
-                print(f"error: {{error}}")
-            store.close()
-            """
-        ).format(src=str(Path(__file__).resolve().parent.parent / "src"))
-        processes = [
-            subprocess.Popen(
-                [sys.executable, "-c", script, str(self.root)],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            for _ in range(8)
-        ]
-        results = []
-        for process in processes:
-            output, error = process.communicate(timeout=60)
-            self.assertEqual(0, process.returncode, error.decode())
-            results.append(output.decode().strip())
-        self.assertEqual(8, len(results))
-        store = open_store(self.root)
-        record = store.lookup_idempotency("race-key")
-        store.close()
-        self.assertEqual({"n": 1}, record["fingerprint"])
-
-
 class TamperTest(AdversarialStorageBase):
     def _seed(self) -> None:
         store = open_store(self.root)
         document = {
             "canonical_branch": "main",
+            "repository_state": "ready",
+            "repository_id": "a" * 32,
+            "last_indexed_seq": 0,
             "views": {"alice": {"tip": "0" * 40}},
             "transactions": {"t1": {"status": "published"}},
             "changes": {},
-            "outbox": {},
             "projection_jobs": {},
             "principals": {},
             "teams": {},
@@ -286,7 +253,7 @@ class TamperTest(AdversarialStorageBase):
     def test_forged_schema_version_blocks_bootstrap(self) -> None:
         self._seed()
         self._tamper(
-            "UPDATE schema_migrations SET version = ?", (STORAGE_SCHEMA_VERSION + 7,)
+            "UPDATE storage_schema SET version = ?", (STORAGE_SCHEMA_VERSION + 7,)
         )
         store = open_store(self.root)
         with self.assertRaises(ForgeError):
@@ -315,8 +282,11 @@ class HostileDataTest(AdversarialStorageBase):
             store = open_store(root)
             document = {{
                 "canonical_branch": "main",
+                "repository_state": "ready",
+                "repository_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "last_indexed_seq": 0,
                 "views": payload,
-                "changes": {{}}, "transactions": {{}}, "outbox": {{}},
+                "changes": {{}}, "transactions": {{}},
                 "projection_jobs": {{}}, "principals": {{}}, "teams": {{}},
                 "roles": {{}}, "role_bindings": {{}}, "view_descriptors": {{}},
             }}
@@ -364,91 +334,37 @@ class HostileDataTest(AdversarialStorageBase):
         self.assertEqual(hostile, reloaded)
 
 
-class BrokenViewIsolationTest(AdversarialStorageBase):
+class BrokenViewIsolationTest(unittest.TestCase):
     def test_dead_view_does_not_block_sibling_progress(self) -> None:
-        """A job stuck dead-lettering on a ghost view cannot starve alice."""
-        from outbox import MAX_JOB_ATTEMPTS
-        from worker import run_projection_job
+        """A dead hint for one view cannot block another view's materialization."""
+        import forge
+        from state import save_state
+        from tests.tree_harness import TreeFixture
 
-        import git as forge_git
+        fixture = TreeFixture()
+        self.addCleanup(fixture.close)
+        state = load_state(fixture.root)
+        state["projection_jobs"] = {
+            "project:alice": {
+                "view": "alice",
+                "target_seq": 999,
+                "status": "dead",
+                "attempts": 8,
+                "next_attempt_at": None,
+                "last_error": "broken",
+                "lease_token": None,
+                "lease_expires_at": None,
+            }
+        }
+        save_state(fixture.root, state)
 
-        (self.root / "views").mkdir(exist_ok=True)
-        subprocess.run(
-            ["git", "init", "--bare", "-q", str(self.root / "views" / "ghost.git")],
-            check=True,
-        )
-        subprocess.run(
-            ["git", "init", "--bare", "-q", "-b", "main", str(self.root / "views" / "alice.git")],
-            check=True,
-        )
-        store = open_store(self.root)
-        document = {
-            "canonical_branch": "main",
-            "views": {
-                "alice": {
-                    "principal_id": "alice",
-                    "descriptor_id": "vdesc-1",
-                    "descriptor_generation": 1,
-                    "canonical_ref": "refs/heads/main",
-                    "projected_ref": "refs/heads/main",
-                    "canonical_frontier": "0" * 40,
-                    "projected_tip": "0" * 40,
-                    "anchors": {},
-                }
-            },
-            "view_descriptors": {},
-            "transactions": {},
-            "changes": {},
-            "outbox": {},
-            "projection_jobs": {},
-            "principals": {},
-            "teams": {},
-            "roles": {},
-            "role_bindings": {},
-        }
-        # Ghost transaction blocks ordering for ghost only.
-        document["transactions"]["t-ghost"] = {
-            "id": "t-ghost",
-            "status": "fanout_pending",
-            "pending_views": [],
-            "view_errors": {},
-        }
-        document["projection_jobs"]["project:t-ghost:ghost"] = {
-            "id": "project:t-ghost:ghost",
-            "event_id": "e-ghost",
-            "transaction_id": "t-ghost",
-            "view": "ghost",
-            "descriptor_id": "vdesc-1",
-            "descriptor_generation": 1,
-            "sequence": 1,
-            "canonical_to": "0" * 40,
-            "status": "pending",
-            "attempts": 0,
-            "last_error": None,
-            "next_attempt_at": 0,
-        }
-        store.save_document(document, [], None)
+        forge.view_repo(fixture.root, "bob").unlink()
+        forge.sync_view(fixture.root, "bob")
 
-        # Drive the broken view's job to dead while asserting that the
-        # worker loop keeps making progress decisions each round.
-        now = 1_700_000_000.0
-        rounds = 0
-        while True:
-            progressed = run_projection_job(root=self.root, now=now)
-            rounds += 1
-            state = load_state(self.root)
-            ghost = state["projection_jobs"]["project:t-ghost:ghost"]
-            if ghost["status"] == "dead":
-                break
-            now += 61
-            self.assertLess(rounds, MAX_JOB_ATTEMPTS * 6, "worker loop stalled")
-        self.assertEqual(MAX_JOB_ATTEMPTS, ghost["attempts"])
-        self.assertIn(
-            "ghost", state["transactions"]["t-ghost"]["view_errors"]
+        self.assertTrue(forge.view_repo(fixture.root, "bob").is_symlink())
+        self.assertEqual(
+            "dead", load_state(fixture.root)["projection_jobs"]["project:alice"]["status"]
         )
-        # The healthy view row remains untouched and consistent.
-        self.assertIn("alice", state["views"])
-        store.close()
 
 
 def uuid_hex() -> str:

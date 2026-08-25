@@ -38,6 +38,16 @@ class Mapping:
         }
 
 
+@dataclass(frozen=True)
+class PreparedCanonicalTransition:
+    """Packable reconciliation output, before any manifest publication."""
+
+    canonical_old: str
+    canonical_new: str
+    candidate_object_dir: Path
+    mappings: list[dict[str, str | None]]
+
+
 def materialize_transition(
     canonical: Path,
     submitted: Path,
@@ -69,7 +79,8 @@ def reconcile_commits(
     descriptor: dict,
     submitted_env: dict[str, str],
     candidate_env: dict[str, str],
-) -> tuple[str, list[dict[str, str | None]]]:
+ ) -> PreparedCanonicalTransition:
+    canonical_old = canonical_parent
     mappings: list[dict[str, str | None]] = []
     for submitted_oid in commits:
         parent_entries = tree_entries(submitted, projected_parent, submitted_env)
@@ -116,4 +127,9 @@ def reconcile_commits(
         )
         canonical_parent = canonical_oid
         projected_parent = submitted_oid
-    return canonical_parent, mappings
+    return PreparedCanonicalTransition(
+        canonical_old,
+        canonical_parent,
+        Path(candidate_env["GIT_OBJECT_DIRECTORY"]),
+        mappings,
+    )

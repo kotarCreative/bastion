@@ -32,7 +32,7 @@ def reference_descriptor_id(payload: dict) -> str:
     encoded = json.dumps(
         payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode("ascii")
-    return "vdesc-" + hashlib.sha256(b"bastion-effective-view-v1\0" + encoded).hexdigest()
+    return "vdesc-" + hashlib.sha256(b"bastion-effective-view\0" + encoded).hexdigest()
 
 
 def catalog() -> dict:
@@ -427,9 +427,8 @@ class ServiceIntegrationTest(unittest.TestCase):
         service_add_role(self.forge, "blind-writer", allow,
                          {key: [] for key in identity.CAPABILITIES})
         service_bind_role(self.forge, "blind-writer", "principal", "writer")
-        entrypoint = Path(__file__).resolve().parents[1] / "forge.py"
         with self.assertRaisesRegex(ForgeError, "no effective readable path"):
-            service_add_view(self.forge, "w", "writer", "main", entrypoint)
+            service_add_view(self.forge, "w", "writer", "main")
         self.assertFalse((self.forge / "views" / "w.git").exists())
         state = read_document(self.forge)
         self.assertEqual({}, state["views"])

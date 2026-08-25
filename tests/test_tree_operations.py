@@ -8,6 +8,7 @@ from tests import identity_harness
 from errors import ForgeError
 from tests.tree_harness import TreeFixture, command, empty_subtree_commit, git, gitlink_commit, oid
 from tests.transport import attach_intake_push
+from tests.storage_helpers import repository_state, submission_record, wal_records
 
 
 class TreeOperationsTest(unittest.TestCase):
@@ -18,10 +19,11 @@ class TreeOperationsTest(unittest.TestCase):
         self.fixture.close()
 
     def _source_transaction(self, view: str, old: str, new: str) -> dict:
-        return next(
-            tx for tx in self.fixture.state()["transactions"].values()
-            if tx.get("view") == view and tx.get("projected_old") == old and tx.get("projected_new") == new
-        )
+        return submission_record(self.fixture.root, view, old, new)["payload"]
+
+    def _view_tip(self, view: str) -> str:
+        active = repository_state(self.fixture.root)[1].active_views[view]
+        return oid(forge.view_repo(self.fixture.root, view), active["projected_ref"])
 
     def _reject_source(self, view: str, effects: dict[bytes, tuple[bytes, bytes] | None], category: str) -> None:
         client = self.fixture.clients[view]
@@ -38,13 +40,13 @@ class TreeOperationsTest(unittest.TestCase):
         old, new = self.fixture.push_source("alice", {b"shared/delete.txt": None})
         transaction = self._source_transaction("alice", old, new)
         self.assertEqual(new, oid(forge.view_repo(self.fixture.root, "alice"), "refs/heads/main"))
-        self.assertEqual("submitted", self.fixture.state()["views"]["alice"]["anchors"][new]["kind"])
+        self.assertEqual(new, transaction["mappings"][-1]["submitted"])
         self.assertEqual(1, len(transaction["mappings"]))
 
-        bob_tip = self.fixture.state()["views"]["bob"]["projected_tip"]
+        bob_tip = self._view_tip("bob")
         self.fixture.push_source("alice", {b"team-a/private-delete.txt": None})
-        bob = self.fixture.state()["views"]["bob"]
-        self.assertEqual(bob_tip, bob["projected_tip"])
+        bob = repository_state(self.fixture.root)[1].active_views["bob"]
+        self.assertEqual(bob_tip, self._view_tip("bob"))
         self.assertEqual(oid(forge.canonical_repo(self.fixture.root), "refs/heads/main"), bob["canonical_frontier"])
 
         self.fixture.push_source("alice", {
@@ -69,9 +71,9 @@ class TreeOperationsTest(unittest.TestCase):
         self.assertEqual(before_down, self.fixture.canonical_model[b"shared/mode-down"][1])
         self.assertEqual(b"100755", self.fixture.canonical_model[b"shared/mode-up"][0])
         self.assertEqual(b"100644", self.fixture.canonical_model[b"shared/mode-down"][0])
-        bob_tip = self.fixture.state()["views"]["bob"]["projected_tip"]
+        bob_tip = self._view_tip("bob")
         self.fixture.push_source("alice", {b"team-a/private.txt": (b"100755", b"alice private\n")})
-        self.assertEqual(bob_tip, self.fixture.state()["views"]["bob"]["projected_tip"])
+        self.assertEqual(bob_tip, self._view_tip("bob"))
 
     def test_symlink_and_file_directory_source_lifecycle(self) -> None:
         lifecycle = (
@@ -90,9 +92,9 @@ class TreeOperationsTest(unittest.TestCase):
         self.assertEqual(link_oid, self.fixture.canonical_model[b"shared/renamed-link"][1])
         self.fixture.push_source("alice", {b"shared/renamed-link": None})
 
-        bob_tip = self.fixture.state()["views"]["bob"]["projected_tip"]
+        bob_tip = self._view_tip("bob")
         self.fixture.push_source("alice", {b"team-a/private-link": (b"120000", b"../../hidden/secret.txt")})
-        self.assertEqual(bob_tip, self.fixture.state()["views"]["bob"]["projected_tip"])
+        self.assertEqual(bob_tip, self._view_tip("bob"))
 
         self.fixture.push_source("alice", {
             b"shared/node": None,
@@ -152,12 +154,15 @@ class TreeOperationsTest(unittest.TestCase):
             {b"shared/node": None, b"shared/node/one": (b"100644", b"one\n")},
             {b"shared/node/one": None, b"shared/node": (b"100755", b"node executable\n")},
         ])
-        transaction = next(tx for tx in self.fixture.state()["transactions"].values() if tx.get("kind") == "canonical_update" and tx["canonical_new"] == commits[-1])
+        transaction = next(
+            record["payload"] for record in wal_records(self.fixture.root, "canonical_update")
+            if record["payload"]["canonical_new"] == commits[-1]
+        )
         self.assertNotIn("mappings", transaction)
         self.assertEqual(6, len(commits))
-        bob_tip = self.fixture.state()["views"]["bob"]["projected_tip"]
+        bob_tip = self._view_tip("bob")
         self.fixture.admin_update([{b"team-a/private.txt": (b"100755", b"admin private\n")}])
-        self.assertEqual(bob_tip, self.fixture.state()["views"]["bob"]["projected_tip"])
+        self.assertEqual(bob_tip, self._view_tip("bob"))
 
         canonical = forge.canonical_repo(self.fixture.root)
         expected = oid(canonical, "refs/heads/main")

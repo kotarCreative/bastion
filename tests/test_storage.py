@@ -1,4 +1,4 @@
-"""Storage backend matrix: versions, leases, checksums, idempotency, stats.
+"""Storage backend matrix: versions, leases, checksums, audit, and stats.
 
 The same core assertions run against SQLite and, when a server is reachable,
 against PostgreSQL through ``BASTION_TEST_PG``.
@@ -28,6 +28,7 @@ from store import (
     initialize_store,
     open_store,
     read_backend_record,
+    write_backend_record,
 )
 
 
@@ -37,10 +38,11 @@ PG_URI = os.environ.get("BASTION_TEST_PG", "")
 def document() -> dict:
     return {
         "canonical_branch": "main",
-        "next_transaction_sequence": 1,
+        "repository_state": "ready",
+        "repository_id": "a" * 32,
+        "last_indexed_seq": 0,
         "views": {"alice": {"projected_tip": "0" * 40}},
         "transactions": {},
-        "outbox": {},
         "projection_jobs": {},
         "changes": {},
         "principals": {},
@@ -246,26 +248,7 @@ class LeaseTest(BackendMatrix, unittest.TestCase):
                 store.close()
 
 
-class IdempotencyAndAuditTest(BackendMatrix, unittest.TestCase):
-    def test_record_lookup_and_mismatch(self) -> None:
-        for name, root in self.forges():
-            with self.subTest(name):
-                store = open_store(root)
-                fingerprint = {"view": "a", "old": "0" * 40, "new": "1" * 40}
-                outcome = {"status": "prepared", "transaction_id": "tx"}
-                store.record_idempotency("key-1", fingerprint, outcome)
-                record = store.lookup_idempotency("key-1")
-                self.assertEqual(fingerprint, record["fingerprint"])
-                self.assertEqual(outcome, record["outcome"])
-                # Same key and same fingerprint is an idempotent no-op.
-                store.record_idempotency("key-1", fingerprint, outcome)
-                with self.assertRaises(ForgeError):
-                    store.record_idempotency(
-                        "key-1", {"view": "b", "old": "0" * 40, "new": "1" * 40}, {}
-                    )
-                self.assertIsNone(store.lookup_idempotency("missing"))
-                store.close()
-
+class AuditTest(BackendMatrix, unittest.TestCase):
     def test_audit_appends_and_lists(self) -> None:
         for name, root in self.forges():
             with self.subTest(name):
@@ -382,7 +365,7 @@ def _set_schema_version(root: Path, backend: str, version: int) -> None:
         connection = sqlite3.connect(root / "store.sqlite3")
         try:
             connection.execute(
-                "UPDATE schema_migrations SET version = ?", (version,)
+                "UPDATE storage_schema SET version = ?", (version,)
             )
             connection.commit()
         finally:
@@ -391,7 +374,7 @@ def _set_schema_version(root: Path, backend: str, version: int) -> None:
     import psycopg
 
     with psycopg.connect(_pg_dsn_for(root), autocommit=True) as connection:
-        connection.execute("UPDATE schema_migrations SET version = %s", (version,))
+        connection.execute("UPDATE storage_schema SET version = %s", (version,))
 
 
 def _expire_leases(root: Path, backend: str, by: float) -> None:

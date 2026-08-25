@@ -17,10 +17,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from http_server import add_token, make_server  # noqa: E402
 from layout import intake_repo  # noqa: E402
+from repository import Repository  # noqa: E402
 
 
 def attach_intake_push(forge_root: Path, checkout: Path, view: str) -> None:
     """Point origin's push URL at the view's intake repository."""
+    _manifest, _version, replay = Repository.open(forge_root).load()
+    principal = replay.active_views[view]["principal_id"]
     subprocess.run(
         [
             "git",
@@ -31,6 +34,18 @@ def attach_intake_push(forge_root: Path, checkout: Path, view: str) -> None:
             "--push",
             "origin",
             str(intake_repo(forge_root, view)),
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(checkout),
+            "config",
+            "remote.origin.receivepack",
+            f"env BASTION_VIEW={view} BASTION_PRINCIPAL_ID={principal} "
+            "BASTION_TRANSPORT=test git-receive-pack",
         ],
         check=True,
     )

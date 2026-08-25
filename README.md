@@ -1,8 +1,9 @@
 # Bastion
 
-Bastion is an experimental permission-aware Git forge. It maintains one complete
-canonical Git repository and exposes writable Git repositories containing only
-the files each permission view may read. Users work with an unmodified Git
+Bastion is an experimental permission-aware Git forge. Repository truth is an
+immutable object-store WAL chain selected by one conditional `manifest.json`;
+local canonical and projected Git repositories are disposable caches. Users
+fetch only permission-bounded projected repositories with an unmodified Git
 client.
 
 The prototype demonstrates that this model is feasible with explicit
@@ -11,19 +12,19 @@ restrictions:
 - submitted history is linear;
 - principals (users and service accounts), immutable teams, roles, and
   bindings resolve to content-addressed effective view descriptors;
-- every authorization decision uses the descriptor captured before canonical
-  commitment, verified across events, jobs, plans, anchors, and revisions;
+- every authorization decision uses the descriptor captured in the committed
+  WAL event;
 - accepted commits retain their exact Git IDs in the submitting view;
 - other views receive synthetic commits only for changes visible to them;
 - hidden-only canonical commits do not move an unaffected projected ref;
-- every tree transition is authorized before the canonical ref moves;
-- canonical and projected publication is recoverable and idempotent;
-- secondary-view publication uses a durable outbox and ordered jobs;
+- every tree transition is authorized before immutable pack upload and manifest
+  CAS;
+- accepted pushes are one linked WAL event and retries are resolved from WAL;
+- view materialization and database indexes are rebuildable; worker jobs are
+  only freshness hints;
 - logical `Change-Id` metadata links different Git representations;
-- durable state lives in SQLite (default) or PostgreSQL as versioned,
-  checksummed document rows guarded by lease-based sessions, with idempotent
-  receives, retry schedules, dead-lettering, observability stats, backups,
-  and legacy-JSON migration.
+- durable control-plane state lives in SQLite (default) or PostgreSQL as
+  versioned, checksummed document rows guarded by lease-based sessions.
 
 This is a local architecture experiment, not a production security boundary.
 Authentication, network transports, and the wider forge surface remain
@@ -53,7 +54,8 @@ python3 -m unittest discover -v tests 'test_*.py'
 Create a local forge, one principal, and one view:
 
 ```bash
-python3 forge.py init /tmp/bastion-forge /path/to/source --branch main
+python3 forge.py init /tmp/bastion-forge /path/to/source --branch main \
+  --object-store filesystem
 python3 forge.py add-principal /tmp/bastion-forge alice --email alice@example.test
 python3 forge.py add-role /tmp/bastion-forge alice-grants \
   --allow read=shared --allow read=team-a \
@@ -90,9 +92,9 @@ git -C alice commit -m "change"
 git -C alice push origin main
 ```
 
-Receive hooks synchronously validate and reconcile the submitted pack from
-intake quarantine, then drain ready secondary-view jobs. Jobs can also be
-processed explicitly:
+Receive hooks synchronously validate and reconcile intake quarantine, upload
+immutable canonical and submission-evidence packs, and acknowledge only after
+manifest CAS. Jobs can be processed explicitly but are never correctness state:
 
 ```bash
 python3 forge.py work /tmp/bastion-forge

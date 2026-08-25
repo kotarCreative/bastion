@@ -8,9 +8,10 @@ import unittest
 from pathlib import Path
 
 import forge
+from repository import Repository
 from tests import identity_harness
 from errors import ForgeError
-from tests.storage_helpers import document_bytes, read_document
+from tests.storage_helpers import repository_state, submission_record
 from tests.transport import attach_intake_push
 
 
@@ -111,9 +112,6 @@ class CrossViewForgeTest(unittest.TestCase):
         git(checkout, "config", "user.email", f"{name}@example.test")
         return checkout
 
-    def state(self) -> dict:
-        return read_document(self.forge)
-
     def remote_tip(self, remote: Path) -> str:
         return forge.ref(remote, "refs/heads/main")
 
@@ -147,6 +145,7 @@ class CrossViewForgeTest(unittest.TestCase):
             1_710_000_200,
         )
         git(self.alice, "push", "-q", "origin", "main")
+        forge.drain_projection_jobs(self.forge)
 
         self.assertEqual(alice_shared, self.remote_tip(self.alice_remote))
         bob_after_alice = self.remote_tip(self.bob_remote)
@@ -176,23 +175,12 @@ class CrossViewForgeTest(unittest.TestCase):
             self.bob_remote, "team-a/private.txt", "hidden/secret.txt"
         )
 
-        state = self.state()
-        shared_revisions = state["changes"][shared_change]["revisions"]
-        self.assertTrue(
-            any(
-                revision["view"] == "alice"
-                and revision["projected"] == alice_shared
-                and revision["kind"] == "submitted"
-                for revision in shared_revisions
-            )
+        source_record = submission_record(
+            self.forge, "alice", alice_initial, alice_shared
         )
-        self.assertTrue(
-            any(
-                revision["view"] == "bob"
-                and revision["projected"] == bob_after_alice
-                and revision["kind"] == "synthetic"
-                for revision in shared_revisions
-            )
+        self.assertEqual(
+            [team_change, shared_change],
+            [mapping["change_id"] for mapping in source_record["payload"]["mappings"]],
         )
 
         git(self.bob, "fetch", "-q", "origin")
@@ -205,6 +193,7 @@ class CrossViewForgeTest(unittest.TestCase):
             1_710_000_300,
         )
         git(self.bob, "push", "-q", "origin", "main")
+        forge.drain_projection_jobs(self.forge)
         self.assertEqual(bob_submitted, self.remote_tip(self.bob_remote))
         alice_after_bob = self.remote_tip(self.alice_remote)
         self.assertNotEqual(alice_shared, alice_after_bob)
@@ -225,6 +214,7 @@ class CrossViewForgeTest(unittest.TestCase):
         bob_before_rebase = commit(self.bob, "bob concurrent", 1_710_000_500)
 
         git(self.alice, "push", "-q", "origin", "main")
+        forge.drain_projection_jobs(self.forge)
         self.assertEqual(alice_concurrent, self.remote_tip(self.alice_remote))
         rejected = git(self.bob, "push", "origin", "main", check=False)
         self.assertNotEqual(0, rejected.returncode)
@@ -235,6 +225,7 @@ class CrossViewForgeTest(unittest.TestCase):
         bob_rebased = git(self.bob, "rev-parse", "HEAD").stdout.strip()
         self.assertNotEqual(bob_before_rebase, bob_rebased)
         git(self.bob, "push", "-q", "origin", "main")
+        forge.drain_projection_jobs(self.forge)
         self.assertEqual(bob_rebased, self.remote_tip(self.bob_remote))
         canonical = forge.canonical_repo(self.forge)
         self.assertEqual(
@@ -247,54 +238,22 @@ class CrossViewForgeTest(unittest.TestCase):
         )
         self.assertNotEqual(alice_initial, self.remote_tip(self.alice_remote))
 
-    def test_recovery_completes_pending_secondary_view(self) -> None:
-        bob_old = self.remote_tip(self.bob_remote)
-        change_id = "Idddddddddddddddddddddddddddddddddddddddd"
+    def test_missing_secondary_cache_is_reconstructed_from_wal(self) -> None:
         (self.alice / "shared" / "recover.txt").write_text("recover cross view\n")
         submitted = commit(
             self.alice,
-            f"cross-view recovery\n\nChange-Id: {change_id}",
+            "cross-view recovery",
             1_710_000_600,
         )
         git(self.alice, "push", "-q", "origin", "main")
-        bob_new = self.remote_tip(self.bob_remote)
-        state = self.state()
-        transaction = next(iter(state["transactions"].values()))
-        bob_anchor = state["views"]["bob"]["anchors"].pop(bob_new)
-        state["views"]["bob"]["projected_tip"] = bob_old
-        state["views"]["bob"]["canonical_frontier"] = transaction["canonical_old"]
-        state["changes"][change_id]["revisions"] = [
-            revision
-            for revision in state["changes"][change_id]["revisions"]
-            if revision["view"] != "bob"
-        ]
-        transaction["status"] = "fanout_pending"
-        transaction["pending_views"] = ["bob"]
-        job = next(
-            job
-            for job in state["projection_jobs"].values()
-            if job["transaction_id"] == transaction["id"] and job["view"] == "bob"
-        )
-        job["status"] = "retry"
-        job["next_attempt_at"] = 0
-        forge.save_state(self.forge, state)
+        self.bob_remote.unlink()
 
-        forge.drain_projection_jobs(self.forge)
-        recovered = self.state()
-        recovered_bob = self.remote_tip(self.bob_remote)
-        self.assertEqual(bob_new, recovered_bob)
-        self.assertEqual("published", recovered["transactions"][transaction["id"]]["status"])
+        forge.sync_view(self.forge, "bob")
+        forge.sync_view(self.forge, "alice")
+
         self.assertEqual(
-            bob_anchor["canonical"],
-            recovered["views"]["bob"]["anchors"][recovered_bob]["canonical"],
-        )
-        self.assertTrue(
-            any(
-                revision["view"] == "bob"
-                and revision["projected"] == recovered_bob
-                and revision["kind"] == "synthetic"
-                for revision in recovered["changes"][change_id]["revisions"]
-            )
+            b"recover cross view\n",
+            forge.git(self.bob_remote, "show", "main:shared/recover.txt").stdout,
         )
         self.assertEqual(submitted, self.remote_tip(self.alice_remote))
 
@@ -307,9 +266,8 @@ class CrossViewForgeTest(unittest.TestCase):
             1_710_000_700,
         )
         git(self.alice, "push", "-q", "origin", "main")
-        canonical_before = forge.ref(
-            forge.canonical_repo(self.forge), "refs/heads/main"
-        )
+        forge.sync_view(self.forge, "bob")
+        canonical_before = repository_state(self.forge)[0].canonical_tip
 
         git(self.bob, "fetch", "-q", "origin")
         git(self.bob, "reset", "-q", "--hard", "origin/main")
@@ -324,7 +282,7 @@ class CrossViewForgeTest(unittest.TestCase):
         self.assertIn("belongs to another principal", rejected.stderr)
         self.assertEqual(
             canonical_before,
-            forge.ref(forge.canonical_repo(self.forge), "refs/heads/main"),
+            repository_state(self.forge)[0].canonical_tip,
         )
 
     def test_broken_secondary_does_not_block_source_or_other_operations(self) -> None:
@@ -341,82 +299,27 @@ class CrossViewForgeTest(unittest.TestCase):
         (self.alice / "shared" / "available.txt").write_text("available\n")
         submitted = commit(self.alice, "available despite broken view", 1_710_000_900)
         git(self.alice, "push", "-q", "origin", "main")
+        forge.sync_view(self.forge, "alice")
         self.assertEqual(submitted, self.remote_tip(self.alice_remote))
-        state = self.state()
-        transaction = next(iter(state["transactions"].values()))
-        self.assertEqual("fanout_pending", transaction["status"])
-        self.assertIn("broken", transaction["pending_views"])
-        self.assertIn("broken", transaction["view_errors"])
         forge.sync_view(self.forge, "bob")
+        forge.sync_view(self.forge, "broken")
+        self.assertTrue(broken.is_symlink())
 
-    def test_unconfirmed_source_serializes_cross_view_transactions(self) -> None:
-        alice_old = self.remote_tip(self.alice_remote)
-        bob_old = self.remote_tip(self.bob_remote)
+    def test_disjoint_cross_view_submissions_do_not_need_source_cache_confirmation(self) -> None:
         (self.alice / "team-a" / "overlap.txt").write_text("alice private overlap\n")
-        alice_new = commit(self.alice, "alice private overlap", 1_710_001_000)
-        forge.run(
-            "git",
-            "--git-dir",
-            str(self.alice_remote),
-            "fetch",
-            "-q",
-            str(self.alice),
-            alice_new,
-        )
-        forge.pre_receive(
-            self.forge,
-            "alice",
-            f"{alice_old} {alice_new} refs/heads/main\n".encode(),
-        )
-        # Recreate the unconfirmed window: rewind the source publication so
-        # canonical is committed while the submitting ref stays behind.
-        forge.git(self.alice_remote, "update-ref", "refs/heads/main", alice_old)
+        commit(self.alice, "alice private overlap", 1_710_001_000)
+        git(self.alice, "push", "-q", "origin", "main")
+        self.alice_remote.unlink()
 
         (self.bob / "shared" / "overlap.txt").write_text("bob shared overlap\n")
-        bob_new = commit(self.bob, "bob shared overlap", 1_710_001_100)
-        forge.run(
-            "git",
-            "--git-dir",
-            str(self.bob_remote),
-            "fetch",
-            "-q",
-            str(self.bob),
-            bob_new,
-        )
-        bob_update = f"{bob_old} {bob_new} refs/heads/main\n".encode()
-        with self.assertRaisesRegex(ForgeError, "unconfirmed source publication"):
-            forge.pre_receive(self.forge, "bob", bob_update)
-        # Restore the publication the crashed receive-pack would have
-        # completed, then confirm through post-receive.
-        forge.git(
-            self.alice_remote,
-            "update-ref",
-            "refs/heads/main",
-            alice_new,
-            alice_old,
-        )
-        forge.post_receive(
-            self.forge,
-            "alice",
-            f"{alice_old} {alice_new} refs/heads/main\n".encode(),
-        )
-        forge.pre_receive(self.forge, "bob", bob_update)
-        forge.post_receive(self.forge, "bob", bob_update)
-        forge.drain_projection_jobs(self.forge)
+        commit(self.bob, "bob shared overlap", 1_710_001_100)
+        git(self.bob, "push", "-q", "origin", "main")
+        forge.sync_view(self.forge, "alice")
         forge.sync_view(self.forge, "bob")
 
-        state = self.state()
-        canonical_tip = forge.ref(
-            forge.canonical_repo(self.forge), "refs/heads/main"
-        )
-        self.assertEqual(canonical_tip, state["views"]["alice"]["canonical_frontier"])
-        self.assertEqual(canonical_tip, state["views"]["bob"]["canonical_frontier"])
-        self.assertEqual(
-            self.remote_tip(self.alice_remote), state["views"]["alice"]["projected_tip"]
-        )
-        self.assertEqual(
-            self.remote_tip(self.bob_remote), state["views"]["bob"]["projected_tip"]
-        )
+        manifest, replay = repository_state(self.forge)
+        self.assertEqual(manifest.canonical_tip, replay.active_views["alice"]["canonical_frontier"])
+        self.assertEqual(manifest.canonical_tip, replay.active_views["bob"]["canonical_frontier"])
         self.assertEqual(
             b"alice private overlap\n",
             forge.git(
@@ -433,88 +336,40 @@ class CrossViewForgeTest(unittest.TestCase):
                 "main:shared/overlap.txt",
             ).stdout,
         )
-        alice_count = int(
-            forge.output(self.alice_remote, "rev-list", "--count", "main")
-        )
-        bob_count = int(forge.output(self.bob_remote, "rev-list", "--count", "main"))
-        self.assertEqual(3, alice_count)
-        self.assertEqual(2, bob_count)
 
-    def test_second_receive_on_same_view_is_rejected_until_source_publishes(self) -> None:
+    def test_committed_request_retry_is_resolved_from_wal(self) -> None:
+        from unittest.mock import patch
+
         old = self.remote_tip(self.alice_remote)
         (self.alice / "shared" / "first-receive.txt").write_text("first\n")
         new = commit(self.alice, "first receive", 1_710_001_200)
-        forge.run(
-            "git",
-            "--git-dir",
-            str(self.alice_remote),
-            "fetch",
-            "-q",
-            str(self.alice),
-            new,
-        )
+        git(self.alice, "push", "-q", "origin", "main")
+        head = repository_state(self.forge)[0].head_seq
         update = f"{old} {new} refs/heads/main\n".encode()
-        forge.pre_receive(self.forge, "alice", update)
-        # Rewind the source publication to recreate the crash window in
-        # which canonical committed but the view ref never moved.
-        forge.git(self.alice_remote, "update-ref", "refs/heads/main", old)
-        with self.assertRaisesRegex(ForgeError, "active receive transaction"):
+        with patch.dict(
+            os.environ,
+            {
+                "BASTION_VIEW": "alice",
+                "BASTION_PRINCIPAL_ID": "alice",
+                "BASTION_TRANSPORT": "test",
+            },
+            clear=False,
+        ):
             forge.pre_receive(self.forge, "alice", update)
+        self.assertEqual(head, repository_state(self.forge)[0].head_seq)
 
-    def test_unconfirmed_source_is_not_published_by_recovery(self) -> None:
-        old = self.remote_tip(self.alice_remote)
+    def test_workers_reconstruct_committed_source_without_local_ref_evidence(self) -> None:
         (self.alice / "shared" / "unconfirmed.txt").write_text("unconfirmed\n")
         new = commit(self.alice, "unconfirmed", 1_710_001_300)
-        forge.run(
-            "git",
-            "--git-dir",
-            str(self.alice_remote),
-            "fetch",
-            "-q",
-            str(self.alice),
-            new,
-        )
-        forge.pre_receive(
-            self.forge,
-            "alice",
-            f"{old} {new} refs/heads/main\n".encode(),
-        )
-        # Recreate the unconfirmed window, then discard the receiver marker
-        # so recovery classifies the transaction as source_unconfirmed.
-        forge.git(self.alice_remote, "update-ref", "refs/heads/main", old)
-        transaction = next(iter(self.state()["transactions"].values()))
-        (self.forge / "receivers" / transaction["id"]).unlink(missing_ok=True)
-        forge.drain_projection_jobs(self.forge)
-        recovered = self.state()["transactions"][transaction["id"]]
-        self.assertEqual(old, self.remote_tip(self.alice_remote))
-        self.assertEqual("source_unconfirmed", recovered["status"])
-        self.assertEqual("blocked", self.state()["outbox"][recovered["event_id"]]["status"])
-        with self.assertRaisesRegex(ForgeError, "unconfirmed source publication"):
-            forge.sync_view(self.forge, "bob")
-        bob_old = self.remote_tip(self.bob_remote)
-        (self.bob / "shared" / "barrier.txt").write_text("barrier\n")
-        bob_new = commit(self.bob, "cannot cross unconfirmed barrier", 1_710_001_350)
-        rejected = git(self.bob, "push", "origin", "main", check=False)
-        self.assertNotEqual(0, rejected.returncode)
-        self.assertIn("unconfirmed source publication", rejected.stderr)
-        self.assertEqual(bob_old, self.remote_tip(self.bob_remote))
+        git(self.alice, "push", "-q", "origin", "main")
+        self.alice_remote.unlink()
+        self.bob_remote.unlink()
 
-        update = f"{old} {new} refs/heads/main\n".encode()
-        forge.pre_receive(self.forge, "alice", update)
-        forge.post_receive(self.forge, "alice", update)
-        retried = self.state()["transactions"][transaction["id"]]
+        forge.drain_projection_jobs(self.forge)
         self.assertEqual(new, self.remote_tip(self.alice_remote))
-        self.assertEqual("published", retried["status"])
         self.assertEqual(
-            1,
-            int(
-                forge.output(
-                    forge.canonical_repo(self.forge),
-                    "rev-list",
-                    "--count",
-                    f"{transaction['canonical_old']}..main",
-                )
-            ),
+            b"unconfirmed\n",
+            forge.git(self.bob_remote, "show", "main:shared/unconfirmed.txt").stdout,
         )
 
 

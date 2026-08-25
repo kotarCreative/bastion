@@ -7,9 +7,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tests.identity_harness import ENTRYPOINT
 from tests.identity_harness import capability_grants
 from tests.identity_harness import add_view as fixture_add_view
+from tests.identity_harness import attach_admin_push
 
 import forge
 from service import (
@@ -22,7 +22,9 @@ from service import (
     bind_role,
     sync_view,
 )
-from tests.storage_helpers import document_bytes, read_document
+from layout import intake_repo
+from repository import Repository
+from tests.storage_helpers import document_bytes, repository_state
 from tests.transport import attach_intake_push
 
 
@@ -90,11 +92,13 @@ class IdentityIntegrationTest(unittest.TestCase):
         self.temporary.cleanup()
 
     def state(self) -> dict:
-        return read_document(self.forge)
+        manifest, replay = repository_state(self.forge)
+        return {"manifest": manifest, "replay": replay, "views": replay.active_views}
 
     def descriptor_of(self, view: str) -> dict:
-        state = self.state()
-        return state["view_descriptors"][state["views"][view]["descriptor_id"]]
+        repository = Repository.open(self.forge)
+        active = repository.load()[2].active_views[view]
+        return repository._descriptor(active["descriptor_id"])
 
     def test_view_name_and_principal_are_recorded_separately(self) -> None:
         transaction_state = self.state()
@@ -116,18 +120,16 @@ class IdentityIntegrationTest(unittest.TestCase):
         git(primary, "push", "-q", "origin", "main")
         forge.drain_projection_jobs(self.forge)
 
-        state = self.state()
-        transaction = next(iter(state["transactions"].values()))
+        replay = repository_state(self.forge)[1]
+        transaction = replay.records[-1]["payload"]
         self.assertEqual("alice", transaction["principal_id"])
-        self.assertEqual(
-            sorted(transaction["target_descriptors"]), ["alice-secondary", "bob"]
-        )
+        self.assertEqual("alice-primary", transaction["view_id"])
         secondary_tip = forge.ref(forge.view_repo(self.forge, "alice-secondary"), "refs/heads/main")
         self.assertNotEqual(secondary_tip, forge.ZERO_OID)
-        synthetic = state["views"]["alice-secondary"]["anchors"][secondary_tip]
-        self.assertEqual("synthetic", synthetic["kind"])
+        self.assertNotEqual(submitted, secondary_tip)
         self.assertEqual(
-            transaction["descriptor_id"], synthetic["descriptor_id"]
+            replay.active_views["alice-secondary"]["descriptor_id"],
+            transaction["descriptor_id"],
         )
 
     def test_same_principal_continues_change_id_from_other_view(self) -> None:
@@ -145,12 +147,13 @@ class IdentityIntegrationTest(unittest.TestCase):
         commit(secondary, f"second\n\nChange-Id: {change_id}", 1_700_000_300)
         git(secondary, "push", "-q", "origin", "main")
         forge.drain_projection_jobs(self.forge)
-        change = self.state()["changes"][change_id]
-        self.assertEqual("alice", change["owner_principal_id"])
+        replay = repository_state(self.forge)[1]
+        self.assertEqual("alice", replay.change_claims[change_id]["owner_principal_id"])
         submitted_views = {
-            revision["view"]
-            for revision in change["revisions"]
-            if revision["kind"] == "submitted"
+            record["payload"]["view_id"]
+            for record in replay.records
+            if record["kind"] == "submission"
+            and any(mapping["change_id"] == change_id for mapping in record["payload"]["mappings"])
         }
         self.assertEqual({"alice-primary", "alice-secondary"}, submitted_views)
 
@@ -189,8 +192,8 @@ class IdentityIntegrationTest(unittest.TestCase):
         git(bot, "push", "-q", "origin", "main")
         forge.drain_projection_jobs(self.forge)
 
-        change = self.state()["changes"][change_id]
-        self.assertEqual("release-bot", change["owner_principal_id"])
+        replay = repository_state(self.forge)[1]
+        self.assertEqual("release-bot", replay.change_claims[change_id]["owner_principal_id"])
 
         # The human owner gains no claim through ownership of the account.
         primary = self.clients["alice-primary"]
@@ -217,6 +220,7 @@ class IdentityIntegrationTest(unittest.TestCase):
 
         admin = self.root / "admin"
         command("git", "clone", "-q", str(forge.canonical_repo(self.forge)), str(admin))
+        attach_admin_push(self.forge, admin)
         git(admin, "config", "user.name", "Admin")
         git(admin, "config", "user.email", "admin@example.test")
         target = admin / "team-a"
@@ -233,9 +237,11 @@ class IdentityIntegrationTest(unittest.TestCase):
 
         command("git", "fetch", "-q", "origin", cwd=bob)
         bob_tip = forge.ref(forge.view_repo(self.forge, "bob"), "refs/heads/main")
-        anchor = self.state()["views"]["bob"]["anchors"][bob_tip]
-        self.assertEqual(new, anchor["canonical"])
-        self.assertEqual(anchor["descriptor_id"], self.descriptor_of("bob")["id"])
+        replay = repository_state(self.forge)[1]
+        self.assertEqual(new, replay.active_views["bob"]["canonical_frontier"])
+        self.assertEqual(
+            replay.active_views["bob"]["descriptor_id"], self.descriptor_of("bob")["id"]
+        )
         listing = command("git", "ls-tree", "-r", "--name-only", bob_tip, cwd=bob).stdout.splitlines()
         self.assertIn("team-a/new.txt", listing)
 
@@ -268,7 +274,7 @@ class IdentityIntegrationTest(unittest.TestCase):
         (bob / "shared" / "env.txt").write_text("env\n")
         new = commit(bob, "env push\n\nChange-Id: I" + "e" * 40, 1_700_001_000)
         old = command("git", "rev-parse", "HEAD~1", cwd=bob).stdout.strip()
-        forge.run("git", "--git-dir", str(forge.view_repo(self.forge, "bob")), "fetch", "-q", str(bob), new)
+        forge.run("git", "--git-dir", str(intake_repo(self.forge, "bob")), "fetch", "-q", str(bob), new)
 
         hostile_env = os.environ.copy()
         hostile_env.update(
@@ -276,27 +282,26 @@ class IdentityIntegrationTest(unittest.TestCase):
                 "BASTION_PRINCIPAL": "alice",
                 "PRINCIPAL": "alice",
                 "BASTION_DESCRIPTOR": "vdesc-forged",
-                "BASTION_VIEW": "alice-primary",
+                "BASTION_VIEW": "bob",
+                "BASTION_PRINCIPAL_ID": "bob",
+                "BASTION_TRANSPORT": "test",
                 "GIT_PUSH_OPTION_PRINCIPAL": "alice",
             }
         )
         updates = f"{old} {new} refs/heads/main\n".encode()
         previous_umask = os.umask(0o022)
         try:
-            forge.pre_receive(self.forge, "bob", updates)
+            from unittest.mock import patch
+
+            with patch.dict(os.environ, hostile_env, clear=True):
+                forge.pre_receive(self.forge, "bob", updates)
         finally:
             os.umask(previous_umask)
-        forge.post_receive(self.forge, "bob", updates)
 
-        state = self.state()
-        transaction = next(tx for tx in state["transactions"].values() if tx.get("view") == "bob")
+        replay = repository_state(self.forge)[1]
+        transaction = replay.records[-1]["payload"]
         self.assertEqual("bob", transaction["principal_id"])
-        self.assertEqual(state["views"]["bob"]["descriptor_id"], transaction["descriptor_id"])
-        self.assertNotIn("bob", transaction["target_descriptors"])
-        self.assertEqual(
-            {"alice-primary", "alice-secondary"},
-            set(transaction["target_descriptors"]),
-        )
+        self.assertEqual(replay.active_views["bob"]["descriptor_id"], transaction["descriptor_id"])
 
 
 if __name__ == "__main__":

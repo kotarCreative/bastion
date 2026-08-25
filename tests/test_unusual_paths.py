@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 import forge
+from tests.storage_helpers import repository_state, submission_record
 from tests.tree_harness import Effects, TreeFixture, build_commit, command, oid, tree_at
 
 
@@ -53,10 +54,7 @@ class UnusualPathTest(unittest.TestCase):
             for index, (path, _renamed) in enumerate(PATH_CASES)
         ]
         old, new = self.fixture.push_source_chain("alice", additions)
-        transaction = next(
-            tx for tx in self.fixture.state()["transactions"].values()
-            if tx.get("view") == "alice" and tx.get("projected_old") == old and tx.get("projected_new") == new
-        )
+        transaction = submission_record(self.fixture.root, "alice", old, new)["payload"]
         self.assertEqual(5, len(transaction["mappings"]))
         self.assertEqual(new, oid(forge.view_repo(self.fixture.root, "alice"), "refs/heads/main"))
 
@@ -80,14 +78,22 @@ class UnusualPathTest(unittest.TestCase):
             (b"team-a/" + b"d" * 150 + b"/" + b"/".join([b"p" * 150] * 28) + b"/leaf.txt", b"deep\n"),
         )
         self.assertGreater(len(private_cases[-1][0]), 4096)
-        bob_tip = self.fixture.state()["views"]["bob"]["projected_tip"]
+        active = repository_state(self.fixture.root)[1].active_views["bob"]
+        bob_tip = oid(forge.view_repo(self.fixture.root, "bob"), active["projected_ref"])
         effects = {path: (b"100644", contents) for path, contents in private_cases}
         self.fixture.push_source("alice", effects)
-        bob = self.fixture.state()["views"]["bob"]
-        self.assertEqual(bob_tip, bob["projected_tip"])
+        bob = repository_state(self.fixture.root)[1].active_views["bob"]
+        self.assertEqual(
+            bob_tip,
+            oid(forge.view_repo(self.fixture.root, "bob"), bob["projected_ref"]),
+        )
         self.assertEqual(oid(forge.canonical_repo(self.fixture.root), "refs/heads/main"), bob["canonical_frontier"])
         self.fixture.push_source("alice", {path: None for path, _contents in private_cases})
-        self.assertEqual(bob_tip, self.fixture.state()["views"]["bob"]["projected_tip"])
+        bob = repository_state(self.fixture.root)[1].active_views["bob"]
+        self.assertEqual(
+            bob_tip,
+            oid(forge.view_repo(self.fixture.root, "bob"), bob["projected_ref"]),
+        )
 
     def test_administrative_add_and_delete_all_raw_path_categories(self) -> None:
         additions: Effects = {

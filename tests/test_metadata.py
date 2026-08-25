@@ -19,12 +19,12 @@ from service import (
     bind_role,
 )
 from tests.identity_harness import (
-    ENTRYPOINT,
     capability_grants,
     provision_admin,
 )
 from service import add_view as service_add_view
-from tests.storage_helpers import document_bytes, read_document
+from repository import Repository
+from tests.storage_helpers import document_bytes, read_document, repository_snapshot
 from tests.transport import attach_intake_push
 
 
@@ -77,7 +77,7 @@ class MetadataFixture:
         add_role(self.forge, "writer", allow, deny)
         bind_role(self.forge, "writer", "principal", "alice")
         bind_role(self.forge, "writer", "principal", "bob")
-        service_add_view(self.forge, "alice", "alice", "main", ENTRYPOINT)
+        service_add_view(self.forge, "alice", "alice", "main")
 
         self.client = root / "client-alice"
         command("git", "clone", "-q", "--no-local",
@@ -114,15 +114,11 @@ class AuthorBindingTest(unittest.TestCase):
     def test_foreign_author_is_rejected_without_state_change(self) -> None:
         # Bob's identity may not act through Alice's view.
         (self.fixture.client / "shared" / "new.txt").write_text("new\n")
-        before = self.fixture.state()
+        before = repository_snapshot(self.fixture.forge)
         rejected = self.fixture.push(author_email="bob@example.test")
         self.assertNotEqual(0, rejected.returncode)
         self.assertIn("undeclared identity", rejected.stderr)
-        self.assertEqual(before["views"], self.fixture.state()["views"])
-        view_state = before["views"]["alice"]
-        actual = forge.ref(forge.view_repo(self.fixture.forge, "alice"),
-                           view_state["projected_ref"])
-        self.assertEqual(view_state["projected_tip"], actual)
+        self.assertEqual(before, repository_snapshot(self.fixture.forge))
 
     def test_unknown_author_is_rejected_for_bound_principals(self) -> None:
         (self.fixture.client / "shared" / "new.txt").write_text("new\n")
@@ -135,7 +131,7 @@ class AuthorBindingTest(unittest.TestCase):
         allow, deny = capability_grants(["shared"], ["shared"])
         add_role(self.fixture.forge, "writer-2", allow, deny)
         bind_role(self.fixture.forge, "writer-2", "principal", "carol")
-        service_add_view(self.fixture.forge, "carol", "carol", "main", ENTRYPOINT)
+        service_add_view(self.fixture.forge, "carol", "carol", "main")
         carol = self.fixture.root / "client-carol"
         command("git", "clone", "-q", "--no-local",
                 str(forge.view_repo(self.fixture.forge, "carol")), str(carol))
@@ -143,7 +139,7 @@ class AuthorBindingTest(unittest.TestCase):
         git(carol, "config", "user.name", "Anyone")
         git(carol, "config", "user.email", "anyone@elsewhere.test")
         (carol / "shared" / "c.txt").write_text("c\n")
-        commit(carol, "legacy\n\nChange-Id: I" + "b" * 40, 1_700_200_000)
+        commit(carol, "historical\n\nChange-Id: I" + "b" * 40, 1_700_200_000)
         git(carol, "push", "-q", "origin", "main")
         forge.drain_projection_jobs(self.fixture.forge)
         check_invariants(self.fixture.forge)
@@ -153,7 +149,7 @@ class AuthorBindingTest(unittest.TestCase):
         allow, deny = capability_grants(["shared"], ["shared"])
         add_role(self.fixture.forge, "bot-writer", allow, deny)
         bind_role(self.fixture.forge, "bot-writer", "principal", "bot")
-        service_add_view(self.fixture.forge, "bot", "bot", "main", ENTRYPOINT)
+        service_add_view(self.fixture.forge, "bot", "bot", "main")
         bot = self.fixture.root / "client-bot"
         command("git", "clone", "-q", "--no-local",
                 str(forge.view_repo(self.fixture.forge, "bot")), str(bot))
@@ -261,9 +257,10 @@ class TagCapabilityTest(unittest.TestCase):
         allow["tag"] = [""]
         add_role(self.forge, "tagger", allow, deny)
         bind_role(self.forge, "tagger", "principal", "alice")
-        service_add_view(self.forge, "alice", "alice", "main", ENTRYPOINT)
-        state = read_document(self.forge)
-        descriptor = state["view_descriptors"][state["views"]["alice"]["descriptor_id"]]
+        service_add_view(self.forge, "alice", "alice", "main")
+        repository = Repository.open(self.forge)
+        active = repository.load()[2].active_views["alice"]
+        descriptor = repository._descriptor(active["descriptor_id"])
         self.assertEqual([""], descriptor["capabilities"]["tag"])
         self.assertEqual([], descriptor["restrictions"]["tag"])
         # Tag objects remain unsupported; only the projected branch exists.

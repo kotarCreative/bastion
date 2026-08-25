@@ -6,13 +6,15 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from errors import ForgeError
 from service import init_forge, update_canonical_ref
+from state import load_state
 import forge
 
-from tests.identity_harness import provision_admin
-from tests.storage_helpers import document_bytes, read_document
+from tests.identity_harness import attach_admin_push, provision_admin
+from tests.storage_helpers import repository_state
 
 
 
@@ -45,6 +47,7 @@ class ForgeInitializationTest(unittest.TestCase):
             canonical = forge.canonical_repo(forge_root)
             checkout = root / "admin"
             subprocess.run(["git", "clone", "-q", str(canonical), str(checkout)], check=True)
+            attach_admin_push(forge_root, checkout)
             subprocess.run(["git", "config", "user.name", "Admin"], cwd=checkout, check=True)
             subprocess.run(
                 ["git", "config", "user.email", "admin@example.test"],
@@ -134,13 +137,39 @@ class ForgeInitializationTest(unittest.TestCase):
                 stdout=subprocess.PIPE, check=True,
             ).stdout.strip()
             subprocess.run(
-                ["git", "push", "-q", str(canonical), f"{new}:refs/staging/next"],
+                ["git", "push", "-q", str(forge_root / "admin-staging.git"), f"{new}:refs/staging/next"],
                 cwd=source,
                 check=True,
             )
             update_canonical_ref(forge_root, old, new, provision_admin(forge_root))
-            state = read_document(forge_root)
-            self.assertEqual("published", next(iter(state["transactions"].values()))["status"])
+            manifest, replay = repository_state(forge_root)
+            self.assertEqual(new, manifest.canonical_tip)
+            self.assertEqual("canonical_update", replay.records[-1]["kind"])
+
+    def test_interrupted_initialization_resumes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            subprocess.run(["git", "init", "-q", "-b", "main", str(source)], check=True)
+            subprocess.run(["git", "config", "user.name", "Fixture"], cwd=source, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "fixture@example.test"],
+                cwd=source,
+                check=True,
+            )
+            (source / "base").write_text("base\n")
+            subprocess.run(["git", "add", "."], cwd=source, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "base"], cwd=source, check=True)
+            forge_root = root / "forge"
+
+            with patch("service.ensure_canonical_materialized", side_effect=RuntimeError("crash")):
+                with self.assertRaisesRegex(RuntimeError, "crash"):
+                    init_forge(forge_root, source, "main")
+
+            self.assertEqual("initializing", load_state(forge_root)["repository_state"])
+            init_forge(forge_root, source, "main")
+            self.assertEqual("ready", load_state(forge_root)["repository_state"])
+            self.assertEqual(1, repository_state(forge_root)[0].head_seq)
 
     @unittest.skipIf(os.pathsep not in ":;", "unexpected object path separator")
     def test_object_path_separator_in_root_is_rejected(self) -> None:

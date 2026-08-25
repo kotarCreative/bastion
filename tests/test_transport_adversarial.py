@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import forge
 from layout import intake_repo, view_repo
 from store import open_store
+from tests.storage_helpers import repository_snapshot, repository_state
 from tests.test_transport_security import TransportFixture, command, commit
 
 
@@ -186,11 +187,7 @@ class RawProtocolAttackTest(unittest.TestCase):
         connection.close()
 
     def test_garbage_pkt_lines_to_receive_leave_state_unchanged(self) -> None:
-        from tests.storage_helpers import document_bytes
-
-        before_doc = document_bytes(self.fixture.forge)
-        before_view = object_digest(view_repo(self.fixture.forge, "alice"))
-        before_intake = object_digest(intake_repo(self.fixture.forge, "alice"))
+        before = repository_snapshot(self.fixture.forge)
         for garbage in (b"\xff\xff\xff\xff", b"00zz garbage\r\n",
                         pkt(b"\x00\x01\x02") + b"\xff" * 32):
             status, _payload = request(
@@ -199,9 +196,7 @@ class RawProtocolAttackTest(unittest.TestCase):
                  "Content-Type": "application/x-git-receive-pack-request"},
             )
             self.assertGreaterEqual(status, 400)
-        self.assertEqual(before_doc, document_bytes(self.fixture.forge))
-        self.assertEqual(before_view, object_digest(view_repo(self.fixture.forge, "alice")))
-        self.assertEqual(before_intake, object_digest(intake_repo(self.fixture.forge, "alice")))
+        self.assertEqual(before, repository_snapshot(self.fixture.forge))
 
 
 class IntakeBoundaryAttackTest(unittest.TestCase):
@@ -244,16 +239,15 @@ class IntakeBoundaryAttackTest(unittest.TestCase):
             self.assertEqual(404, status, path)
             self.assertEqual(b"not found", payload, path)
 
-    def test_rejected_http_push_leaves_intake_store_byte_identical(self) -> None:
-        before = object_digest(intake_repo(self.fixture.forge, "alice"))
+    def test_rejected_http_push_leaves_repository_truth_unchanged(self) -> None:
+        before = repository_snapshot(self.fixture.forge)
         command("git", "-C", str(self.alice), "checkout", "-qb", "hostile")
         (self.alice / "shared" / "hostile.txt").write_text("hostile\n")
         commit(self.alice, "hostile branch", 1_700_900_000)
         pushed = command("git", "-C", str(self.alice), "push", "origin",
                          "hostile", check=False)
         self.assertNotEqual(0, pushed.returncode)
-        self.assertEqual(before,
-                         object_digest(intake_repo(self.fixture.forge, "alice")))
+        self.assertEqual(before, repository_snapshot(self.fixture.forge))
 
     def test_tampered_intake_mirror_self_heals_on_push(self) -> None:
         (self.alice / "shared" / "heal.txt").write_text("heal\n")
@@ -271,9 +265,10 @@ class IntakeBoundaryAttackTest(unittest.TestCase):
                              "main", check=False)
         self.assertEqual(0, pushed.returncode, pushed.stderr)
         repaired = forge.output(intake, "rev-parse", "refs/heads/main")
-        view_tip = forge.ref(view_repo(self.fixture.forge, "alice"),
-                             "refs/heads/main")
-        self.assertEqual(repaired, view_tip)
+        self.assertEqual(
+            repaired,
+            repository_state(self.fixture.forge)[1].records[-1]["payload"]["projected_new"],
+        )
         forge.check_invariants(self.fixture.forge)
 
     def test_future_dated_commit_over_http_is_rejected(self) -> None:
@@ -339,11 +334,7 @@ class IdentitySpoofingTest(unittest.TestCase):
         self.assertTrue(accepts[0]["subject"].startswith("alice/alice"),
                         accepts[0]["subject"])
         self.assertIn("http", accepts[0]["detail"])
-        from state import load_state
-
-        transaction = next(iter(
-            load_state(self.fixture.forge)["transactions"].values()
-        ))
+        transaction = repository_state(self.fixture.forge)[1].records[-1]["payload"]
         self.assertEqual("alice", transaction["principal_id"])
 
 

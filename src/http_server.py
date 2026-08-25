@@ -20,6 +20,8 @@ from errors import ForgeError
 from git import clean_env
 from layout import intake_repo, view_repo
 from state import load_state
+from materialization import ensure_intake_materialized, ensure_view_materialized
+from repository import Repository
 
 
 ROUTE = re.compile(
@@ -30,8 +32,7 @@ SERVICES = ("git-upload-pack", "git-receive-pack")
 SERVICE_COMMANDS = {"git-upload-pack": "upload-pack", "git-receive-pack": "receive-pack"}
 SERVICE_TIMEOUTS = {"git-upload-pack": 300, "git-receive-pack": 600}
 UPLOAD_MAX_BODY = 32 << 20
-
-from service import MAX_PACK_BYTES as RECEIVE_MAX_BODY
+RECEIVE_MAX_BODY = int(os.environ.get("BASTION_MAX_PACK_BYTES", 256 * 1024 * 1024))
 GZIP_MAX_RATIO = 32
 PROTOCOL_HEADER = re.compile(r"version=2(=[0-9]+)?")
 SUBPROCESS_TIMEOUT = 600
@@ -134,7 +135,11 @@ def add_token(root: Path, view: str) -> str:
     from state import locked
 
     state = load_state(root)
-    if view not in state["views"]:
+    if state.get("repository_state") != "ready":
+        raise ForgeError("forge initialization is incomplete")
+    repository = Repository.open(root)
+    _manifest, _version, replay = repository.load()
+    if view not in replay.active_views:
         raise ForgeError(f"unknown view: {view}")
     token = secrets.token_urlsafe(32)
     target = tokens_path(root)
@@ -156,9 +161,23 @@ def service_repo(root: Path, view: str, service: str) -> tuple[Path, Path | None
     Uploads read from published view storage; receives target the isolated
     intake repository whose only object source is the sibling view store.
     """
+    _repository, _manifest, active, materialized = _resolve_service(root, view)
     if service == "git-upload-pack":
-        return view_repo(root, view), None
-    return intake_repo(root, view), view_repo(root, view) / "objects"
+        return materialized.path, None
+    return ensure_intake_materialized(root, materialized), materialized.path / "objects"
+
+
+def _resolve_service(root: Path, view: str):
+    state = load_state(root)
+    if state.get("repository_state") != "ready":
+        raise ForgeError("forge initialization is incomplete")
+    repository = Repository.open(root)
+    manifest, _version, replay = repository.load()
+    active = replay.active_views.get(view)
+    if active is None:
+        raise ForgeError("view is not active in the committed WAL")
+    materialized = ensure_view_materialized(root, view, manifest, replay, repository)
+    return repository, manifest, active, materialized
 
 
 def run_service(
@@ -248,7 +267,15 @@ class BastionRequestHandler(BaseHTTPRequestHandler):
         service = target if target != "info/refs" else parse_service(split.query)
         if service is None:
             raise HttpError(404, BODY_404)
-        repo, alternates = service_repo(self.root, view, service)
+        try:
+            _repository, _manifest, active, materialized = _resolve_service(self.root, view)
+            if service == "git-upload-pack":
+                repo, alternates = materialized.path, None
+            else:
+                repo = ensure_intake_materialized(self.root, materialized)
+                alternates = materialized.path / "objects"
+        except ForgeError:
+            raise HttpError(404, BODY_404)
         if not repo.is_dir():
             raise HttpError(404, BODY_404)
         protocol = self.headers.get("Git-Protocol")
@@ -271,9 +298,8 @@ class BastionRequestHandler(BaseHTTPRequestHandler):
                 "BASTION_TRANSPORT": "http",
                 "BASTION_REMOTE_ADDR": self.client_address[0],
             }
-            principal = self._principal_for(view)
-            if principal:
-                extra_env["BASTION_PRINCIPAL_ID"] = principal
+            if service == "git-receive-pack":
+                extra_env["BASTION_PRINCIPAL_ID"] = active["principal_id"]
             idempotency_key = self.headers.get("Idempotency-Key")
             if idempotency_key and target == "git-receive-pack":
                 if len(idempotency_key) > 256 or not idempotency_key.strip():
@@ -289,11 +315,10 @@ class BastionRequestHandler(BaseHTTPRequestHandler):
 
     def _principal_for(self, view: str) -> str | None:
         try:
-            state = load_state(self.root)
+            _repository, _manifest, active, _materialized = _resolve_service(self.root, view)
         except ForgeError:
             return None
-        entry = state["views"].get(view)
-        return entry.get("principal_id") if entry else None
+        return active["principal_id"]
 
     def _read_body(self, service: str) -> bytes:
         maximum = UPLOAD_MAX_BODY if service == "git-upload-pack" else RECEIVE_MAX_BODY
@@ -357,7 +382,8 @@ class BastionServer(ThreadingHTTPServer):
 
 
 def make_server(root: Path, host: str = "127.0.0.1", port: int = 8000) -> BastionServer:
-    load_state(root)
+    if load_state(root).get("repository_state") != "ready":
+        raise ForgeError("forge initialization is incomplete")
     return BastionServer((host, port), root)
 
 

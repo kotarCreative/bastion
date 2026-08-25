@@ -17,8 +17,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from service import add_view as _service_add_view  # noqa: E402
 
 
-ENTRYPOINT = Path(__file__).resolve().parent.parent / "forge.py"
-
 WRITE_CAPABILITIES = ("create", "modify", "delete", "mode", "symlink")
 
 ADMIN_PRINCIPAL = "forge-admin"
@@ -73,6 +71,25 @@ def update_canonical(
     update_canonical_ref(Path(root), expected, new, acting_principal)
 
 
+def attach_admin_push(root: Path, checkout: Path) -> None:
+    """Route trusted fixture staging refs to the disposable admin repository."""
+    import subprocess
+
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(checkout),
+            "remote",
+            "set-url",
+            "--push",
+            "origin",
+            str(Path(root) / "admin-staging.git"),
+        ],
+        check=True,
+    )
+
+
 def add_view(
     root: Path,
     name: str,
@@ -104,4 +121,4 @@ def add_view(
             allow, deny = capability_grants(list(read), list(write))
             add_role(root, role_id, allow, deny)
             bind_role(root, role_id, "principal", name)
-    _service_add_view(root, name, owner, branch, ENTRYPOINT)
+    _service_add_view(root, name, owner, branch)

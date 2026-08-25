@@ -26,7 +26,7 @@ CAPABILITIES = (
     "tag",
 )
 DESCRIPTOR_ALGORITHM = "capabilities-v2"
-DESCRIPTOR_DOMAIN = b"bastion-effective-view-v1\0"
+DESCRIPTOR_DOMAIN = b"bastion-effective-view\0"
 TIMESTAMP_SKEW_SECONDS = 600
 
 

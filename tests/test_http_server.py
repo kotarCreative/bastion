@@ -14,7 +14,7 @@ from git import ref
 from http_server import add_token, make_server
 from invariants import check_invariants
 from layout import ZERO_OID, canonical_repo
-from tests.storage_helpers import document_bytes, read_document
+from tests.storage_helpers import document_bytes, read_document, repository_state
 
 
 
@@ -96,7 +96,7 @@ class HttpForgeTest(unittest.TestCase):
         git(alice, "commit", "-q", "-m", "pushed over http")
         git(alice, "push", "-q", "origin", "main")
 
-        canonical_tip = ref(canonical_repo(self.forge), "refs/heads/main")
+        canonical_tip = repository_state(self.forge)[0].canonical_tip
         self.assertNotEqual(canonical_tip, self.initial_canonical)
         check_invariants(self.forge)
 

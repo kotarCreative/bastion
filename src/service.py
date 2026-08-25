@@ -4,317 +4,182 @@ from __future__ import annotations
 
 import os
 import re
-import shlex
 import shutil
-import sys
+import uuid
 from pathlib import Path
 
 import identity
 from errors import ForgeError
 from failpoints import checkpoint
-from git import clean_env, git, output, ref, run, tree_entries, tree_oid
-from layout import ZERO_OID, canonical_repo, intake_repo, view_repo
-from projection import project_history, project_tree, synthetic_commit
+from git import clean_env, git, output, ref, run, tree_entries
+from layout import ZERO_OID
+from artifacts import build_full_ref_pack, upload_pack
+from materialization import (
+    ensure_canonical_materialized,
+    ensure_intake_materialized,
+    ensure_view_materialized,
+)
+from repository import AlreadyCommitted, Candidate, Repository, write_repository_config
 from state import (
-    has_unconfirmed_source,
     is_ancestor,
+    load_state,
     locked,
-    record_change_representation,
-    require_quiescent,
     save_state,
-    source_publication_pending,
 )
 from validation import capability_allowed, validate_view_name
+from validation import parse_change_id
+from wal import event_id, record_fingerprint
 
 
-MAX_PACK_BYTES = int(os.environ.get("BASTION_MAX_PACK_BYTES", 256 * 1024 * 1024))
-
-REJECT_ALL_HOOK = (
-    "#!/bin/sh\n"
-    "echo 'bastion: pushes are accepted only through the authenticated"
-    " intake boundary' >&2\n"
-    "exit 1\n"
-)
-
-
-def repair_intake_mirror(root: Path, state: dict, name: str) -> None:
-    """Force the intake advertisement ref to the authoritative projected tip."""
-    view = state["views"].get(name)
-    if not view:
-        return
-    intake = intake_repo(root, name)
-    if not intake.is_dir():
-        return
-    projected_ref = view["projected_ref"]
-    target = view["projected_tip"]
-    current = ref(intake, projected_ref)
-    if target == ZERO_OID:
-        if current != ZERO_OID:
-            git(intake, "update-ref", "-d", projected_ref, current)
-        return
-    if current != target:
-        arguments = ["update-ref", projected_ref, target]
-        if current != ZERO_OID:
-            arguments.append(current)
-        git(intake, *arguments)
+def _object_store_path(root: Path, value: str) -> Path:
+    if value == "filesystem":
+        return root / "object-store"
+    if not value.startswith("filesystem:") or not value[len("filesystem:") :]:
+        raise ForgeError("object store must be filesystem or filesystem:PATH")
+    path = Path(value[len("filesystem:") :])
+    return path if path.is_absolute() else root / path
 
 
-def init_forge(root: Path, source: Path, branch: str, database: str | None = None) -> None:
+def init_forge(
+    root: Path,
+    source: Path,
+    branch: str,
+    database: str | None = None,
+    object_store: str = "filesystem",
+) -> None:
     if run("git", "check-ref-format", "--branch", branch, check=False).returncode:
         raise ForgeError(f"invalid branch name: {branch}")
     if os.pathsep in str(root.resolve()):
         raise ForgeError(
             f"forge root cannot contain the object-path separator {os.pathsep!r}"
         )
-    if root.exists() and any(root.iterdir()):
-        raise ForgeError(f"forge root is not empty: {root}")
+    was_nonempty = root.exists() and any(root.iterdir())
     root.mkdir(parents=True, exist_ok=True)
-    (root / "views").mkdir()
-    (root / "intake").mkdir()
-    from store import initialize_store
-
-    store = initialize_store(root, database)
-    store.close()
-    run("git", "clone", "--bare", "--no-local", str(source), str(canonical_repo(root)))
-    if output(canonical_repo(root), "rev-parse", "--show-object-format") != "sha1":
-        raise ForgeError("this experiment currently supports SHA-1 repositories only")
-    canonical_ref = f"refs/heads/{branch}"
-    if ref(canonical_repo(root), canonical_ref) == ZERO_OID:
-        raise ForgeError(f"source has no branch named {branch}")
-    save_state(
-        root,
-        {
-            "canonical_branch": branch,
-            "principals": {},
-            "teams": {},
-            "roles": {},
-            "role_bindings": {},
-            "view_descriptors": {},
-            "views": {},
-            "transactions": {},
-            "changes": {},
-            "outbox": {},
-            "projection_jobs": {},
-            "next_transaction_sequence": 1,
-        },
-    )
-
-
-def migrate_storage(root: Path, database: str | None = None) -> None:
-    """Import a legacy JSON forge into the configured database backend."""
-    import json
-
+    (root / "views").mkdir(exist_ok=True)
+    (root / "intake").mkdir(exist_ok=True)
     from store import backend_record_path, initialize_store, open_store
 
-    legacy = root / "state.json"
+    if was_nonempty and not backend_record_path(root).exists():
+        resumable = {
+            "views", "intake", "store.sqlite3", "store.sqlite3-wal",
+            "store.sqlite3-shm",
+        }
+        if any(item.name not in resumable for item in root.iterdir()):
+            raise ForgeError(f"forge root is not empty: {root}")
+    store = (
+        open_store(root)
+        if backend_record_path(root).exists()
+        else initialize_store(root, database)
+    )
     try:
-        document = json.loads(legacy.read_text())
-    except (OSError, json.JSONDecodeError) as error:
-        raise ForgeError(f"cannot read legacy forge state: {error}") from error
-    if not isinstance(document.get("canonical_branch"), str):
-        raise ForgeError("legacy forge state is not a valid forge document")
-    if backend_record_path(root).exists():
-        raise ForgeError("forge already has a storage backend record")
-    store = initialize_store(root, database)
-    try:
-        store.save_document(document, [], None)
-        reloaded = store.load_document()
-    except Exception:
-        store.close()
-        _rollback_failed_migration(root)
-        raise
-    normalized_document = json.loads(json.dumps(document, sort_keys=True))
-    normalized_reloaded = json.loads(json.dumps(reloaded, sort_keys=True))
-    try:
-        if normalized_document != normalized_reloaded:
-            raise ForgeError("migrated document differs from the legacy JSON")
-        os.replace(legacy, root / "state.json.imported")
-    except Exception:
-        _rollback_failed_migration(root)
-        raise
+        store.bootstrap()
     finally:
         store.close()
-
-
-def _rollback_failed_migration(root: Path) -> None:
-    from store import backend_record_path
-
-    for name in ("store.sqlite3", "store.sqlite3-wal", "store.sqlite3-shm"):
-        candidate = root / name
-        if candidate.exists():
-            candidate.unlink(missing_ok=True)
-    backend_record_path(root).unlink(missing_ok=True)
-
-
-def install_hooks(root: Path, name: str, entrypoint: Path) -> None:
-    python = shlex.quote(sys.executable)
-    command = shlex.quote(str(entrypoint.resolve()))
-    root_arg = shlex.quote(str(root.resolve()))
-    view_arg = shlex.quote(name)
-    receive_script = (
-        f"#!/bin/sh\nexec {python} {command} {{hook}} {root_arg} {view_arg}\n"
+    try:
+        state = load_state(root)
+    except ForgeError as error:
+        if "forge state is not initialized" not in str(error):
+            raise
+        state = {
+            "canonical_branch": None,
+            "repository_state": "initializing",
+            "repository_id": None,
+            "last_indexed_seq": 0,
+        }
+    if state.get("repository_state") != "initializing":
+        if was_nonempty:
+            raise ForgeError(f"forge root is not empty: {root}")
+        raise ForgeError("forge initialization state is invalid", "integrity")
+    persisted_branch = state.get("canonical_branch")
+    if persisted_branch not in {None, branch}:
+        raise ForgeError("initialization branch differs from the persisted branch")
+    object_store_path = _object_store_path(root, object_store)
+    if (root / "repository.json").exists():
+        repository_id = Repository.open(root).repository_id
+    else:
+        repository_id = state.get("repository_id") or uuid.uuid4().hex
+    write_repository_config(root, repository_id, branch, object_store_path)
+    state.update(
+        {
+            "canonical_branch": branch,
+            "repository_state": "initializing",
+            "repository_id": repository_id,
+            "last_indexed_seq": state.get("last_indexed_seq", 0),
+        }
     )
-    scripts = {
-        view_repo(root, name): {
-            "pre-receive": REJECT_ALL_HOOK,
-        },
-        intake_repo(root, name): {
-            "pre-receive": receive_script.format(hook="pre-receive"),
-            "post-receive": receive_script.format(hook="post-receive"),
-        },
-    }
-    for repo, hooks in scripts.items():
-        for filename, contents in hooks.items():
-            target = repo / "hooks" / filename
-            target.write_text(contents)
-            target.chmod(0o755)
-
-
-def initialize_intake_repo(root: Path, name: str, branch: str) -> Path:
-    """Create the fetch-isolated intake repository for one view."""
-    intake = intake_repo(root, name)
-    run("git", "init", "--bare", "-q", "-b", branch, str(intake))
-    for key, value in (
-        ("receive.denyDeletes", "true"),
-        ("receive.denyNonFastForwards", "true"),
-        ("receive.maxInputSize", str(MAX_PACK_BYTES)),
-        ("core.logAllRefUpdates", "false"),
+    for section in (
+        "principals", "teams", "roles", "role_bindings", "view_descriptors",
+        "views", "transactions", "changes", "projection_jobs",
     ):
-        git(intake, "config", key, value)
-    info = intake / "objects" / "info"
-    info.mkdir(parents=True, exist_ok=True)
-    alternates = info / "alternates"
-    if not alternates.exists():
-        alternates.write_text(f"{(view_repo(root, name) / 'objects').resolve()}\n")
-    return intake
-
-
-def sync_view_locked(
-    root: Path, state: dict, name: str, check_active: bool = True
-) -> None:
-    view = state["views"].get(name)
-    if not view:
-        raise ForgeError(f"unknown view: {name}")
-    descriptor = identity.descriptor_for_view(state, name)
-    if check_active and source_publication_pending(root, state, name):
-        raise ForgeError("view has an active receive transaction")
-    if check_active and has_unconfirmed_source(state):
-        raise ForgeError("canonical history contains an unconfirmed source publication")
-    if check_active:
-        from outbox import view_has_unfinished_jobs
-
-        if view_has_unfinished_jobs(state, name):
-            raise ForgeError("view has pending projection work")
-    plan = build_projection_plan(root, name, view, descriptor)
-    publish_projection_plan(root, state, plan)
-
-
-def build_projection_plan(
-    root: Path,
-    name: str,
-    view: dict,
-    descriptor: dict,
-    canonical_tip: str | None = None,
-) -> dict:
-    canonical = canonical_repo(root)
-    destination = view_repo(root, name)
-    canonical_tip = canonical_tip or ref(canonical, view["canonical_ref"])
-    if canonical_tip == ZERO_OID:
-        raise ForgeError("canonical branch is empty")
-    frontier = view["canonical_frontier"]
-    if frontier != ZERO_OID and run(
-        "git",
-        "--git-dir",
-        str(canonical),
-        "merge-base",
-        "--is-ancestor",
-        frontier,
-        canonical_tip,
-        env=clean_env(),
-        check=False,
-    ).returncode:
-        raise ForgeError("canonical history was rewritten")
-    old_tip = view["projected_tip"]
-    projected_tip, frontier, anchors = project_history(
-        canonical,
-        destination,
-        frontier,
-        canonical_tip,
-        old_tip,
-        descriptor,
-    )
-    generation = view["descriptor_generation"]
-    for anchor in anchors.values():
-        anchor["descriptor_id"] = descriptor["id"]
-        anchor["descriptor_generation"] = generation
-    return {
-        "view": name,
-        "canonical_ref": view["canonical_ref"],
-        "projected_ref": view["projected_ref"],
-        "descriptor_id": descriptor["id"],
-        "descriptor_generation": generation,
-        "old_frontier": view["canonical_frontier"],
-        "new_frontier": frontier,
-        "old_tip": old_tip,
-        "new_tip": projected_tip,
-        "anchors": anchors,
-    }
-
-
-def publish_projection_plan(root: Path, state: dict, plan: dict) -> None:
-    name = plan["view"]
-    view = state["views"].get(name)
-    if not view:
-        raise ForgeError(f"unknown view: {name}")
-    identity.require_matching_descriptor(
-        view, plan["descriptor_id"], plan["descriptor_generation"]
-    )
-    if view["canonical_frontier"] != plan["old_frontier"] or view[
-        "projected_tip"
-    ] != plan["old_tip"]:
-        if view["canonical_frontier"] == plan["new_frontier"] and view[
-            "projected_tip"
-        ] == plan["new_tip"]:
-            return
-        raise ForgeError("projection plan is stale")
-    destination = view_repo(root, name)
-    canonical = canonical_repo(root)
-    canonical_tip = ref(canonical, plan["canonical_ref"])
-    if canonical_tip == ZERO_OID or not is_ancestor(
-        canonical, plan["new_frontier"], canonical_tip
-    ):
-        raise ForgeError("canonical history changed while projecting view")
-    actual_tip = ref(destination, view["projected_ref"])
-    if plan["new_tip"] != plan["old_tip"] and actual_tip != plan["new_tip"]:
-        if actual_tip == plan["old_tip"] or is_ancestor(
-            destination, actual_tip, plan["new_tip"]
-        ):
-            git(
-                destination,
-                "update-ref",
-                view["projected_ref"],
-                plan["new_tip"],
-                actual_tip,
+        state.setdefault(section, {})
+    save_state(root, state)
+    repository = Repository.open(root)
+    bootstrap = root / "materializations" / "bootstrap-source.git"
+    canonical_ref = f"refs/heads/{branch}"
+    try:
+        manifest, _version, _replay = repository.load()
+    except ForgeError as error:
+        if "manifest is missing" not in str(error):
+            raise
+        bootstrap.parent.mkdir(parents=True, exist_ok=True)
+        if bootstrap.exists():
+            probe = git(
+                bootstrap,
+                "rev-parse",
+                "--is-bare-repository",
+                check=False,
             )
-        else:
-            raise ForgeError("projected ref changed outside synchronization")
-    checkpoint(root, "projection.ref_published")
-    view["anchors"].update(plan["anchors"])
-    for projected_oid, anchor in plan["anchors"].items():
-        if anchor["change_id"]:
-            record_change_representation(
-                state,
-                anchor["change_id"],
-                name,
-                projected_oid,
-                anchor["canonical"],
-                "synthetic",
-                anchor["descriptor_id"],
-                anchor["descriptor_generation"],
+            if probe.returncode or probe.stdout.decode().strip() != "true":
+                shutil.rmtree(bootstrap, ignore_errors=True)
+        if not bootstrap.exists():
+            run("git", "clone", "--bare", "--no-local", str(source), str(bootstrap))
+        if output(bootstrap, "rev-parse", "--show-object-format") != "sha1":
+            raise ForgeError("this experiment currently supports SHA-1 repositories only")
+        canonical_tip = ref(bootstrap, canonical_ref)
+        if canonical_tip == ZERO_OID:
+            raise ForgeError(f"source has no branch named {branch}")
+        pack = build_full_ref_pack(bootstrap, canonical_ref)
+        try:
+            claims: dict[str, dict] = {}
+            from git import commit_message, first_parent_commits
+
+            for oid in first_parent_commits(bootstrap, ZERO_OID, canonical_tip):
+                change_id = parse_change_id(commit_message(bootstrap, oid))
+                if change_id:
+                    claims[change_id] = {
+                        "change_id": change_id,
+                        "owner_principal_id": None,
+                        "canonical_ref": canonical_ref,
+                    }
+            pack_ref = pack.reference("packs/canonical")
+            payload = {
+                "canonical_ref": canonical_ref,
+                "canonical_tip": canonical_tip,
+                "canonical_pack": pack_ref,
+                "change_claims": [claims[key] for key in sorted(claims)],
+            }
+            repository.bootstrap(
+                Candidate(
+                    record_fingerprint(repository_id, "import", payload),
+                    payload,
+                    (lambda target: upload_pack(target, "packs/canonical", pack),),
+                )
             )
-    view["projected_tip"] = plan["new_tip"]
-    view["canonical_frontier"] = plan["new_frontier"]
-    repair_intake_mirror(root, state, name)
+        finally:
+            pack.cleanup()
+        manifest, _version, _replay = repository.load()
+    if manifest.canonical_ref != canonical_ref:
+        raise ForgeError("initialized manifest branch differs from requested branch", "integrity")
+    ensure_canonical_materialized(root, manifest, repository)
+    staging = root / "admin-staging.git"
+    if not staging.is_dir():
+        run("git", "init", "--bare", "-q", "-b", branch, str(staging))
+    shutil.rmtree(bootstrap, ignore_errors=True)
+    state = load_state(root)
+    if state.get("repository_id") != repository_id:
+        raise ForgeError("initialization repository ID fence is inconsistent", "integrity")
+    state["repository_state"] = "ready"
+    save_state(root, state)
 
 
 def _catalog_operation(root: Path, operation) -> None:
@@ -367,12 +232,11 @@ def add_view(
     name: str,
     principal_id: str,
     branch: str,
-    entrypoint: Path,
 ) -> None:
     validate_view_name(name)
     with locked(root) as state:
-        if name in state["views"]:
-            raise ForgeError(f"view already exists: {name}")
+        if state.get("repository_state") != "ready":
+            raise ForgeError("forge initialization is incomplete")
         if branch != state["canonical_branch"]:
             raise ForgeError(
                 "this experiment supports the configured canonical branch only"
@@ -387,45 +251,46 @@ def add_view(
             )
         if not descriptor["capabilities"]["read"]:
             raise ForgeError("principal has no effective readable path")
-        destination = view_repo(root, name)
-        existed_before = destination.exists()
-        intake_existed_before = intake_repo(root, name).exists()
-        run("git", "init", "--bare", "-q", "-b", branch, str(destination))
-        try:
-            for key, value in (
-                ("receive.denyDeletes", "true"),
-                ("receive.denyNonFastForwards", "true"),
-                ("uploadpack.allowAnySHA1InWant", "false"),
-                ("uploadpack.allowReachableSHA1InWant", "false"),
-                ("uploadpack.allowTipSHA1InWant", "false"),
-            ):
-                git(destination, "config", key, value)
-            initialize_intake_repo(root, name, branch)
-            state["views"][name] = {
-                "principal_id": principal_id,
-                "descriptor_id": descriptor["id"],
-                "descriptor_generation": 1,
-                "canonical_ref": f"refs/heads/{branch}",
-                "projected_ref": f"refs/heads/{branch}",
-                "canonical_frontier": ZERO_OID,
-                "projected_tip": ZERO_OID,
-                "anchors": {},
-            }
-            install_hooks(root, name, entrypoint)
-            sync_view_locked(root, state, name)
-        except Exception:
-            if not existed_before:
-                shutil.rmtree(destination, ignore_errors=True)
-            if not intake_existed_before:
-                shutil.rmtree(intake_repo(root, name), ignore_errors=True)
-            raise
         save_state(root, state)
+    repository = Repository.open(root)
+    repository.put_descriptor(descriptor)
+
+    def build(manifest, replay):
+        existing = replay.active_views.get(name)
+        desired = {
+            "principal_id": principal_id,
+            "projected_ref": f"refs/heads/{branch}",
+            "descriptor_id": descriptor["id"],
+            "descriptor_generation": 1,
+            "projection_epoch": 1,
+        }
+        if existing is not None:
+            if all(existing[key] == value for key, value in desired.items()):
+                return AlreadyCommitted(existing["epoch_start_seq"])
+            raise ForgeError(f"view already exists: {name}")
+        payload = {
+            "view_id": name,
+            **desired,
+            "canonical_frontier": manifest.canonical_tip,
+        }
+        return Candidate(
+            record_fingerprint(repository.repository_id, "view_create", payload), payload
+        )
+
+    repository.publish(build)
+    manifest, _version, replay = repository.load()
+    materialized = ensure_view_materialized(root, name, manifest, replay, repository)
+    ensure_intake_materialized(root, materialized)
 
 
 def sync_view(root: Path, name: str) -> None:
-    with locked(root) as state:
-        sync_view_locked(root, state, name)
-        save_state(root, state)
+    state = load_state(root)
+    if state.get("repository_state") != "ready":
+        raise ForgeError("forge initialization is incomplete")
+    repository = Repository.open(root)
+    manifest, _version, replay = repository.load()
+    materialized = ensure_view_materialized(root, name, manifest, replay, repository)
+    ensure_intake_materialized(root, materialized)
 
 
 def validate_canonical_update(canonical: Path, expected: str, new: str) -> None:
@@ -444,16 +309,6 @@ def validate_canonical_update(canonical: Path, expected: str, new: str) -> None:
         for _path, (mode, kind, _oid) in tree_entries(canonical, commit_oid).items():
             if mode not in ALLOWED_MODES or kind != b"blob":
                 raise ForgeError("canonical update contains an unsupported tree entry")
-
-
-def current_target_assignments(state: dict) -> dict[str, dict]:
-    return {
-        name: {
-            "descriptor_id": view["descriptor_id"],
-            "descriptor_generation": view["descriptor_generation"],
-        }
-        for name, view in sorted(state["views"].items())
-    }
 
 
 def _changed_paths_between(canonical: Path, expected: str, new: str) -> set[bytes]:
@@ -479,116 +334,117 @@ def require_admin_coverage(
             )
 
 
-def update_canonical_ref_locked(
-    root: Path,
-    state: dict,
-    expected: str,
-    new: str,
-    create_event: bool,
-    acting_principal_id: str | None = None,
-) -> None:
-    canonical = canonical_repo(root)
+def update_canonical_ref(root: Path, expected: str, new: str, principal_id: str) -> None:
+    """Publish an administrative fast-forward from disposable staging input."""
+    state = load_state(root)
+    if state.get("repository_state") != "ready":
+        raise ForgeError("forge initialization is incomplete")
+    repository = Repository.open(root)
     canonical_ref = f"refs/heads/{state['canonical_branch']}"
-    actual = ref(canonical, canonical_ref)
-    if actual != expected:
-        raise ForgeError("canonical ref changed before administrative update")
-    validate_canonical_update(canonical, expected, new)
-    if create_event:
-        if not acting_principal_id:
-            raise ForgeError("administrative updates require an acting principal")
-        require_admin_coverage(state, acting_principal_id, canonical, expected, new)
-    transaction = None
-    if create_event:
-        sequence = state.setdefault("next_transaction_sequence", 1)
-        state["next_transaction_sequence"] = sequence + 1
-        transaction_id = f"canonical:{sequence}:{new}"
-        transaction = {
-            "id": transaction_id,
-            "kind": "canonical_update",
-            "principal_id": acting_principal_id,
-            "sequence": sequence,
+    fingerprint_payload = {
+        "principal_id": principal_id,
+        "canonical_ref": canonical_ref,
+        "canonical_old": expected,
+        "canonical_new": new,
+    }
+    wanted_fingerprint = record_fingerprint(
+        repository.repository_id, "canonical_update", fingerprint_payload
+    )
+
+    def build(manifest, replay):
+        existing = replay.events.get(event_id(wanted_fingerprint))
+        if existing is not None:
+            return AlreadyCommitted(existing["seq"])
+        if manifest.canonical_tip != expected:
+            raise ForgeError("canonical ref changed before administrative update", "conflict")
+        canonical = ensure_canonical_materialized(root, manifest, repository)
+        staging = root / "admin-staging.git"
+        if not staging.is_dir():
+            run("git", "init", "--bare", "-q", "-b", state["canonical_branch"], str(staging))
+        info = staging / "objects" / "info"
+        info.mkdir(parents=True, exist_ok=True)
+        (info / "alternates").write_text(f"{(canonical / 'objects').resolve()}\n")
+        validate_canonical_update(staging, expected, new)
+        require_admin_coverage(state, principal_id, staging, expected, new)
+        from git import commit_message, first_parent_commits
+
+        commits = [
+            {
+                "canonical": oid,
+                "change_id": parse_change_id(commit_message(staging, oid)),
+            }
+            for oid in first_parent_commits(staging, expected, new)
+        ]
+        from artifacts import build_canonical_pack
+
+        pack = build_canonical_pack(staging, expected, new, clean_env())
+        pack_ref = pack.reference("packs/canonical")
+        payload = {
+            "principal_id": principal_id,
             "canonical_ref": canonical_ref,
             "canonical_old": expected,
             "canonical_new": new,
-            "target_descriptors": current_target_assignments(state),
-            "pending_views": sorted(state["views"]),
-            "status": "prepared",
+            "canonical_pack": pack_ref,
+            "commits": commits,
         }
-        state["transactions"][transaction_id] = transaction
-        save_state(root, state)
-        checkpoint(root, "admin.prepared_persisted")
-    git(canonical, "update-ref", canonical_ref, new, expected)
-    checkpoint(root, "admin.canonical_ref_published")
-    if transaction:
-        from outbox import enqueue_canonical_committed
 
-        enqueue_canonical_committed(state, transaction, ready=True)
-        transaction["status"] = (
-            "fanout_pending" if transaction["pending_views"] else "published"
-        )
-        save_state(root, state)
-        checkpoint(root, "admin.canonical_state_persisted")
+        def upload(target: Repository) -> None:
+            upload_pack(target, "packs/canonical", pack)
+            checkpoint(root, "wal.canonical_pack_uploaded")
 
+        return Candidate(wanted_fingerprint, payload, (upload,), pack.cleanup)
 
-def update_canonical_ref(root: Path, expected: str, new: str, principal_id: str) -> None:
-    """Serialize and enqueue an administrative canonical fast-forward."""
-    with locked(root) as state:
-        update_canonical_ref_locked(
-            root, state, expected, new, create_event=True, acting_principal_id=principal_id
-        )
+    repository.publish(build)
 
 
 def transition_principal(root: Path, principal_id: str) -> None:
-    """Apply a quiescent policy transition for every view of one principal."""
+    """Publish one epoch transition for every active view of a principal."""
     with locked(root) as state:
-        require_quiescent(root, state)
+        if state.get("repository_state") != "ready":
+            raise ForgeError("forge initialization is incomplete")
         identity.validate_identifier(principal_id)
         if principal_id not in state["principals"]:
             raise ForgeError(f"unknown principal: {principal_id}")
-        names = sorted(
-            name
-            for name, view in sorted(state["views"].items())
-            if view["principal_id"] == principal_id
-        )
-        if not names:
-            raise ForgeError("principal has no views to transition")
-        assignments = {state["views"][name]["descriptor_id"] for name in names}
-        generations = {state["views"][name]["descriptor_generation"] for name in names}
-        if len(assignments) != 1 or len(generations) != 1:
-            raise ForgeError("principal views disagree on their descriptor assignment")
         fresh = identity.effective_descriptor(
             state, principal_id, f"refs/heads/{state['canonical_branch']}"
         )
-        current_id = next(iter(assignments))
-        if current_id == fresh["id"]:
-            return
-        generation = next(iter(generations)) + 1
-        canonical = canonical_repo(root)
-        checkpoint(root, "transition.prepared")
-        for name in names:
-            view = state["views"][name]
-            destination = view_repo(root, name)
-            tip = view["projected_tip"]
-            frontier = view["canonical_frontier"]
-            if tip != ZERO_OID and frontier != ZERO_OID:
-                new_tree = project_tree(canonical, destination, frontier, fresh)
-                old_tree = tree_oid(destination, tip)
-                if new_tree != old_tree:
-                    commit = synthetic_commit(
-                        canonical, destination, frontier, new_tree, tip, None
-                    )
-                    git(destination, "update-ref", view["projected_ref"], commit, tip)
-                    checkpoint(root, "transition.ref_published")
-                    view["anchors"][commit] = {
-                        "canonical": frontier,
-                        "kind": "synthetic",
-                        "change_id": None,
-                        "descriptor_id": fresh["id"],
-                        "descriptor_generation": generation,
-                    }
-                    view["projected_tip"] = commit
-            view["descriptor_id"] = fresh["id"]
-            view["descriptor_generation"] = generation
-            repair_intake_mirror(root, state, name)
         save_state(root, state)
-        checkpoint(root, "transition.state_persisted")
+    repository = Repository.open(root)
+    repository.put_descriptor(fresh)
+
+    def build(manifest, replay):
+        active = sorted(
+            (view_id, view)
+            for view_id, view in replay.active_views.items()
+            if view["principal_id"] == principal_id
+        )
+        if not active:
+            raise ForgeError("principal has no views to transition")
+        if all(view["descriptor_id"] == fresh["id"] for _name, view in active):
+            return AlreadyCommitted(manifest.head_seq)
+        payload = {
+            "principal_id": principal_id,
+            "canonical_frontier": manifest.canonical_tip,
+            "views": [
+                {
+                    "view_id": name,
+                    "old_descriptor_id": view["descriptor_id"],
+                    "old_generation": view["descriptor_generation"],
+                    "old_projection_epoch": view["projection_epoch"],
+                    "new_descriptor_id": fresh["id"],
+                    "new_generation": view["descriptor_generation"] + 1,
+                    "new_projection_epoch": view["projection_epoch"] + 1,
+                }
+                for name, view in active
+            ],
+        }
+        return Candidate(
+            record_fingerprint(repository.repository_id, "policy_transition", payload), payload
+        )
+
+    repository.publish(build)
+    manifest, _version, replay = repository.load()
+    for name, view in sorted(replay.active_views.items()):
+        if view["principal_id"] == principal_id:
+            materialized = ensure_view_materialized(root, name, manifest, replay, repository)
+            ensure_intake_materialized(root, materialized)

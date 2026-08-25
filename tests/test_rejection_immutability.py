@@ -7,7 +7,7 @@ This module covers the roadmap item:
 > Verify every rejected operation leaves authoritative refs and mappings unchanged.
 
 For each rejection category the harness captures the authoritative snapshot
-before the operation (``state.json`` bytes, all canonical and view refs, receiver
+before the operation (control-plane bytes, all canonical and view refs, receiver
 markers, logical changes, and mappings) and requires it to be identical after
 the rejection.  Every rejected stable checkpoint must also pass the global
 invariant checker.
@@ -24,7 +24,7 @@ from pathlib import Path
 import forge
 from tests import identity_harness
 from errors import ForgeError
-from state import locked
+from state import load_state, locked, save_state
 from tests.tree_harness import TreeFixture, build_commit, clean_environment, command, empty_subtree_commit, git, gitlink_commit, oid, tree_at
 from tests.storage_helpers import document_bytes, read_document
 from tests.transport import attach_intake_push
@@ -401,50 +401,45 @@ class SyncBarrierImmutabilityTest(unittest.TestCase):
         with locked(self.forge) as state:
             pass
 
-    def test_sync_rejects_active_receive(self) -> None:
-        """Sync rejects an active receive transaction and leaves state unchanged."""
-        old = git(self.alice_remote, "rev-parse", "refs/heads/main").stdout.decode("ascii").strip()
+    def test_sync_rebuilds_a_missing_source_cache_from_wal(self) -> None:
+        """Committed source evidence, not a local ref, reconstructs the source."""
         (self.alice / "shared" / "active.txt").write_text("active\n")
         new = self._commit(self.alice, "active receive", 1_700_000_100)
-        forge.run("git", "--git-dir", os.fsdecode(self.alice_remote), "fetch", "-q", os.fsdecode(self.alice), new)
-        forge.pre_receive(self.forge, "alice", f"{old} {new} refs/heads/main\n".encode())
-        # Recreate the crash window: canonical committed, source unpublished.
-        forge.git(self.alice_remote, "update-ref", "refs/heads/main", old)
-        self._recover()
-        before = self._rejection_snapshot()
-        with self.assertRaisesRegex(ForgeError, "active receive transaction"):
-            forge.sync_view(self.forge, "alice")
-        self._assert_rejection(before)
+        command("git", "-C", self.alice, "push", "-q", "origin", "main")
+        self.alice_remote.unlink()
 
-    def test_sync_rejects_unconfirmed_source(self) -> None:
-        """Sync rejects while another view has an unconfirmed source publication."""
-        old = git(self.alice_remote, "rev-parse", "refs/heads/main").stdout.decode("ascii").strip()
+        forge.sync_view(self.forge, "alice")
+
+        self.assertEqual(new, forge.ref(self.alice_remote, "refs/heads/main"))
+        forge.check_invariants(self.forge)
+
+    def test_sync_of_another_view_does_not_need_source_confirmation(self) -> None:
+        """WAL commitment is sufficient for independent view reconstruction."""
         (self.alice / "team-a" / "unconfirmed.txt").write_text("unconfirmed\n")
-        new = self._commit(self.alice, "unconfirmed source", 1_700_000_100)
-        forge.run("git", "--git-dir", os.fsdecode(self.alice_remote), "fetch", "-q", os.fsdecode(self.alice), new)
-        forge.pre_receive(self.forge, "alice", f"{old} {new} refs/heads/main\n".encode())
-        # Rewind the source publication so recovery classifies it unconfirmed.
-        forge.git(self.alice_remote, "update-ref", "refs/heads/main", old)
-        transaction = next(iter(self._state()["transactions"].values()))
-        (self.forge / "receivers" / transaction["id"]).unlink(missing_ok=True)
-        self._recover()
-        before = self._rejection_snapshot()
-        with self.assertRaisesRegex(ForgeError, "unconfirmed source publication"):
-            forge.sync_view(self.forge, "bob")
-        self._assert_rejection(before)
+        self._commit(self.alice, "committed source", 1_700_000_100)
+        command("git", "-C", self.alice, "push", "-q", "origin", "main")
+        self.alice_remote.unlink()
 
-    def test_sync_rejects_unfinished_projection_work(self) -> None:
-        """Sync rejects when the selected view has unfinished projection work."""
-        old = git(self.alice_remote, "rev-parse", "refs/heads/main").stdout.decode("ascii").strip()
+        forge.sync_view(self.forge, "bob")
+
+        self.assertTrue(self.bob_remote.is_symlink())
+        forge.check_invariants(self.forge)
+
+    def test_sync_ignores_projection_job_hints(self) -> None:
+        """Missing scheduler rows cannot block synchronous materialization."""
         (self.alice / "shared" / "pending.txt").write_text("pending\n")
-        new = self._commit(self.alice, "pending projection", 1_700_000_100)
-        forge.run("git", "--git-dir", os.fsdecode(self.alice_remote), "fetch", "-q", os.fsdecode(self.alice), new)
-        forge.pre_receive(self.forge, "alice", f"{old} {new} refs/heads/main\n".encode())
-        self._recover()
-        before = self._rejection_snapshot()
-        with self.assertRaisesRegex(ForgeError, "pending projection work"):
-            forge.sync_view(self.forge, "bob")
-        self._assert_rejection(before)
+        self._commit(self.alice, "pending projection", 1_700_000_100)
+        command("git", "-C", self.alice, "push", "-q", "origin", "main")
+        state = load_state(self.forge)
+        state["projection_jobs"] = {}
+        save_state(self.forge, state)
+
+        forge.sync_view(self.forge, "bob")
+
+        self.assertEqual(
+            b"pending\n",
+            forge.git(self.bob_remote, "show", "main:shared/pending.txt").stdout,
+        )
 
 
 if __name__ == "__main__":

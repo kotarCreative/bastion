@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI and compatibility facade for the Bastion experimental Git forge."""
+"""CLI for the Bastion experimental Git forge."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from errors import ForgeError
 from invariants import check_invariants
 from git import git, output, ref, run
 from layout import ZERO_OID, canonical_repo, view_repo
-from protocol import hook_pre_receive, post_receive, pre_receive
+from protocol import hook_pre_receive, pre_receive
 from service import (
     add_principal as _add_principal,
     add_role as _add_role,
@@ -24,12 +24,10 @@ from service import (
     add_view as _add_view,
     bind_role as _bind_role,
     init_forge,
-    migrate_storage,
     sync_view,
     transition_principal,
     update_canonical_ref,
 )
-from state import save_state
 from worker import (
     cancel_projection_job,
     drain_projection_jobs,
@@ -40,7 +38,7 @@ from worker import (
 def add_view(
     root: Path, name: str, principal: str, branch: str
 ) -> None:
-    _add_view(root, name, principal, branch, Path(__file__))
+    _add_view(root, name, principal, branch)
 
 
 def new_change_id() -> str:
@@ -71,6 +69,11 @@ def parser() -> argparse.ArgumentParser:
     init.add_argument(
         "--database",
         help="storage backend URI: sqlite (default) or postgres://...",
+    )
+    init.add_argument(
+        "--object-store",
+        default="filesystem",
+        help="object store: filesystem (default) or filesystem:PATH",
     )
     principal = commands.add_parser("add-principal")
     principal.add_argument("root", type=Path)
@@ -121,9 +124,6 @@ def parser() -> argparse.ArgumentParser:
     pre = commands.add_parser("pre-receive")
     pre.add_argument("root", type=Path)
     pre.add_argument("name")
-    post = commands.add_parser("post-receive")
-    post.add_argument("root", type=Path)
-    post.add_argument("name")
     token_command = commands.add_parser("add-token")
     token_command.add_argument("root", type=Path)
     token_command.add_argument("view")
@@ -133,12 +133,6 @@ def parser() -> argparse.ArgumentParser:
     serve.add_argument("--port", type=int, default=8000)
     stats = commands.add_parser("stats")
     stats.add_argument("root", type=Path)
-    migrate = commands.add_parser("migrate-storage")
-    migrate.add_argument("root", type=Path)
-    migrate.add_argument(
-        "--database",
-        help="target storage backend URI: sqlite (default) or postgres://...",
-    )
     backup = commands.add_parser("backup")
     backup.add_argument("root", type=Path)
     backup.add_argument("destination", type=Path)
@@ -168,7 +162,7 @@ def main() -> int:
     args = parser().parse_args()
     try:
         if args.command == "init":
-            init_forge(args.root, args.source, args.branch, args.database)
+            init_forge(args.root, args.source, args.branch, args.database, args.object_store)
         elif args.command == "add-principal":
             _add_principal(args.root, args.principal, args.email)
         elif args.command == "add-service-account":
@@ -205,8 +199,6 @@ def main() -> int:
             raise SystemExit(
                 hook_pre_receive(args.root, args.name, sys.stdin.buffer.read())
             )
-        elif args.command == "post-receive":
-            post_receive(args.root, args.name, sys.stdin.buffer.read())
         elif args.command == "add-token":
             from http_server import add_token
 
@@ -225,8 +217,6 @@ def main() -> int:
                 print(_json.dumps(store.stats(), indent=2, sort_keys=True))
             finally:
                 store.close()
-        elif args.command == "migrate-storage":
-            migrate_storage(args.root, args.database)
         elif args.command == "backup":
             from store import backup_forge
 

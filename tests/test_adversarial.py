@@ -213,7 +213,7 @@ class AdversarialPushTest(unittest.TestCase):
             "REFS/heads/main",
             "refs/heads/main/nested",
             "refs/heads/alice",
-            "refs/tags/v1",
+            "refs/tags/release",
             "refs/heads/main ",
         ):
             before = self.fixture.rejection_snapshot()
@@ -351,15 +351,6 @@ class AdversarialPushTest(unittest.TestCase):
                 for line in message.split(b"\n"):
                     if line.startswith(b"Change-Id: "):
                         self.assertNotIn(line[len(b"Change-Id: "):].decode(), claimed)
-
-    # -- replay and desync ------------------------------------------------
-
-    def test_post_receive_unknown_transaction_is_inert(self) -> None:
-        before = self.fixture.rejection_snapshot()
-        with patch.dict(os.environ, clean_environment(), clear=True):
-            forge.post_receive(self.fixture.root, "alice", update_line("1" * 40, "2" * 40))
-        self.fixture.assert_rejection(before)
-
 
 class AdversarialHttpWireTest(unittest.TestCase):
     def setUp(self) -> None:

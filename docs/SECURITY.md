@@ -178,7 +178,7 @@ bodies, and non-uniform error timing.
 The following are not production-proven:
 
 - SSH transport and production HTTP identity (TLS, principals, rate limits);
-- protocol v0/v1 configuration;
+- older Git wire-protocol configuration;
 - shallow and partial clone;
 - thin packs and delta-base confidentiality;
 - Git LFS authorization;

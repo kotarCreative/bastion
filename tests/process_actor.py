@@ -19,7 +19,7 @@ from worker import run_projection_job
 def main(argv: list[str]) -> int:
     if len(argv) < 2:
         print(
-            "usage: process_actor.py {worker|recover|state-save|fail} ROOT ...",
+            "usage: process_actor.py {worker|recover|fail} ROOT ...",
             file=sys.stderr,
         )
         return 2
@@ -37,19 +37,6 @@ def main(argv: list[str]) -> int:
             return 2
         with locked(root):
             pass
-        return 0
-    if command == "state-save":
-        if len(argv) != 3:
-            print("usage: process_actor.py state-save ROOT VALUE", file=sys.stderr)
-            return 2
-        value = int(argv[2])
-        with locked(root, recoverer=lambda _root, _state: None) as state:
-            state["next_transaction_sequence"] = (
-                state.get("next_transaction_sequence", 1) + value
-            )
-            from state import save_state
-
-            save_state(root, state)
         return 0
     if command == "fail":
         if len(argv) != 5:

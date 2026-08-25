@@ -333,11 +333,13 @@ class SshShimTest(unittest.TestCase):
         )
         self.assertEqual(0, result.returncode, result.stderr.decode())
         self.assertIn(b"ok refs/heads/main", result.stdout)
+        forge.sync_view(self.fixture.forge, "alice")
         view_tip = forge.ref(view_repo(self.fixture.forge, "alice"),
                              "refs/heads/main")
         self.assertEqual(new, view_tip)
-        canonical_tip = forge.ref(forge.canonical_repo(self.fixture.forge),
-                                  "refs/heads/main")
+        from tests.storage_helpers import repository_state
+
+        canonical_tip = repository_state(self.fixture.forge)[0].canonical_tip
         self.assertNotEqual(canonical_tip, view_tip)
         intake_tip = forge.git(intake_repo(self.fixture.forge, "alice"),
                                "rev-parse", "refs/heads/main").stdout.decode().strip()

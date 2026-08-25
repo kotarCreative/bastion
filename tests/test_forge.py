@@ -8,8 +8,10 @@ import unittest
 from pathlib import Path
 
 import forge
+from materialization import ensure_canonical_materialized
+from repository import Repository
 from tests import identity_harness
-from tests.storage_helpers import document_bytes, read_document
+from tests.storage_helpers import submission_record
 from tests.transport import attach_intake_push
 
 
@@ -57,6 +59,7 @@ class ForgeTest(unittest.TestCase):
 
         self.forge = self.root / "forge"
         forge.init_forge(self.forge, self.source, "main")
+        self.admin_principal = identity_harness.provision_admin(self.forge)
         identity_harness.add_view(self.forge, "alice", ["visible"], ["visible"], "main")
         self.remote = forge.view_repo(self.forge, "alice")
         self.alice = self.root / "alice"
@@ -69,24 +72,28 @@ class ForgeTest(unittest.TestCase):
         self.temporary.cleanup()
 
     def canonical_tip(self) -> str:
-        return forge.ref(forge.canonical_repo(self.forge), "refs/heads/main")
+        return Repository.open(self.forge).load()[0].canonical_tip
 
     def remote_tip(self) -> str:
         return forge.ref(self.remote, "refs/heads/main")
 
-    def state(self) -> dict:
-        return read_document(self.forge)
-
     def admin_change(self, path: str, contents: str, message: str, timestamp: int) -> str:
+        repository = Repository.open(self.forge)
+        manifest, _version, _replay = repository.load()
+        ensure_canonical_materialized(self.forge, manifest, repository)
         admin = self.root / f"admin-{timestamp}"
         command("git", "clone", "-q", str(forge.canonical_repo(self.forge)), str(admin))
+        identity_harness.attach_admin_push(self.forge, admin)
         git(admin, "config", "user.name", "Admin")
         git(admin, "config", "user.email", "admin@example.test")
         target = admin / path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(contents)
         oid = commit(admin, message, timestamp)
-        git(admin, "push", "-q", "origin", "main")
+        git(admin, "push", "-q", "origin", f"{oid}:refs/staging/admin-{timestamp}")
+        identity_harness.update_canonical(
+            self.forge, manifest.canonical_tip, oid, self.admin_principal
+        )
         return oid
 
     def test_accepted_commits_remain_exact_projected_tip(self) -> None:
@@ -96,20 +103,24 @@ class ForgeTest(unittest.TestCase):
         change_id = "I1111111111111111111111111111111111111111"
         submitted = commit(self.alice, f"alice change\n\nChange-Id: {change_id}", 1_700_000_200)
         git(self.alice, "push", "-q", "origin", "main")
+        forge.sync_view(self.forge, "alice")
 
         self.assertNotEqual(initial, submitted)
         self.assertEqual(submitted, self.remote_tip())
         self.assertNotEqual(submitted, self.canonical_tip())
         self.assertEqual(submitted, git(self.alice, "rev-parse", "origin/main").stdout.strip())
-        revision = self.state()["changes"][change_id]["revisions"][0]
-        self.assertEqual(submitted, revision["submitted"])
-        self.assertEqual(self.canonical_tip(), revision["canonical"])
+        mapping = submission_record(
+            self.forge, "alice", initial, submitted
+        )["payload"]["mappings"][0]
+        self.assertEqual(submitted, mapping["submitted"])
+        self.assertEqual(self.canonical_tip(), mapping["canonical"])
 
         (self.alice / "visible" / "second.txt").write_text("second\n")
         commit(self.alice, "first commit in second push", 1_700_000_300)
         (self.alice / "visible" / "third.txt").write_text("third\n")
         second = commit(self.alice, "second commit in second push", 1_700_000_310)
         git(self.alice, "push", "-q", "origin", "main")
+        forge.sync_view(self.forge, "alice")
         self.assertEqual(second, self.remote_tip())
 
     def test_projection_object_database_excludes_hidden_blob(self) -> None:
@@ -139,6 +150,7 @@ class ForgeTest(unittest.TestCase):
         (self.alice / "visible" / "file.txt").write_text("alice after hidden\n")
         submitted = commit(self.alice, "works over hidden advancement", 1_700_000_500)
         git(self.alice, "push", "-q", "origin", "main")
+        forge.sync_view(self.forge, "alice")
         self.assertEqual(submitted, self.remote_tip())
         secret = forge.git(forge.canonical_repo(self.forge), "show", "main:hidden/secret.txt").stdout
         self.assertEqual(b"secret 3\n", secret)
@@ -151,7 +163,7 @@ class ForgeTest(unittest.TestCase):
 
         rejected = git(self.alice, "push", "origin", "main", check=False)
         self.assertNotEqual(0, rejected.returncode)
-        self.assertIn("visible history advanced", rejected.stderr)
+        self.assertIn("stale or force updates", rejected.stderr)
 
     def test_visible_advancement_requires_fetch_and_rebase(self) -> None:
         change_id = "I2222222222222222222222222222222222222222"
@@ -161,16 +173,23 @@ class ForgeTest(unittest.TestCase):
 
         rejected = git(self.alice, "push", "origin", "main", check=False)
         self.assertNotEqual(0, rejected.returncode)
-        self.assertIn("visible history advanced", rejected.stderr)
+        self.assertIn("stale or force updates", rejected.stderr)
         forge.sync_view(self.forge, "alice")
         git(self.alice, "fetch", "-q", "origin")
         git(self.alice, "rebase", "origin/main")
         rewritten = git(self.alice, "rev-parse", "HEAD").stdout.strip()
         self.assertNotEqual(original, rewritten)
         git(self.alice, "push", "-q", "origin", "main")
+        forge.sync_view(self.forge, "alice")
         self.assertEqual(rewritten, self.remote_tip())
         self.assertIn(f"Change-Id: {change_id}", git(self.alice, "show", "-s", "--format=%B").stdout)
-        self.assertEqual(rewritten, self.state()["changes"][change_id]["revisions"][0]["submitted"])
+        record = next(
+            record
+            for record in Repository.open(self.forge).load()[2].records
+            if record["kind"] == "submission"
+            and any(mapping["change_id"] == change_id for mapping in record["payload"]["mappings"])
+        )
+        self.assertEqual(rewritten, record["payload"]["mappings"][0]["submitted"])
 
     def test_unauthorized_second_commit_rejects_entire_push(self) -> None:
         canonical_before = self.canonical_tip()
@@ -195,8 +214,7 @@ class ForgeTest(unittest.TestCase):
         self.assertIn("branch update is not authorized", rejected.stderr)
         self.assertEqual(forge.ZERO_OID, forge.ref(self.remote, "refs/heads/other"))
 
-    def test_recovery_finishes_canonical_committed_transaction(self) -> None:
-        projected_old = self.remote_tip()
+    def test_source_cache_is_reconstructed_from_submission_evidence(self) -> None:
         (self.alice / "visible" / "recover.txt").write_text("recover\n")
         submitted = commit(
             self.alice,
@@ -204,43 +222,18 @@ class ForgeTest(unittest.TestCase):
             1_700_001_050,
         )
         git(self.alice, "push", "-q", "origin", "main")
-        state = self.state()
-        transaction = next(iter(state["transactions"].values()))
+        self.remote.unlink()
 
-        forge.git(self.remote, "update-ref", "refs/heads/main", projected_old, submitted)
-        transaction["status"] = "prepared"
-        view = state["views"]["alice"]
-        view["canonical_frontier"] = transaction["canonical_old"]
-        view["projected_tip"] = projected_old
-        view["anchors"].pop(submitted)
-        state["changes"] = {}
-        (self.forge / "receivers" / transaction["id"]).unlink(missing_ok=True)
-        forge.save_state(self.forge, state)
+        forge.sync_view(self.forge, "alice")
 
-        recovered_ref = forge.ref(self.remote, "refs/heads/main")
-        forge.git(
-            self.remote,
-            "update-ref",
-            "refs/heads/main",
-            submitted,
-            recovered_ref,
-        )
-        forge.post_receive(
+        self.assertEqual(submitted, self.remote_tip())
+        record = submission_record(
             self.forge,
             "alice",
-            f"{projected_old} {submitted} refs/heads/main\n".encode(),
+            git(self.alice, "rev-parse", "HEAD^").stdout.strip(),
+            submitted,
         )
-        recovered = self.state()
-        self.assertEqual(submitted, self.remote_tip())
-        self.assertEqual("published", recovered["transactions"][transaction["id"]]["status"])
-        self.assertEqual(
-            transaction["canonical_new"],
-            recovered["views"]["alice"]["anchors"][submitted]["canonical"],
-        )
-        self.assertEqual(
-            1,
-            len(recovered["changes"]["I3333333333333333333333333333333333333333"]["revisions"]),
-        )
+        self.assertEqual(submitted, record["payload"]["projected_new"])
 
     def test_client_merge_is_rejected(self) -> None:
         git(self.alice, "checkout", "-q", "-b", "side")
@@ -272,11 +265,16 @@ class ForgeTest(unittest.TestCase):
         canonical = forge.canonical_repo(self.forge)
         admin = self.root / "admin-collision"
         command("git", "clone", "-q", str(canonical), str(admin))
+        identity_harness.attach_admin_push(self.forge, admin)
         git(admin, "config", "user.name", "Admin")
         git(admin, "config", "user.email", "admin@example.test")
         (admin / "container").write_text("hidden boundary\n")
-        commit(admin, "add hidden ancestor file", 1_700_001_300)
-        git(admin, "push", "-q", "origin", "main")
+        old = self.canonical_tip()
+        new = commit(admin, "add hidden ancestor file", 1_700_001_300)
+        git(admin, "push", "-q", "origin", f"{new}:refs/staging/collision")
+        identity_harness.update_canonical(
+            self.forge, old, new, self.admin_principal
+        )
 
         (collision / "container" / "visible").mkdir(parents=True, exist_ok=True)
         (collision / "container" / "visible" / "nested.txt").write_text("nested\n")

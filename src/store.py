@@ -1,11 +1,4 @@
-"""Durable document store with SQLite and PostgreSQL backends.
-
-Implements `.specs/009-production-transaction-storage.md`: every aggregate is
-a table of JSON documents carrying an optimistic `version` and a SHA-256
-`checksum`; sessions hold lease rows instead of filesystem locks; saves are
-short transactions guarded by version checks; backups, restore, idempotency
-records, audit entries, and observability snapshots live here.
-"""
+"""Durable control-plane store with SQLite and PostgreSQL backends."""
 
 from __future__ import annotations
 
@@ -13,6 +6,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import time
 import urllib.parse
 import uuid
@@ -20,7 +14,7 @@ from pathlib import Path
 
 from errors import ForgeError
 
-STORAGE_SCHEMA_VERSION = 1
+STORAGE_SCHEMA_VERSION = 2
 LEASE_TTL_SECONDS = 60.0
 LEASE_WAIT_SECONDS = 30.0
 LEASE_POLL_SECONDS = 0.05
@@ -34,7 +28,6 @@ DOCUMENT_TABLES = (
     "views",
     "transactions",
     "changes",
-    "outbox_events",
     "projection_jobs",
 )
 
@@ -47,7 +40,6 @@ _STATE_SECTIONS = {
     "views": "views",
     "transactions": "transactions",
     "changes": "changes",
-    "outbox": "outbox_events",
     "projection_jobs": "projection_jobs",
 }
 
@@ -89,9 +81,10 @@ def database_uri(root: Path, database: str | None = None) -> str:
 
 def _sqlite_ddl() -> list[str]:
     return [
-        """CREATE TABLE IF NOT EXISTS schema_migrations (
-            version INTEGER PRIMARY KEY,
-            applied_at REAL NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS storage_schema (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            version INTEGER NOT NULL,
+            initialized_at REAL NOT NULL)""",
         """CREATE TABLE IF NOT EXISTS storage_locks (
             scope TEXT PRIMARY KEY,
             owner TEXT NOT NULL,
@@ -107,12 +100,8 @@ def _sqlite_ddl() -> list[str]:
             kind TEXT NOT NULL,
             subject TEXT NOT NULL,
             detail TEXT NOT NULL,
-            at REAL NOT NULL)""",
-        """CREATE TABLE IF NOT EXISTS idempotency_keys (
-            key TEXT PRIMARY KEY,
-            fingerprint TEXT NOT NULL,
-            outcome TEXT NOT NULL,
-            recorded_at REAL NOT NULL)""",
+            at REAL NOT NULL,
+            event_id TEXT NULL)""",
     ] + [
         f"""CREATE TABLE IF NOT EXISTS {table} (
             key TEXT PRIMARY KEY,
@@ -125,9 +114,10 @@ def _sqlite_ddl() -> list[str]:
 
 def _postgres_ddl() -> str:
     statements = [
-        """CREATE TABLE IF NOT EXISTS schema_migrations (
-            version INTEGER PRIMARY KEY,
-            applied_at DOUBLE PRECISION NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS storage_schema (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            version INTEGER NOT NULL,
+            initialized_at DOUBLE PRECISION NOT NULL)""",
         """CREATE TABLE IF NOT EXISTS forge_meta (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             doc TEXT NOT NULL,
@@ -143,12 +133,8 @@ def _postgres_ddl() -> str:
             kind TEXT NOT NULL,
             subject TEXT NOT NULL,
             detail TEXT NOT NULL,
-            at DOUBLE PRECISION NOT NULL)""",
-        """CREATE TABLE IF NOT EXISTS idempotency_keys (
-            key TEXT PRIMARY KEY,
-            fingerprint TEXT NOT NULL,
-            outcome TEXT NOT NULL,
-            recorded_at DOUBLE PRECISION NOT NULL)""",
+            at DOUBLE PRECISION NOT NULL,
+            event_id TEXT NULL)""",
     ] + [
         f"""CREATE TABLE IF NOT EXISTS {table} (
             key TEXT PRIMARY KEY,
@@ -351,9 +337,9 @@ class _PostgresBackend:
         try:
             self.create_schema(connection)
             with connection.cursor() as cursor:
-                cursor.execute("DELETE FROM schema_migrations")
+                cursor.execute("DELETE FROM storage_schema")
                 cursor.execute(
-                    "INSERT INTO schema_migrations (version, applied_at) VALUES (%s, %s)",
+                    "INSERT INTO storage_schema (id, version, initialized_at) VALUES (1, %s, %s)",
                     (STORAGE_SCHEMA_VERSION, time.time()),
                 )
             self.commit(connection)
@@ -435,16 +421,23 @@ class Store:
         self.backend.begin(self.connection)
         try:
             self.backend.create_schema(self.connection)
-            rows = self._fetchall("SELECT version FROM schema_migrations", ())
+            rows = self._fetchall("SELECT version FROM storage_schema WHERE id = 1", ())
             versions = {row["version"] for row in rows}
             if not versions:
                 self._insert_placeholder_free(
-                    "INSERT INTO schema_migrations (version, applied_at)",
-                    (STORAGE_SCHEMA_VERSION, time.time()),
+                    "INSERT INTO storage_schema (id, version, initialized_at)",
+                    (1, STORAGE_SCHEMA_VERSION, time.time()),
                 )
                 self._save_table(
                     "forge_meta",
-                    {"__meta__": {"canonical_branch": None}},
+                    {
+                        "__meta__": {
+                            "canonical_branch": None,
+                            "repository_state": "initializing",
+                            "repository_id": None,
+                            "last_indexed_seq": 0,
+                        }
+                    },
                     id_column=True,
                 )
             elif versions != {STORAGE_SCHEMA_VERSION}:
@@ -452,6 +445,7 @@ class Store:
                 raise ForgeError(
                     f"storage schema version {found} is incompatible with this build"
                 )
+            self._ensure_indexes()
             self.backend.commit(self.connection)
         except ForgeError:
             self.backend.rollback(self.connection)
@@ -459,6 +453,13 @@ class Store:
         except Exception as error:
             self.backend.rollback(self.connection)
             raise ForgeError(f"cannot initialize storage schema: {error}") from error
+
+    def _ensure_indexes(self) -> None:
+        self._execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS audit_log_event_id "
+            "ON audit_log(event_id) WHERE event_id IS NOT NULL",
+            (),
+        )
 
     def _insert_placeholder_free(self, head: str, values: tuple) -> None:
         placeholders = ", ".join([self.backend.param] * len(values))
@@ -498,7 +499,7 @@ class Store:
         return self._cursor_rows(statement, parameters)
 
     def load_document(self) -> dict:
-        """Materialize the legacy nested state dict, verifying checksums."""
+        """Materialize the current control-plane document, verifying checksums."""
         self.backend.begin(self.connection)
         try:
             meta_rows = self._fetchall(
@@ -506,15 +507,18 @@ class Store:
             )
             if len(meta_rows) > 1:
                 raise ForgeError("forge meta table is corrupt")
-            document: dict = {}
-            if meta_rows:
-                meta = meta_rows[0]
-                parsed = json.loads(meta["doc"])
-                if _checksum(parsed) != meta["checksum"]:
-                    raise ForgeError("forge meta row failed its integrity checksum")
-                document.update(parsed)
-            document.setdefault("canonical_branch", None)
-            document.setdefault("next_transaction_sequence", 1)
+            if not meta_rows:
+                raise ForgeError("forge state is not initialized")
+            meta = meta_rows[0]
+            parsed = json.loads(meta["doc"])
+            if _checksum(parsed) != meta["checksum"]:
+                raise ForgeError("forge meta row failed its integrity checksum")
+            expected_meta = {
+                "canonical_branch", "repository_state", "repository_id", "last_indexed_seq"
+            }
+            if not isinstance(parsed, dict) or set(parsed) != expected_meta:
+                raise ForgeError("forge meta row has an invalid shape")
+            document: dict = dict(parsed)
             for section, table in _STATE_SECTIONS.items():
                 rows = self._fetchall(
                     f"SELECT key, doc, checksum FROM {table}", ()
@@ -531,7 +535,6 @@ class Store:
             if document.get("canonical_branch") is None:
                 raise ForgeError("forge state is not initialized")
             self.backend.rollback(self.connection)
-            return document
             return document
         except json.JSONDecodeError as error:
             self.backend.rollback(self.connection)
@@ -568,12 +571,15 @@ class Store:
                 )
                 if updated != 1:
                     raise ForgeError(f"storage lease lost: {scope}")
-            desired_meta = {
-                "canonical_branch": state.get("canonical_branch") or "",
-                "next_transaction_sequence": state.get(
-                    "next_transaction_sequence", 1
-                ),
+            required_meta = {
+                "canonical_branch", "repository_state", "repository_id", "last_indexed_seq"
             }
+            expected_fields = required_meta | set(_STATE_SECTIONS)
+            if set(state) != expected_fields:
+                raise ForgeError("forge state has an invalid shape")
+            desired_meta = {key: state[key] for key in required_meta}
+            if desired_meta["repository_state"] not in {"initializing", "ready"}:
+                raise ForgeError("forge repository state is invalid")
             self._save_table(
                 "forge_meta",
                 {"__meta__": desired_meta},
@@ -581,10 +587,7 @@ class Store:
                 baseline_section=(
                     {
                         "__meta__": {
-                            "canonical_branch": baseline.get("canonical_branch"),
-                            "next_transaction_sequence": baseline.get(
-                                "next_transaction_sequence", 1
-                            ),
+                            **{key: baseline[key] for key in required_meta},
                         }
                     }
                     if baseline is not None
@@ -800,63 +803,17 @@ class Store:
             self.backend.rollback(self.connection)
             raise ForgeError(f"cannot release storage lease: {error}") from error
 
-    # -- idempotency --------------------------------------------------------
-
-    def lookup_idempotency(self, key: str) -> dict | None:
-        row = self._fetchone(
-            "SELECT fingerprint, outcome FROM idempotency_keys WHERE key = "
-            f"{self.backend.param}",
-            (key,),
-        )
-        if row is None:
-            return None
-        return {
-            "fingerprint": json.loads(row["fingerprint"]),
-            "outcome": json.loads(row["outcome"]),
-        }
-
-    def record_idempotency(self, key: str, fingerprint: dict, outcome: dict) -> None:
-        self.backend.begin(self.connection)
-        try:
-            existing = self._fetchone(
-                "SELECT fingerprint FROM idempotency_keys WHERE key = "
-                f"{self.backend.param}",
-                (key,),
-            )
-            if existing is not None:
-                if json.loads(existing["fingerprint"]) != fingerprint:
-                    raise ForgeError(
-                        "idempotency key was already used for a different request"
-                    )
-                self.backend.commit(self.connection)
-                return
-            self._execute(
-                "INSERT INTO idempotency_keys (key, fingerprint, outcome, recorded_at) "
-                f"VALUES ({self.backend.param}, {self.backend.param}, {self.backend.param}, {self.backend.param})",
-                (
-                    key,
-                    json.dumps(fingerprint, sort_keys=True),
-                    json.dumps(outcome, sort_keys=True),
-                    time.time(),
-                ),
-            )
-            self.backend.commit(self.connection)
-        except ForgeError:
-            self.backend.rollback(self.connection)
-            raise
-        except Exception as error:
-            self.backend.rollback(self.connection)
-            raise ForgeError(f"cannot record idempotency key: {error}") from error
-
     # -- audit and observability --------------------------------------------
 
-    def audit(self, kind: str, subject: str, detail: str) -> None:
+    def audit(
+        self, kind: str, subject: str, detail: str, event_id: str | None = None
+    ) -> None:
         self.backend.begin(self.connection)
         try:
             self._execute(
-                "INSERT INTO audit_log (kind, subject, detail, at) VALUES "
-                f"({self.backend.param}, {self.backend.param}, {self.backend.param}, {self.backend.param})",
-                (kind, subject, detail, time.time()),
+                "INSERT INTO audit_log (kind, subject, detail, at, event_id) VALUES "
+                f"({self.backend.param}, {self.backend.param}, {self.backend.param}, {self.backend.param}, {self.backend.param})",
+                (kind, subject, detail, time.time(), event_id),
             )
             self.backend.commit(self.connection)
         except Exception as error:
@@ -865,7 +822,7 @@ class Store:
 
     def recent_audit(self, limit: int = 20) -> list[dict]:
         rows = self._fetchall(
-            "SELECT seq, kind, subject, detail, at FROM audit_log "
+            "SELECT seq, kind, subject, detail, at, event_id FROM audit_log "
             f"ORDER BY seq DESC LIMIT {int(limit)}",
             (),
         )
@@ -873,11 +830,19 @@ class Store:
 
     def stats(self) -> dict:
         counts: dict[str, dict[str, int]] = {}
-        for label, table in (("transactions", "transactions"), ("events", "outbox_events"), ("jobs", "projection_jobs")):
+        for label, table in (("transactions", "transactions"), ("jobs", "projection_jobs")):
             rows = self._fetchall(f"SELECT doc FROM {table}", ())
             bucket: dict[str, int] = {}
             for row in rows:
-                status = json.loads(row["doc"]).get("status", "?")
+                document = json.loads(row["doc"])
+                status = document.get("status")
+                if (
+                    status is None
+                    and label == "transactions"
+                    and document.get("committed") is True
+                ):
+                    status = "committed"
+                status = status or "?"
                 bucket[status] = bucket.get(status, 0) + 1
             counts[label] = dict(sorted(bucket.items()))
         leases = self._fetchall(
@@ -908,7 +873,7 @@ def open_store(root: Path) -> Store:
 
 
 def initialize_store(root: Path, database: str | None = None) -> Store:
-    """Create the backend record and empty schema for a fresh or migrated forge."""
+    """Create the backend record and current schema for a fresh forge."""
     uri = database_uri(root, database)
     if uri.startswith("postgres://") or uri.startswith("postgresql://"):
         record = {"backend": "postgres", "dsn": uri}
@@ -928,45 +893,15 @@ def initialize_store(root: Path, database: str | None = None) -> Store:
 
 def backup_forge(root: Path, destination: Path) -> Path:
     """Write a consistent backup directory and return its path."""
-    import git as forge_git
-
     store = open_store(root)
     document = store.load_document()
-    destination.mkdir(parents=True, exist_ok=False)
+    if document.get("repository_state") != "ready":
+        store.close()
+        raise ForgeError("forge initialization is incomplete")
     try:
-        manifest = {
-            "created_at": time.time(),
-            "schema_version": STORAGE_SCHEMA_VERSION,
-            "backend": store.backend.kind,
-            "document": document,
-            "refs": {},
-        }
-        canonical = root / "canonical.git"
-        repos_dir = destination / "repos"
-        repos_dir.mkdir()
-        shutil.copytree(canonical, repos_dir / "canonical.git", symlinks=True)
-        views_dir = root / "views"
-        if views_dir.exists():
-            shutil.copytree(views_dir, repos_dir / "views", symlinks=True)
-        for name in sorted(document.get("views", {})):
-            view_repo = repos_dir / "views" / f"{name}.git"
-            projected_ref = document["views"][name]["projected_ref"]
-            manifest["refs"][f"view:{name}"] = forge_git.ref(view_repo, projected_ref)
-        canonical_ref = f"refs/heads/{document['canonical_branch']}"
-        manifest["refs"]["canonical"] = forge_git.ref(canonical, canonical_ref)
-        if store.backend.kind == "sqlite":
-            store.backend.dump(destination / "database.sqlite3")
-        else:
-            store.backend.dump(destination / "tables")
-        (destination / "manifest.json").write_text(
-            json.dumps(manifest, indent=2, sort_keys=True) + "\n"
-        )
-    except Exception:
-        shutil.rmtree(destination, ignore_errors=True)
-        raise
+        return _backup_repository(root, destination, store)
     finally:
         store.close()
-    return destination
 
 
 def restore_forge(backup: Path, new_root: Path, database: str | None = None) -> Path:
@@ -976,61 +911,191 @@ def restore_forge(backup: Path, new_root: Path, database: str | None = None) -> 
         manifest = json.loads(manifest_path.read_text())
     except (OSError, json.JSONDecodeError) as error:
         raise ForgeError(f"cannot read backup manifest: {error}") from error
-    if manifest.get("schema_version") != STORAGE_SCHEMA_VERSION:
-        raise ForgeError(
-            f"backup schema version {manifest.get('schema_version')} is unsupported"
+    if manifest.get("format") != "bastion-wal-backup" or manifest.get("format_version") != 1:
+        raise ForgeError("backup format is unsupported")
+    return _restore_repository(backup, new_root, database, manifest)
+
+
+def _backup_repository(root: Path, destination: Path, store: Store) -> Path:
+    """Copy the exact manifest-reachable object closure, never live caches."""
+    from repository import Repository
+    from wal import canonical_json, sha256
+
+    if destination.exists():
+        raise ForgeError(f"backup destination already exists: {destination}")
+    repository = Repository.open(root)
+    manifest, _version, replay = repository.load()
+    manifest_body = canonical_json(manifest.to_dict())
+    keys: set[str] = {"manifest.json"}
+    pointer = manifest.wal_head.to_dict()
+    while True:
+        keys.add(pointer["key"])
+        record = json.loads(repository.get(pointer["key"]).body)
+        if record["seq"] == 1:
+            break
+        pointer = record["previous"]
+    pack_refs: list[dict] = list(manifest.canonical_packs)
+    descriptor_ids: set[str] = set()
+    for record in replay.records:
+        payload = record["payload"]
+        if record["kind"] == "import":
+            pack_refs.append(payload["canonical_pack"])
+        elif record["kind"] == "view_create":
+            descriptor_ids.add(payload["descriptor_id"])
+        elif record["kind"] == "submission":
+            descriptor_ids.add(payload["descriptor_id"])
+            pack_refs.extend((payload["canonical_pack"], payload["submission_pack"]))
+        elif record["kind"] == "canonical_update":
+            pack_refs.append(payload["canonical_pack"])
+        elif record["kind"] == "policy_transition":
+            descriptor_ids.update(item["new_descriptor_id"] for item in payload["views"])
+    for pack in pack_refs:
+        keys.add(pack["pack_key"])
+        keys.add(pack["idx_key"])
+    keys.update(f"descriptors/{identifier}.json" for identifier in descriptor_ids)
+    destination.mkdir(parents=True)
+    copied: list[dict] = []
+    try:
+        for key in sorted(keys):
+            body = manifest_body if key == "manifest.json" else repository.get(key).body
+            target = destination / "objects" / key
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(body)
+            copied.append({"key": key, "sha256": sha256(body), "size": len(body)})
+        shutil.copy2(root / "repository.json", destination / "repository.json")
+        shutil.copy2(root / "backend.json", destination / "backend.json")
+        tokens = root / "tokens.json"
+        if tokens.exists():
+            shutil.copy2(tokens, destination / "tokens.json")
+        if store.backend.kind == "sqlite":
+            store.backend.dump(destination / "database.sqlite3")
+        else:
+            store.backend.dump(destination / "tables")
+        metadata = {
+            "format": "bastion-wal-backup",
+            "format_version": 1,
+            "created_at": time.time(),
+            "repository_id": repository.repository_id,
+            "head_seq": manifest.head_seq,
+            "manifest_sha256": sha256(manifest_body),
+            "objects": copied,
+        }
+        (destination / "manifest.json").write_bytes(canonical_json(metadata))
+        return destination
+    except Exception:
+        shutil.rmtree(destination, ignore_errors=True)
+        raise
+
+
+def _read_backup_object(root: Path, key: str, expected_size: object) -> bytes:
+    if not isinstance(expected_size, int) or isinstance(expected_size, bool) or expected_size < 0:
+        raise ForgeError("WAL backup object has an invalid size", "integrity")
+    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        components = key.split("/")
+        for component in components[:-1]:
+            child = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=directory,
+            )
+            os.close(directory)
+            directory = child
+        metadata = os.stat(components[-1], dir_fd=directory, follow_symlinks=False)
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ForgeError("WAL backup object path contains a symlink", "integrity")
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ForgeError("WAL backup object is not a regular file", "integrity")
+        descriptor = os.open(
+            components[-1],
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=directory,
         )
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode) or opened.st_size != expected_size:
+                raise ForgeError("WAL backup object size differs", "integrity")
+            with os.fdopen(descriptor, "rb") as source:
+                descriptor = -1
+                body = source.read(expected_size + 1)
+                if len(body) != expected_size:
+                    raise ForgeError("WAL backup object size changed while reading", "integrity")
+                return body
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+    except ForgeError:
+        raise
+    except OSError as error:
+        raise ForgeError(f"cannot safely read WAL backup object: {key}", "integrity") from error
+    finally:
+        os.close(directory)
+
+
+def _restore_repository(backup: Path, new_root: Path, database: str | None, metadata: dict) -> Path:
+    from object_store_fs import FilesystemObjectStore
+    from object_store import Create, validate_key
+    from repository import Repository
+    from materialization import ensure_canonical_materialized, ensure_intake_materialized, ensure_view_materialized
+
     if new_root.exists() and any(new_root.iterdir()):
         raise ForgeError(f"restore target is not empty: {new_root}")
-    new_root.mkdir(parents=True)
-    (new_root / "views").mkdir(exist_ok=True)
-    shutil.copytree(backup / "repos" / "canonical.git", new_root / "canonical.git", symlinks=True)
-    if (backup / "repos" / "views").exists():
-        shutil.copytree(
-            backup / "repos" / "views", new_root / "views", symlinks=True, dirs_exist_ok=True
-        )
+    try:
+        config = json.loads((backup / "repository.json").read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise ForgeError(f"cannot read WAL backup configuration: {error}") from error
+    if config.get("repository_id") != metadata.get("repository_id"):
+        raise ForgeError("WAL backup repository ID is inconsistent", "integrity")
+    new_root.mkdir(parents=True, exist_ok=True)
+    (new_root / "views").mkdir()
+    (new_root / "intake").mkdir()
+    from repository import write_repository_config
+
+    write_repository_config(
+        new_root,
+        config["repository_id"],
+        config["canonical_branch"],
+        new_root / "object-store",
+    )
+    shutil.copy2(backup / "backend.json", new_root / "backend.json")
+    tokens = backup / "tokens.json"
+    if tokens.exists():
+        shutil.copy2(tokens, new_root / "tokens.json")
+    object_root = new_root / "object-store"
+    filesystem = FilesystemObjectStore(object_root)
+    backup_objects = backup / "objects"
+    if not backup_objects.is_dir() or backup_objects.is_symlink():
+        raise ForgeError("WAL backup object directory is invalid", "integrity")
+    for entry in metadata.get("objects", []):
+        key = entry.get("key")
+        if not isinstance(key, str):
+            raise ForgeError("WAL backup has an invalid object key", "integrity")
+        try:
+            validate_key(key)
+        except ValueError as error:
+            raise ForgeError("WAL backup has an invalid object key", "integrity") from error
+        body = _read_backup_object(backup_objects, key, entry.get("size"))
+        if hashlib.sha256(body).hexdigest() != entry.get("sha256"):
+            raise ForgeError("WAL backup object hash differs", "integrity")
+        filesystem.put(f"repos/{config['repository_id']}/{key}", body, mode=Create())
     uri = database_uri(new_root, database)
     if uri.startswith("postgres://") or uri.startswith("postgresql://"):
         record = {"backend": "postgres", "dsn": uri}
     else:
         record = {"backend": "sqlite"}
     if record["backend"] == "sqlite":
-        fresh = _SqliteBackend(new_root / "store.sqlite3")
-        connection = fresh.connect()
-        try:
-            fresh.create_schema(connection)
-        finally:
-            fresh.shutdown(connection)
         write_backend_record(new_root, record)
         _SqliteBackend(new_root / "store.sqlite3").restore(backup / "database.sqlite3")
     else:
         backend = _PostgresBackend(record["dsn"], new_root)
         backend.restore(backup / "tables")
         write_backend_record(new_root, record)
-    restored = open_store(new_root)
-    try:
-        document = restored.load_document()
-    finally:
-        restored.close()
-    expected = manifest.get("document")
-    loaded = json.loads(json.dumps(document, sort_keys=True))
-    normalized = json.loads(json.dumps(expected, sort_keys=True)) if expected else None
-    if normalized is not None and loaded != normalized:
-        raise ForgeError("restored document differs from the backup manifest")
-    import git as forge_git
-
-    for marker, tip in sorted(manifest.get("refs", {}).items()):
-        if marker == "canonical":
-            actual = forge_git.ref(
-                new_root / "canonical.git",
-                f"refs/heads/{document['canonical_branch']}",
-            )
-        else:
-            name = marker.split(":", 1)[1]
-            actual = forge_git.ref(
-                new_root / "views" / f"{name}.git",
-                document["views"][name]["projected_ref"],
-            )
-        if actual != tip:
-            raise ForgeError(f"restored ref differs from the backup manifest: {marker}")
+    repository = Repository.open(new_root)
+    manifest, _version, replay = repository.load()
+    if manifest.head_seq != metadata.get("head_seq"):
+        raise ForgeError("WAL backup manifest head differs", "integrity")
+    ensure_canonical_materialized(new_root, manifest, repository)
+    for view in sorted(replay.active_views):
+        materialized = ensure_view_materialized(new_root, view, manifest, replay, repository)
+        ensure_intake_materialized(new_root, materialized)
     return new_root

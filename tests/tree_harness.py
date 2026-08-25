@@ -12,7 +12,13 @@ from pathlib import Path
 
 import forge
 from tests import identity_harness
-from tests.storage_helpers import document_bytes, read_document
+from tests.storage_helpers import (
+    document_bytes,
+    read_document,
+    repository_state,
+    repository_snapshot,
+    submission_record,
+)
 from tests.transport import attach_intake_push
 
 
@@ -205,6 +211,7 @@ class TreeFixture:
             self.clients[name] = checkout
         self.admin = self.directory / "admin"
         command("git", "clone", "-q", "--no-local", os.fsdecode(forge.canonical_repo(self.root)), os.fsdecode(self.admin))
+        identity_harness.attach_admin_push(self.root, self.admin)
         self.models: dict[str, Tree] = {initial_tip: tree_at(self.source, initial_tip)}
         self.canonical_model = dict(self.models[initial_tip])
         self.hidden_oid = self.canonical_model[b"hidden/secret.txt"][1]
@@ -238,8 +245,7 @@ class TreeFixture:
         old, new = self.source_commit(view, effects, message)
         command("git", "-C", os.fsdecode(self.clients[view]), "push", "origin", "main")
         forge.drain_projection_jobs(self.root)
-        state = self.state()
-        transaction = next(tx for tx in state["transactions"].values() if tx.get("view") == view and tx.get("projected_old") == old and tx.get("projected_new") == new)
+        transaction = submission_record(self.root, view, old, new)["payload"]
         self.canonical_model = self._apply(self.canonical_model, effects)
         for mapping in transaction["mappings"]:
             self.models[mapping["canonical"]] = dict(self.canonical_model)
@@ -254,7 +260,7 @@ class TreeFixture:
             parent = build_commit(client, parent, effects, f"source chain {index}\n".encode(), self._next_timestamp())
         command("git", "-C", os.fsdecode(client), "push", "origin", "main")
         forge.drain_projection_jobs(self.root)
-        transaction = next(tx for tx in self.state()["transactions"].values() if tx.get("view") == view and tx.get("projected_old") == old and tx.get("projected_new") == parent)
+        transaction = submission_record(self.root, view, old, parent)["payload"]
         for effects, mapping in zip(chain, transaction["mappings"]):
             self.canonical_model = self._apply(self.canonical_model, effects)
             self.models[mapping["canonical"]] = dict(self.canonical_model)
@@ -264,6 +270,7 @@ class TreeFixture:
     def admin_update(self, chain: list[Effects]) -> list[str]:
         canonical = forge.canonical_repo(self.root)
         expected = oid(canonical, "refs/heads/main")
+        git(self.admin, "fetch", "-q", "origin", expected)
         git(self.admin, "update-ref", "refs/heads/main", expected)
         parent = expected
         commits: list[str] = []
@@ -281,7 +288,60 @@ class TreeFixture:
         return commits
 
     def state(self) -> dict:
-        return read_document(self.root)
+        document = read_document(self.root)
+        manifest, replay = repository_state(self.root)
+        views: dict[str, dict] = {}
+        for name, active in replay.active_views.items():
+            views[name] = {
+                **active,
+                "canonical_ref": manifest.canonical_ref,
+                "projected_tip": oid(
+                    forge.view_repo(self.root, name), active["projected_ref"]
+                ),
+                "anchors": {},
+            }
+        transactions: dict[str, dict] = {}
+        changes = {
+            change_id: {**claim, "revisions": []}
+            for change_id, claim in replay.change_claims.items()
+        }
+        for record in replay.records:
+            payload = record["payload"]
+            if record["kind"] not in {"submission", "canonical_update"}:
+                continue
+            transaction = {
+                **payload,
+                "id": record["event_id"],
+                "event_id": record["event_id"],
+                "sequence": record["seq"],
+                "kind": record["kind"],
+                "status": "committed",
+            }
+            if record["kind"] == "submission":
+                transaction["view"] = payload["view_id"]
+                source = views[payload["view_id"]]
+                for mapping in payload["mappings"]:
+                    source["anchors"][mapping["submitted"]] = {
+                        "canonical": mapping["canonical"],
+                        "kind": "submitted",
+                        "change_id": mapping["change_id"],
+                        "descriptor_id": payload["descriptor_id"],
+                        "descriptor_generation": payload["descriptor_generation"],
+                    }
+                    if mapping["change_id"]:
+                        changes[mapping["change_id"]]["revisions"].append(
+                            {
+                                "submitted": mapping["submitted"],
+                                "canonical": mapping["canonical"],
+                                "principal_id": payload["principal_id"],
+                                "canonical_ref": payload["canonical_ref"],
+                            }
+                        )
+            transactions[record["event_id"]] = transaction
+        document["views"] = views
+        document["transactions"] = transactions
+        document["changes"] = changes
+        return document
 
     def refs(self) -> dict[str, tuple[tuple[str, str, str], ...]]:
         repositories = {"canonical": forge.canonical_repo(self.root)} | {name: forge.view_repo(self.root, name) for name in self.policies}
@@ -291,27 +351,26 @@ class TreeFixture:
             result[name] = tuple(tuple(line.split(" ", 2)) for line in lines)
         return result
 
-    def rejection_snapshot(self) -> tuple[bytes, dict[str, tuple[tuple[str, str, str], ...]], tuple[str, ...]]:
-        markers = self.root / "receivers"
-        return (document_bytes(self.root), self.refs(), tuple(sorted(path.name for path in markers.iterdir())) if markers.exists() else ())
+    def rejection_snapshot(self):
+        return repository_snapshot(self.root)
 
-    def assert_rejection(self, before: tuple[bytes, dict[str, tuple[tuple[str, str, str], ...]], tuple[str, ...]]) -> None:
+    def assert_rejection(self, before) -> None:
         if before != self.rejection_snapshot():
-            raise AssertionError("rejection changed authoritative state or refs")
+            raise AssertionError("rejection changed repository truth or immutable objects")
         forge.check_invariants(self.root)
 
     def checkpoint(self) -> None:
         forge.check_invariants(self.root)
-        state = self.state()
+        _manifest, replay = repository_state(self.root)
         canonical = forge.canonical_repo(self.root)
         if tree_at(canonical, oid(canonical, "refs/heads/main")) != self.canonical_model:
             raise AssertionError("canonical tree differs from independent model")
         for name, (read, _write) in self.policies.items():
-            view = state["views"][name]
+            view = replay.active_views[name]
             expected = filtered(self.models[view["canonical_frontier"]], read)
             repository = forge.view_repo(self.root, name)
             actual = oid(repository, view["projected_ref"])
-            if actual != view["projected_tip"] or tree_at(repository, actual) != expected:
+            if tree_at(repository, actual) != expected:
                 raise AssertionError(f"projected tree differs for {name}")
             if git(repository, "cat-file", "-e", self.hidden_oid, check=False).returncode == 0:
                 raise AssertionError(f"hidden blob is present in {name}")

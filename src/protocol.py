@@ -16,7 +16,6 @@ from failpoints import checkpoint
 from git import (
     clean_env,
     commit_metadata,
-    copy_object,
     git,
     output,
     quarantine_objects,
@@ -25,16 +24,14 @@ from git import (
     tree_oid,
     verify_no_extra_objects,
 )
-from layout import ZERO_OID, canonical_repo, intake_repo, view_repo
+from layout import ZERO_OID, canonical_repo, intake_repo
 from projection import visible_advance
 from reconciliation import reconcile_commits
-from state import (
-    locked,
-    reserve_change_ids,
-    save_state,
-    validate_change_ids,
-    write_receiver_marker,
-)
+from artifacts import build_canonical_pack, build_submission_pack, upload_pack
+from materialization import ensure_canonical_materialized, ensure_view_materialized
+from repository import AlreadyCommitted, Candidate, Repository
+from wal import idempotency_key_hash, record_fingerprint
+from state import audit_event, load_state
 from validation import parse_updates, validate_ref_update
 
 
@@ -73,17 +70,6 @@ def candidate_environment(canonical: Path, directory: Path) -> dict[str, str]:
     env["GIT_OBJECT_DIRECTORY"] = str(directory)
     env["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = str(canonical / "objects")
     return env
-
-
-def promote_objects(source: Path, canonical: Path) -> None:
-    for object_path in source.rglob("*"):
-        if not object_path.is_file():
-            continue
-        relative = object_path.relative_to(source)
-        target = canonical / "objects" / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if not target.exists():
-            os.link(object_path, target)
 
 
 def enforce_pack_limits(repo: Path, old: str, new: str, env: dict[str, str]) -> None:
@@ -147,9 +133,10 @@ def prepare_submission(
     new: str,
     hook_env: dict[str, str],
     state: dict | None = None,
-) -> tuple[str, str, list[dict[str, str | None]], Path]:
+    canonical: Path | None = None,
+):
     destination = intake_repo(root, name)
-    canonical = canonical_repo(root)
+    canonical = canonical or canonical_repo(root)
     commits = submitted_commits(destination, old, new, hook_env)
     enforce_pack_limits(destination, old, new, hook_env)
     verify_no_extra_objects(destination, new, hook_env)
@@ -181,7 +168,7 @@ def prepare_submission(
     transaction_objects.mkdir(parents=True)
     candidate_env = candidate_environment(canonical, transaction_objects)
     try:
-        canonical_new, mappings = reconcile_commits(
+        transition = reconcile_commits(
             canonical,
             destination,
             commits,
@@ -194,42 +181,7 @@ def prepare_submission(
     except Exception:
         shutil.rmtree(transaction_objects, ignore_errors=True)
         raise
-    return canonical_old, canonical_new, mappings, transaction_objects
-
-
-def copy_intake_closure(
-    root: Path, name: str, old: str, new: str, env: dict[str, str]
-) -> None:
-    """Materialize submitted objects into the view store before ref publication."""
-    intake = intake_repo(root, name)
-    destination = view_repo(root, name)
-    object_ids = output(
-        intake, "rev-list", "--objects", "--no-object-names", new, f"^{old}", env=env
-    ).splitlines()
-    for oid in object_ids:
-        copy_object(intake, destination, oid, source_env=env)
-
-
-def publish_source_publication(
-    root: Path, state: dict, name: str, view: dict, old: str, new: str
-) -> None:
-    """Copy the submitted closure into the view and move its ref by CAS.
-
-    Receive-pack used to move this ref implicitly when views were push
-    targets; the intake boundary performs the equivalent step explicitly
-    so crash windows and retries keep their established recovery shape.
-    """
-    if new == ZERO_OID or old == ZERO_OID:
-        raise ForgeError("source publication requires a linear branch update")
-    hook_env = os.environ.copy()
-    copy_intake_closure(root, name, old, new, hook_env)
-    destination = view_repo(root, name)
-    actual = ref(destination, view["projected_ref"])
-    if actual == new:
-        return
-    if actual != old:
-        raise ForgeError("projected ref changed outside synchronization")
-    git(destination, "update-ref", view["projected_ref"], new, old)
+    return transition
 
 
 def hook_pre_receive(root: Path, name: str, updates: bytes) -> int:
@@ -261,186 +213,150 @@ def hook_pre_receive(root: Path, name: str, updates: bytes) -> int:
 def pre_receive(root: Path, name: str, updates: bytes) -> None:
     parsed = parse_updates(updates)
     context = receive_context(name)
+    control = load_state(root)
+    if control.get("repository_state") != "ready":
+        raise ForgeError("forge initialization is incomplete", "integrity")
+    repository = Repository.open(root)
     idempotency_key = os.environ.get("BASTION_IDEMPOTENCY_KEY")
-    with locked(root) as state:
-        view = state["views"].get(name)
-        if not view:
+    idempotency_hash = (
+        idempotency_key_hash(repository.repository_id, idempotency_key)
+        if idempotency_key
+        else None
+    )
+
+    def build(manifest, replay):
+        active = replay.active_views.get(name)
+        if active is None:
             raise ForgeError("exactly one authorized branch may be updated")
-        descriptor = identity.descriptor_for_view(state, name)
-        from outbox import view_has_unfinished_jobs
-        from service import repair_intake_mirror
-        from state import has_unconfirmed_source, source_publication_pending
-
-        # The intake advertisement must match the authoritative tip unless a
-        # crashed receive is still being retried; in that window the mirror
-        # deliberately stays at the old value so the retry CAS succeeds.
-        if not source_publication_pending(root, state, name) and not (
-            has_unconfirmed_source(state)
-        ):
-            repair_intake_mirror(root, state, name)
-
-        # Idempotent replay is decided before ref validation so a retried
-        # push whose outcome was already recorded returns that outcome
-        # instead of a derived rejection.
-        fingerprint = {
-            "view": name,
-            "old": parsed[0][0] if parsed else "",
-            "new": parsed[0][1] if parsed else "",
+        if context.principal_id != active["principal_id"]:
+            raise ForgeError("authenticated receive principal does not match the WAL view", "policy")
+        source = ensure_view_materialized(root, name, manifest, replay, repository)
+        checkpoint(root, "wal.source_materialized")
+        view = {
+            "principal_id": active["principal_id"],
+            "descriptor_id": active["descriptor_id"],
+            "descriptor_generation": active["descriptor_generation"],
+            "projection_epoch": active["projection_epoch"],
+            "canonical_ref": manifest.canonical_ref,
+            "projected_ref": active["projected_ref"],
+            "canonical_frontier": source.cursor["canonical_frontier"],
+            "projected_tip": source.projected_tip,
         }
-        if idempotency_key:
-            from state import idempotency_lookup
-
-            recorded = idempotency_lookup(root, idempotency_key)
-            if recorded is not None:
-                if recorded["fingerprint"] != fingerprint:
+        descriptor = repository._descriptor(active["descriptor_id"])
+        if len(parsed) != 1:
+            raise ForgeError("exactly one authorized branch may be updated")
+        old, new, updated_ref = parsed[0]
+        if updated_ref != active["projected_ref"]:
+            raise ForgeError("branch update is not authorized")
+        if old == ZERO_OID or new == ZERO_OID:
+            raise ForgeError(
+                "branch creation, deletion, and stale or force updates are not supported"
+            )
+        request = (name, active["projected_ref"], old, new)
+        if idempotency_hash is not None:
+            committed = replay.idempotency.get(idempotency_hash)
+            if committed is not None:
+                committed_event = replay.events.get(committed["event_id"])
+                if committed_event is None:
                     raise ForgeError(
-                        "idempotency key was already used for a different request"
+                        "idempotency index references a missing WAL event", "integrity"
                     )
-                transaction = state["transactions"].get(
-                    recorded.get("outcome", {}).get("transaction_id", "")
+                sequence = committed_event["seq"]
+                record = replay.records[sequence - 1]
+                payload = record["payload"]
+                if (payload["view_id"], payload["projected_ref"], payload["projected_old"], payload["projected_new"]) != request:
+                    raise ForgeError("idempotency key was already used for a different request")
+                return AlreadyCommitted(sequence)
+        old_requests = replay.requests.get(request, [])
+        if old_requests and source.projected_tip != old:
+            if idempotency_hash is not None:
+                raise ForgeError(
+                    "a new idempotency key cannot be attached to a committed request"
                 )
-                if transaction and transaction["status"] in {
-                    "canonical_committed",
-                    "fanout_pending",
-                    "published",
-                }:
-                    from state import is_ancestor
-
-                    destination = view_repo(root, name)
-                    actual = ref(destination, view["projected_ref"])
-                    if actual != fingerprint["new"] and not is_ancestor(
-                        destination, fingerprint["new"], actual
-                    ):
-                        publish_source_publication(
-                            root,
-                            state,
-                            name,
-                            view,
-                            fingerprint["old"],
-                            fingerprint["new"],
-                        )
-                return
-
+            return AlreadyCommitted(replay.events[old_requests[-1]]["seq"])
         old, new, _updated_ref = validate_ref_update(view, parsed)
-        retry_id = transaction_id(name, old, new)
-        retry = state["transactions"].get(retry_id)
-        if retry and retry["status"] == "source_unconfirmed":
-            identity.require_matching_descriptor(
-                view, retry["descriptor_id"], retry["descriptor_generation"]
-            )
-            if retry.get("principal_id") != view["principal_id"]:
-                raise ForgeError("projection descriptor changed")
-            write_receiver_marker(root, retry_id, os.getppid())
-            retry.pop("source_error", None)
-            save_state(root, state)
-            publish_source_publication(root, state, name, view, old, new)
-            return
-        if source_publication_pending(root, state, name):
-            raise ForgeError("view has an active receive transaction")
-        if has_unconfirmed_source(state):
-            raise ForgeError("canonical history contains an unconfirmed source publication")
-        if view_has_unfinished_jobs(state, name):
-            raise ForgeError("view has pending projection work; retry after synchronization")
+        canonical = ensure_canonical_materialized(root, manifest, repository)
         hook_env = os.environ.copy()
-        canonical_old, canonical_new, mappings, transaction_objects = prepare_submission(
-            root, name, view, descriptor, old, new, hook_env, state=state
+        transition = prepare_submission(
+            root, name, view, descriptor, old, new, hook_env, state=control, canonical=canonical
         )
-        try:
-            validate_change_ids(
-                state, view["principal_id"], view["canonical_ref"], mappings
-            )
-            promote_objects(transaction_objects, canonical_repo(root))
-        finally:
-            shutil.rmtree(transaction_objects, ignore_errors=True)
-        checkpoint(root, "source.validation_complete")
-        txid = transaction_id(name, old, new)
-        sequence = state.setdefault("next_transaction_sequence", 1)
-        state["next_transaction_sequence"] = sequence + 1
-        transaction = {
-            "id": txid,
-            "view": name,
-            "principal_id": view["principal_id"],
-            "descriptor_id": descriptor["id"],
-            "descriptor_generation": view["descriptor_generation"],
-            "received_at": int(time.time()),
-            "target_descriptors": {
-                other_name: {
-                    "descriptor_id": other["descriptor_id"],
-                    "descriptor_generation": other["descriptor_generation"],
-                }
-                for other_name, other in sorted(state["views"].items())
-                if other_name != name
-            },
-            "canonical_ref": view["canonical_ref"],
-            "projected_ref": view["projected_ref"],
-            "canonical_frontier_old": view["canonical_frontier"],
-            "canonical_old": canonical_old,
-            "canonical_new": canonical_new,
+        for mapping in transition.mappings:
+            change_id = mapping["change_id"]
+            if not change_id:
+                continue
+            claim = replay.change_claims.get(change_id)
+            if claim is not None and (
+                claim["owner_principal_id"] != active["principal_id"]
+                or claim["canonical_ref"] != manifest.canonical_ref
+            ):
+                shutil.rmtree(transition.candidate_object_dir, ignore_errors=True)
+                raise ForgeError("Change-Id belongs to another principal or branch")
+        checkpoint(root, "wal.validation_complete")
+        canonical_pack = build_canonical_pack(
+            canonical, transition.canonical_old, transition.canonical_new,
+            candidate_environment(canonical, transition.candidate_object_dir),
+        )
+        checkpoint(root, "wal.canonical_pack_built")
+        receiving_intake = Path(
+            os.environ.get("BASTION_INTAKE_REPO", str(intake_repo(root, name)))
+        )
+        submission_pack = build_submission_pack(receiving_intake, old, new, hook_env)
+        checkpoint(root, "wal.submission_pack_built")
+        canonical_ref = canonical_pack.reference("packs/canonical")
+        submission_ref = submission_pack.reference("packs/submissions")
+        payload = {
+            "idempotency_key_hash": idempotency_hash,
+            "view_id": name,
+            "principal_id": active["principal_id"],
+            "descriptor_id": active["descriptor_id"],
+            "descriptor_generation": active["descriptor_generation"],
+            "projection_epoch": active["projection_epoch"],
+            "canonical_ref": manifest.canonical_ref,
+            "canonical_old": transition.canonical_old,
+            "canonical_new": transition.canonical_new,
+            "projected_ref": active["projected_ref"],
             "projected_old": old,
             "projected_new": new,
-            "mappings": mappings,
-            "sequence": sequence,
-            "pending_views": sorted(
-                view_name for view_name in state["views"] if view_name != name
-            ),
-            "status": "prepared",
+            "canonical_frontier_old": active["canonical_frontier"],
+            "canonical_pack": canonical_ref,
+            "submission_pack": submission_ref,
+            "mappings": transition.mappings,
+            "received_at": int(time.time()),
+            "transport": context.transport,
+            "remote_identity": context.remote_addr,
         }
-        write_receiver_marker(root, txid, os.getppid())
-        state["transactions"][txid] = transaction
-        save_state(root, state)
-        if idempotency_key:
-            from state import idempotency_record
 
-            idempotency_record(
-                root,
-                idempotency_key,
-                fingerprint,
-                {"status": "prepared", "transaction_id": txid},
-            )
-        checkpoint(root, "source.prepared_persisted")
-        from service import update_canonical_ref_locked
+        def upload_canonical(target: Repository) -> None:
+            if upload_pack(target, "packs/canonical", canonical_pack) != canonical_ref:
+                raise ForgeError("canonical pack upload metadata changed", "integrity")
+            checkpoint(root, "wal.canonical_pack_uploaded")
 
-        update_canonical_ref_locked(
-            root, state, canonical_old, canonical_new, create_event=False
+        def upload_submission(target: Repository) -> None:
+            if upload_pack(target, "packs/submissions", submission_pack) != submission_ref:
+                raise ForgeError("submission pack upload metadata changed", "integrity")
+            checkpoint(root, "wal.submission_pack_uploaded")
+
+        return Candidate(
+            record_fingerprint(repository.repository_id, "submission", payload),
+            payload,
+            (upload_canonical, upload_submission),
+            lambda: (
+                canonical_pack.cleanup(),
+                submission_pack.cleanup(),
+                shutil.rmtree(transition.candidate_object_dir, ignore_errors=True),
+            ),
         )
-        checkpoint(root, "source.canonical_ref_published")
-        reserve_change_ids(
-            state, view["principal_id"], view["canonical_ref"], mappings
-        )
-        transaction["status"] = "canonical_committed"
-        from outbox import enqueue_canonical_committed
 
-        enqueue_canonical_committed(state, transaction)
-        save_state(root, state)
-        checkpoint(root, "source.canonical_state_persisted")
-        from state import audit_event
-
+    sequence = repository.publish(build)
+    checkpoint(root, "wal.git_success_returning")
+    try:
+        _manifest, _version, replay = repository.load()
         audit_event(
             root,
             "receive.accept",
-            f"{name}/{view['principal_id']}",
-            f"{context.transport} {context.remote_addr or '-'}"
-            f" {old}..{new} tx={txid}",
+            f"{name}/{context.principal_id}",
+            f"{context.transport} {context.remote_addr or '-'} seq={sequence}",
+            replay.records[sequence - 1]["event_id"],
         )
-        publish_source_publication(root, state, name, view, old, new)
-        checkpoint(root, "source.source_ref_published")
-
-
-def post_receive(root: Path, name: str, updates: bytes) -> None:
-    checkpoint(root, "source.ref_published")
-    parsed = parse_updates(updates)
-    with locked(root) as state:
-        from service import repair_intake_mirror
-
-        for old, new, updated_ref in parsed:
-            txid = transaction_id(name, old, new)
-            transaction = state["transactions"].get(txid)
-            if transaction and transaction["projected_ref"] == updated_ref:
-                (root / "receivers" / txid).unlink(missing_ok=True)
-        repair_intake_mirror(root, state, name)
-        save_state(root, state)
-        checkpoint(root, "source.receiver_cleanup_persisted")
-    checkpoint(root, "source.confirmation_persisted")
-    from worker import drain_projection_jobs
-
-    drain_projection_jobs(root)
+    except Exception:
+        pass
