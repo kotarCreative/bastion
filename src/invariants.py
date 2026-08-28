@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from errors import ForgeError
+from git import has_exact_object_closure
 from layout import view_repo
 from state import load_state
 
@@ -72,3 +73,5 @@ def check_invariants(root: Path) -> None:
         alternates = cached.resolve() / "objects" / "info" / "alternates"
         if alternates.exists():
             _fail("ISOLATION", view_id, "active view has an alternate")
+        if not has_exact_object_closure(cached):
+            _fail("ISOLATION", view_id, "active view contains unreachable objects")

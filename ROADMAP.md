@@ -21,8 +21,12 @@ Bastion currently provides:
 
 ## Git Compatibility
 
-- Test repack, garbage collection, commit graphs, bitmaps, multi-pack-index, and delta-base selection.
-- Define shallow clone, deepen, and partial clone support.
+- Maintain the [Git compatibility matrix](docs/GIT_COMPATIBILITY.md) for repack,
+  garbage collection, commit graphs, bitmaps, multi-pack-index, protocol
+  versions, exact OID wants, and shallow history.
+- Expand maintenance coverage to cruft, stale indexes, missing packs, and
+  adversarial delta-base selection.
+- Define partial clone support and shallow behavior across policy epochs.
 - Decide and implement SHA-256 repository support.
 - Define tags, signed tags, and source-signature attestations.
 - Add Git LFS authorization.

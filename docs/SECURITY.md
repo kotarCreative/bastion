@@ -76,7 +76,10 @@ protected service storage, database authorization, and rate limiting.
 
 Each projected repository contains an authorization-safe reachable closure and
 has no canonical alternate. Tests verify that known hidden blobs are absent
-from ref reachability, direct object lookup, and direct protocol wants.
+from ref reachability, direct object lookup, and direct protocol wants. Active
+view validation also requires the physical object inventory to equal the
+reachable ref closure. This rejects dangling loose and cruft-packed objects,
+which strict `git fsck` accepts and protocol v2 may otherwise serve by OID.
 
 Server-side object reuse is an optimization, not an authorization boundary.
 Future shared object storage must authorize every lookup and pack delta base.

@@ -16,7 +16,7 @@ object store: manifest + WAL + packs + descriptors
                  intake/<name>.git
 ```
 
-`canonical.git` materializes complete history. Each view materializes only the object closure allowed by its policy descriptor and has no canonical alternate. Its intake repository advertises the projected tip and reads only from that view's object database.
+`canonical.git` materializes complete history. Each view materializes only the object closure allowed by its policy descriptor and has no canonical alternate. View validation compares every stored object with the advertised ref's reachable closure; a generation containing dangling or cruft objects is replaced rather than served. Its intake repository advertises the projected tip and reads only from that view's object database.
 
 ## Publication
 

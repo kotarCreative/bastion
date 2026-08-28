@@ -94,6 +94,28 @@ def ref(repo: Path, name: str, env: dict[str, str] | None = None) -> str:
     return result.stdout.decode().strip() if result.returncode == 0 else ZERO_OID
 
 
+def has_exact_object_closure(repo: Path) -> bool:
+    """Whether the object database contains exactly its reachable ref closure."""
+    stored = git(
+        repo,
+        "cat-file",
+        "--batch-all-objects",
+        "--batch-check=%(objectname)",
+        check=False,
+    )
+    reachable = git(
+        repo,
+        "rev-list",
+        "--objects",
+        "--no-object-names",
+        "--all",
+        check=False,
+    )
+    if stored.returncode or reachable.returncode:
+        return False
+    return set(stored.stdout.splitlines()) == set(reachable.stdout.splitlines())
+
+
 def tree_entries(
     repo: Path, treeish: str, env: dict[str, str] | None = None
 ) -> TreeEntries:

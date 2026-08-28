@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from errors import ForgeError
-from git import clean_env, git, verify_no_extra_objects, write_tree
+from git import clean_env, git, has_exact_object_closure, verify_no_extra_objects, write_tree
 
 
 class GitEnvironmentTest(unittest.TestCase):
@@ -35,6 +35,33 @@ class GitEnvironmentTest(unittest.TestCase):
 
 
 class QuarantineClosureTest(unittest.TestCase):
+    def test_exact_object_closure_rejects_dangling_objects(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary) / "repository.git"
+            subprocess.run(("git", "init", "--bare", "-q", str(repository)), check=True)
+            blob = git(
+                repository, "hash-object", "-w", "--stdin", data=b"reachable\n"
+            ).stdout.decode().strip()
+            tree = git(
+                repository, "mktree", data=f"100644 blob {blob}\tfile\n".encode()
+            ).stdout.decode().strip()
+            metadata = clean_env() | {
+                "GIT_AUTHOR_NAME": "Test",
+                "GIT_AUTHOR_EMAIL": "test@example.test",
+                "GIT_AUTHOR_DATE": "2000-01-01T00:00:00 +0000",
+                "GIT_COMMITTER_NAME": "Test",
+                "GIT_COMMITTER_EMAIL": "test@example.test",
+                "GIT_COMMITTER_DATE": "2000-01-01T00:00:00 +0000",
+            }
+            commit = git(
+                repository, "commit-tree", tree, data=b"initial\n", env=metadata
+            ).stdout.decode().strip()
+            git(repository, "update-ref", "refs/heads/main", commit)
+            self.assertTrue(has_exact_object_closure(repository))
+
+            git(repository, "hash-object", "-w", "--stdin", data=b"dangling\n")
+            self.assertFalse(has_exact_object_closure(repository))
+
     def test_oid_only_closure_rejects_extra_quarantined_object(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

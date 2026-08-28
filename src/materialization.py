@@ -15,7 +15,16 @@ from pathlib import Path
 
 from artifacts import install_pack
 from errors import ForgeError
-from git import author_environment, clean_env, git, make_commit, ref, run, tree_oid
+from git import (
+    author_environment,
+    clean_env,
+    git,
+    has_exact_object_closure,
+    make_commit,
+    ref,
+    run,
+    tree_oid,
+)
 from layout import (
     ZERO_OID,
     canonical_repo,
@@ -295,7 +304,10 @@ def _valid_view(path: Path, cursor: dict, projected_ref: str) -> bool:
             return False
     except OSError:
         return False
-    return git(path, "fsck", "--full", "--strict", check=False).returncode == 0
+    return (
+        git(path, "fsck", "--full", "--strict", check=False).returncode == 0
+        and has_exact_object_closure(path)
+    )
 
 
 def _record_at(state: ReplayState, seq: int) -> dict:
