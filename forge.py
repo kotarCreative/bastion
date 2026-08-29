@@ -131,6 +131,10 @@ def parser() -> argparse.ArgumentParser:
     serve.add_argument("root", type=Path)
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
+    serve_demo = commands.add_parser("serve-demo")
+    serve_demo.add_argument("root", type=Path)
+    serve_demo.add_argument("--host", default="127.0.0.1")
+    serve_demo.add_argument("--port", type=int, default=8000)
     stats = commands.add_parser("stats")
     stats.add_argument("root", type=Path)
     backup = commands.add_parser("backup")
@@ -205,6 +209,10 @@ def main() -> int:
             print(add_token(args.root, args.view))
         elif args.command == "serve":
             from http_server import serve
+
+            serve(args.root, args.host, args.port)
+        elif args.command == "serve-demo":
+            from demo_server import serve
 
             serve(args.root, args.host, args.port)
         elif args.command == "stats":

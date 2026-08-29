@@ -85,6 +85,19 @@ python3 forge.py serve /tmp/bastion-forge --port 8000
 git clone http://alice:TOKEN@127.0.0.1:8000/alice.git alice
 ```
 
+Or run the invite-only browser demo (requires Flask):
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements-demo.txt
+python3 forge.py add-token /tmp/bastion-forge alice
+BASTION_DEMO_SECRET=$(openssl rand -hex 32) .venv/bin/python forge.py serve-demo /tmp/bastion-forge --port 8000
+```
+
+Then open `http://127.0.0.1:8000/`, enter the token, and browse the effective
+permissions, evaluate path decisions, view the projected tree and visible
+history, and clone the same view with an unmodified Git client.
+
 Use normal Git inside `alice`:
 
 ```bash

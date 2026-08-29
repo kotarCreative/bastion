@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+
+{% block title %}Whoami — Bastion Demo{% endblock %}
+
+{% block content %}
+<h2>View: <code>{{ view }}</code></h2>
+
+<table>
+  <tr><th>Principal</th><td><code>{{ principal.id }}</code> ({{ principal.kind }})</td></tr>
+  <tr><th>Declared emails</th><td>{% if principal.emails %}{{ principal.emails | join(", ") }}{% else %}<span class="muted">none</span>{% endif %}</td></tr>
+  <tr><th>Teams</th><td>{% if teams %}{{ teams | join(", ") }}{% else %}<span class="muted">none</span>{% endif %}</td></tr>
+  <tr><th>Role bindings</th><td>{% if bindings %}{{ bindings | join(", ") }}{% else %}<span class="muted">none</span>{% endif %}</td></tr>
+  <tr><th>Roles</th><td>{% if roles %}{{ roles | map(attribute="id") | join(", ") }}{% else %}<span class="muted">none</span>{% endif %}</td></tr>
+  <tr><th>Descriptor ID</th><td><code>{{ descriptor.id }}</code></td></tr>
+  <tr><th>Descriptor generation</th><td>{{ descriptor_generation }}</td></tr>
+  <tr><th>Projection epoch</th><td>{{ projection_epoch }}</td></tr>
+</table>
+
+<h3>Effective capability rules</h3>
+<table>
+  <thead>
+    <tr><th>Capability</th><th>Allow prefixes</th><th>Deny prefixes</th></tr>
+  </thead>
+  <tbody>
+  {% for capability in ["read", "create", "modify", "delete", "mode", "symlink", "branch", "merge", "admin", "tag"] %}
+    <tr>
+      <td>{{ capability }}</td>
+      <td>
+        {% set allows = descriptor.capabilities.get(capability, []) %}
+        {% if allows %}
+          {% for prefix in allows %}<code>{{ prefix }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
+        {% else %}
+          <span class="muted">none</span>
+        {% endif %}
+      </td>
+      <td>
+        {% set denies = descriptor.restrictions.get(capability, []) %}
+        {% if denies %}
+          {% for prefix in denies %}<code>{{ prefix }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
+        {% else %}
+          <span class="muted">none</span>
+        {% endif %}
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+<p class="muted">Policy transitions affect future server operations but cannot erase objects already downloaded by a client.</p>
+{% endblock %}

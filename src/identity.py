@@ -368,7 +368,7 @@ def descriptor_for_view(state: dict, view_name: str) -> dict:
         raise ForgeError(f"unknown view: {view_name}")
     descriptor_id, generation = require_descriptor_assignment(view)
     descriptor = _verified_descriptor_record(state, descriptor_id)
-    if view["canonical_ref"] != descriptor["canonical_ref"]:
+    if view["projected_ref"] != descriptor["canonical_ref"]:
         raise ForgeError(f"descriptor canonical ref differs from view: {view_name}")
     if descriptor["principal_id"] != view["principal_id"]:
         raise ForgeError(f"descriptor principal differs from view: {view_name}")

@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+
+{% block title %}Browse — Bastion Demo{% endblock %}
+
+{% block content %}
+<h2>Browse view: <code>{{ view }}</code></h2>
+
+<p>
+  {% if path %}
+    <a href="{{ url_for('browse') }}">root</a>
+    {% set parts = path.split('/') %}
+    {% set accumulated = [] %}
+    {% for part in parts %}
+      {% set _ = accumulated.append(part) %}
+      / <a href="{{ url_for('browse', path=accumulated|join('/')) }}">{{ part }}</a>
+    {% endfor %}
+  {% else %}
+    root
+  {% endif %}
+</p>
+
+{% if entries %}
+  <table>
+    <thead>
+      <tr><th>Name</th><th>Kind</th><th>Object</th></tr>
+    </thead>
+    <tbody>
+    {% for entry in entries %}
+      <tr>
+        <td>
+          {% if entry.kind == 'tree' %}
+            <a href="{{ url_for('browse', path=entry.path) }}">{{ entry.name }}/</a>
+          {% else %}
+            {{ entry.name }}
+          {% endif %}
+        </td>
+        <td>{{ entry.kind }}</td>
+        <td><code>{{ entry.oid[:16] }}…</code></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+{% else %}
+  <p class="muted">This directory is empty or not visible.</p>
+{% endif %}
+{% endblock %}

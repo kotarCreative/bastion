@@ -41,3 +41,7 @@ The control-plane document has exact top-level fields. Repository lifecycle is `
 Opening a write session replays committed WAL records to refresh derived transactions, changes, and active-view indexes. Canonical and view caches are reconstructed on demand from manifest-reachable packs. Intake repositories are recreated from active view generations.
 
 Backup pins one manifest generation, copies exactly its reachable WAL, packs, descriptors, configuration, and control-plane snapshot, and records hashes for restore verification. Repository configuration, manifest, WAL records, and backups intentionally omit format-version fields because this is a greenfield implementation with no legacy formats to support.
+
+## Hosted Demo
+
+`forge.py serve-demo` runs a single-process Flask application that serves both the Git smart-HTTP endpoints and a browser UI on one port. A TLS-terminating reverse proxy (e.g. Caddy) is the supported production-shaped deployment; the application itself listens on a private address and serves plain HTTP. The demo verifies that all descriptors use algorithm `capabilities-v3` before binding a listener. Browser sessions are authenticated by the same per-view tokens used for Git access; the UI shows the effective descriptor, evaluates capability decisions, and browses only the projected tree and visible history.

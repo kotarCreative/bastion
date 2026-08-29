@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+
+{% block title %}History — Bastion Demo{% endblock %}
+
+{% block content %}
+<h2>Visible history for view: <code>{{ view }}</code></h2>
+
+{% if commits %}
+  <table>
+    <thead>
+      <tr><th>Commit</th><th>Message</th><th>Timestamp</th></tr>
+    </thead>
+    <tbody>
+    {% for commit in commits %}
+      <tr>
+        <td><code>{{ commit.oid[:16] }}…</code></td>
+        <td>{{ commit.message }}</td>
+        <td>{{ commit.timestamp }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+{% else %}
+  <p class="muted">No history is visible for this view.</p>
+{% endif %}
+{% endblock %}
