@@ -25,7 +25,7 @@ CAPABILITIES = (
     "admin",
     "tag",
 )
-DESCRIPTOR_ALGORITHM = "capabilities-v2"
+DESCRIPTOR_ALGORITHM = "capabilities-v3"
 DESCRIPTOR_DOMAIN = b"bastion-effective-view\0"
 TIMESTAMP_SKEW_SECONDS = 600
 
@@ -55,7 +55,11 @@ def prefix_covers(ancestor: str, descendant: str) -> bool:
 
 
 def minimize_prefixes(values: list[str]) -> list[str]:
-    """Sort, deduplicate, and drop prefixes covered by a retained ancestor."""
+    """Sort, deduplicate, and drop prefixes covered by a retained ancestor.
+
+    This helper is retained for tests and legacy callers; descriptor
+    construction uses ``normalize_prefixes`` so no effective prefix is lost.
+    """
     kept: list[str] = []
     for value in sorted(set(values)):
         if any(prefix_covers(retained, value) for retained in kept):
@@ -64,22 +68,27 @@ def minimize_prefixes(values: list[str]) -> list[str]:
     return kept
 
 
+def normalize_prefixes(values: list[str]) -> list[str]:
+    """Sort and exact-deduplicate normalized prefixes without ancestor drops."""
+    return sorted(set(values))
+
+
 def empty_capability_map() -> dict[str, list[str]]:
     return {capability: [] for capability in CAPABILITIES}
 
 
 def normalize_capability_map(raw: object, subject: str) -> dict[str, list[str]]:
-    """Validate and normalize one allow or deny map with all nine capabilities."""
+    """Validate and normalize one allow or deny map with all ten capabilities."""
     if not isinstance(raw, dict):
         raise ForgeError(f"{subject} must be a capability map")
     if set(raw) != set(CAPABILITIES):
-        raise ForgeError(f"{subject} must hold exactly the nine capabilities")
+        raise ForgeError(f"{subject} must hold exactly the ten capabilities")
     result = empty_capability_map()
     for capability in CAPABILITIES:
         values = raw[capability]
         if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
             raise ForgeError(f"{subject}.{capability} must be a list of path strings")
-        result[capability] = minimize_prefixes(
+        result[capability] = normalize_prefixes(
             [normalize_prefix(value) for value in values]
         )
     return result
@@ -251,8 +260,8 @@ def effective_grants(
     effective_allow = empty_capability_map()
     effective_deny = empty_capability_map()
     for capability in CAPABILITIES:
-        effective_allow[capability] = minimize_prefixes(allow_union[capability])
-        effective_deny[capability] = minimize_prefixes(deny_union[capability])
+        effective_allow[capability] = normalize_prefixes(allow_union[capability])
+        effective_deny[capability] = normalize_prefixes(deny_union[capability])
     return effective_allow, effective_deny
 
 

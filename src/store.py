@@ -14,7 +14,6 @@ from pathlib import Path
 
 from errors import ForgeError
 
-STORAGE_SCHEMA_VERSION = 2
 LEASE_TTL_SECONDS = 60.0
 LEASE_WAIT_SECONDS = 30.0
 LEASE_POLL_SECONDS = 0.05
@@ -73,6 +72,109 @@ def read_backend_record(root: Path) -> dict:
     return record
 
 
+def _load_table_readonly_sqlite(path: Path, table: str) -> dict[str, dict]:
+    import sqlite3
+
+    if not path.exists():
+        raise ForgeError("forge state is not initialized")
+    uri = f"file:{path}?mode=ro"
+    connection = sqlite3.connect(uri, uri=True, timeout=30.0)
+    try:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            f"SELECT key, doc, checksum FROM {table}"
+        ).fetchall()
+        result: dict[str, dict] = {}
+        for row in rows:
+            parsed = json.loads(row["doc"])
+            if _checksum(parsed) != row["checksum"]:
+                raise ForgeError(f"{table} row failed its integrity checksum")
+            result[row["key"]] = parsed
+        return result
+    finally:
+        connection.close()
+
+
+def _load_table_readonly_postgres(dsn: str, table: str) -> dict[str, dict]:
+    try:
+        import psycopg
+    except ImportError as error:
+        raise ForgeError(
+            'the postgres backend requires psycopg 3: pip install "psycopg[binary]"'
+        ) from error
+    connection = psycopg.connect(dsn, autocommit=False)
+    try:
+        connection.execute("BEGIN READ ONLY")
+        rows = connection.execute(
+            f"SELECT key, doc, checksum FROM {table}"
+        ).fetchall()
+        result: dict[str, dict] = {}
+        for row in rows:
+            parsed = json.loads(row["doc"])
+            if _checksum(parsed) != row["checksum"]:
+                raise ForgeError(f"{table} row failed its integrity checksum")
+            result[row["key"]] = parsed
+        return result
+    finally:
+        connection.close()
+
+
+def load_principals_readonly(root: Path) -> dict[str, dict]:
+    """Load only immutable principal rows without writes, leases, or schema changes."""
+    record = read_backend_record(root)
+    if record["backend"] == "sqlite":
+        return _load_table_readonly_sqlite(root / "store.sqlite3", "principals")
+    dsn = _PostgresBackend._scoped_dsn(record["dsn"], root)
+    return _load_table_readonly_postgres(dsn, "principals")
+
+
+def load_forge_meta_readonly(root: Path) -> dict:
+    """Load only the immutable forge_meta row without writes, leases, or schema changes."""
+    record = read_backend_record(root)
+    if record["backend"] == "sqlite":
+        import sqlite3
+
+        path = root / "store.sqlite3"
+        if not path.exists():
+            raise ForgeError("forge state is not initialized")
+        uri = f"file:{path}?mode=ro"
+        connection = sqlite3.connect(uri, uri=True, timeout=30.0)
+        try:
+            connection.row_factory = sqlite3.Row
+            rows = connection.execute(
+                "SELECT doc, checksum FROM forge_meta WHERE id = 1"
+            ).fetchall()
+            if not rows:
+                raise ForgeError("forge state is not initialized")
+            parsed = json.loads(rows[0]["doc"])
+            if _checksum(parsed) != rows[0]["checksum"]:
+                raise ForgeError("forge meta row failed its integrity checksum")
+            return parsed
+        finally:
+            connection.close()
+    try:
+        import psycopg
+    except ImportError as error:
+        raise ForgeError(
+            'the postgres backend requires psycopg 3: pip install "psycopg[binary]"'
+        ) from error
+    dsn = _PostgresBackend._scoped_dsn(record["dsn"], root)
+    connection = psycopg.connect(dsn, autocommit=False)
+    try:
+        connection.execute("BEGIN READ ONLY")
+        rows = connection.execute(
+            "SELECT doc, checksum FROM forge_meta WHERE id = 1"
+        ).fetchall()
+        if not rows:
+            raise ForgeError("forge state is not initialized")
+        parsed = json.loads(rows[0]["doc"])
+        if _checksum(parsed) != rows[0]["checksum"]:
+            raise ForgeError("forge meta row failed its integrity checksum")
+        return parsed
+    finally:
+        connection.close()
+
+
 def database_uri(root: Path, database: str | None = None) -> str:
     if database:
         return database
@@ -81,10 +183,6 @@ def database_uri(root: Path, database: str | None = None) -> str:
 
 def _sqlite_ddl() -> list[str]:
     return [
-        """CREATE TABLE IF NOT EXISTS storage_schema (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            version INTEGER NOT NULL,
-            initialized_at REAL NOT NULL)""",
         """CREATE TABLE IF NOT EXISTS storage_locks (
             scope TEXT PRIMARY KEY,
             owner TEXT NOT NULL,
@@ -114,10 +212,6 @@ def _sqlite_ddl() -> list[str]:
 
 def _postgres_ddl() -> str:
     statements = [
-        """CREATE TABLE IF NOT EXISTS storage_schema (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            version INTEGER NOT NULL,
-            initialized_at DOUBLE PRECISION NOT NULL)""",
         """CREATE TABLE IF NOT EXISTS forge_meta (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             doc TEXT NOT NULL,
@@ -336,13 +430,6 @@ class _PostgresBackend:
         connection = self.connect()
         try:
             self.create_schema(connection)
-            with connection.cursor() as cursor:
-                cursor.execute("DELETE FROM storage_schema")
-                cursor.execute(
-                    "INSERT INTO storage_schema (id, version, initialized_at) VALUES (1, %s, %s)",
-                    (STORAGE_SCHEMA_VERSION, time.time()),
-                )
-            self.commit(connection)
             for ndjson in sorted(tables_dir.glob("*.ndjson")):
                 table = ndjson.stem
                 if table == "storage_locks":
@@ -421,13 +508,8 @@ class Store:
         self.backend.begin(self.connection)
         try:
             self.backend.create_schema(self.connection)
-            rows = self._fetchall("SELECT version FROM storage_schema WHERE id = 1", ())
-            versions = {row["version"] for row in rows}
-            if not versions:
-                self._insert_placeholder_free(
-                    "INSERT INTO storage_schema (id, version, initialized_at)",
-                    (1, STORAGE_SCHEMA_VERSION, time.time()),
-                )
+            rows = self._fetchall("SELECT doc FROM forge_meta WHERE id = 1", ())
+            if not rows:
                 self._save_table(
                     "forge_meta",
                     {
@@ -439,11 +521,6 @@ class Store:
                         }
                     },
                     id_column=True,
-                )
-            elif versions != {STORAGE_SCHEMA_VERSION}:
-                found = ", ".join(str(item) for item in sorted(versions))
-                raise ForgeError(
-                    f"storage schema version {found} is incompatible with this build"
                 )
             self._ensure_indexes()
             self.backend.commit(self.connection)
@@ -850,7 +927,6 @@ class Store:
         )
         return {
             "backend": self.backend.kind,
-            "schema_version": STORAGE_SCHEMA_VERSION,
             "counts": counts,
             "leases": [
                 {
@@ -911,8 +987,10 @@ def restore_forge(backup: Path, new_root: Path, database: str | None = None) -> 
         manifest = json.loads(manifest_path.read_text())
     except (OSError, json.JSONDecodeError) as error:
         raise ForgeError(f"cannot read backup manifest: {error}") from error
-    if manifest.get("format") != "bastion-wal-backup" or manifest.get("format_version") != 1:
+    if manifest.get("format") != "bastion-wal-backup":
         raise ForgeError("backup format is unsupported")
+    if new_root.exists() and any(new_root.iterdir()):
+        raise ForgeError(f"restore target is not empty: {new_root}")
     return _restore_repository(backup, new_root, database, manifest)
 
 
@@ -946,6 +1024,7 @@ def _backup_repository(root: Path, destination: Path, store: Store) -> Path:
             descriptor_ids.add(payload["descriptor_id"])
             pack_refs.extend((payload["canonical_pack"], payload["submission_pack"]))
         elif record["kind"] == "canonical_update":
+            descriptor_ids.add(payload["descriptor_id"])
             pack_refs.append(payload["canonical_pack"])
         elif record["kind"] == "policy_transition":
             descriptor_ids.update(item["new_descriptor_id"] for item in payload["views"])
@@ -973,7 +1052,6 @@ def _backup_repository(root: Path, destination: Path, store: Store) -> Path:
             store.backend.dump(destination / "tables")
         metadata = {
             "format": "bastion-wal-backup",
-            "format_version": 1,
             "created_at": time.time(),
             "repository_id": repository.repository_id,
             "head_seq": manifest.head_seq,

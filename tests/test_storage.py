@@ -21,7 +21,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from errors import ForgeError
 from store import (
-    STORAGE_SCHEMA_VERSION,
     _PostgresBackend,
     _SqliteBackend,
     _checksum,
@@ -147,18 +146,6 @@ class StorageCoreTest(BackendMatrix, unittest.TestCase):
                 with self.assertRaises(ForgeError):
                     open_store(fresh).load_document()
 
-    def test_schema_version_mismatch_is_fatal(self) -> None:
-        for name, root in self.forges():
-            with self.subTest(name):
-                store = open_store(root)
-                store.save_document(document(), [], None)
-                store.close()
-                _set_schema_version(root, name, STORAGE_SCHEMA_VERSION + 1)
-                fresh_root = root
-                with self.assertRaises(ForgeError):
-                    store = open_store(fresh_root)
-                    store.bootstrap()
-
     def test_wrong_backend_record_is_fatal(self) -> None:
         root = Path(tempfile.mkdtemp()) / "forge"
         root.mkdir(parents=True)
@@ -273,7 +260,6 @@ class AuditTest(BackendMatrix, unittest.TestCase):
                 store.save_document(doc, [], None)
                 stats = store.stats()
                 self.assertEqual(name, stats["backend"])
-                self.assertEqual(STORAGE_SCHEMA_VERSION, stats["schema_version"])
                 self.assertEqual({"published": 1}, stats["counts"]["transactions"])
                 self.assertEqual({"completed": 1, "dead": 1}, stats["counts"]["jobs"])
                 self.assertEqual(1, stats["dead_letters"])
@@ -358,23 +344,6 @@ def _corrupt_row(
     )
     with psycopg.connect(_pg_dsn_for(root), autocommit=True) as connection:
         connection.execute(f"UPDATE {table} SET {expression} WHERE key = %s", (key,))
-
-
-def _set_schema_version(root: Path, backend: str, version: int) -> None:
-    if backend == "sqlite":
-        connection = sqlite3.connect(root / "store.sqlite3")
-        try:
-            connection.execute(
-                "UPDATE storage_schema SET version = ?", (version,)
-            )
-            connection.commit()
-        finally:
-            connection.close()
-        return
-    import psycopg
-
-    with psycopg.connect(_pg_dsn_for(root), autocommit=True) as connection:
-        connection.execute("UPDATE storage_schema SET version = %s", (version,))
 
 
 def _expire_leases(root: Path, backend: str, by: float) -> None:

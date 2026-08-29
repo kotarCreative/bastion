@@ -22,10 +22,14 @@ The event fingerprint makes retries deterministic. An optional HTTP idempotency 
 - `import`: initial canonical branch, pack, and existing logical-change claims.
 - `view_create`: principal, descriptor generation, projection epoch, and canonical frontier.
 - `submission`: canonical transition, exact submitted evidence, mappings, transport identity, and optional idempotency hash.
-- `canonical_update`: authorized administrative fast-forward and canonical pack.
+- `canonical_update`: authorized administrative fast-forward, captured descriptor identity, canonical pack, and received-at timestamp.
 - `policy_transition`: atomic descriptor and projection-epoch changes for all active views of one principal.
 
-Each record has an exact validated shape, structural `format_version`, contiguous sequence, previous-record pointer, publication ID, event fingerprint, and event ID.
+Each record has an exact validated shape, contiguous sequence, previous-record pointer, publication ID, event fingerprint, and event ID. This greenfield implementation intentionally omits format-version fields because no legacy formats exist.
+
+## Descriptor Capture
+
+View submissions and creations record the assigned descriptor identity and generation; the view keeps that assignment until a policy transition. Administrative canonical updates resolve one fresh descriptor from the catalog snapshot current when the command starts and capture its identity in the event fingerprint and payload. The captured descriptor is the only policy input used to authorize the update, remains fixed for retries and ambiguous-write resolution, and is uploaded as an immutable object before the WAL record commits.
 
 ## Derived Work
 

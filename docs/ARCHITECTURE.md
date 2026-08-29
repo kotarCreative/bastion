@@ -26,9 +26,9 @@ Administrative canonical updates and policy transitions use the same WAL publica
 
 ## Identity
 
-Principals are users or service accounts. Immutable teams, roles, and bindings resolve into a content-addressed effective descriptor containing provenance and per-capability allow and deny prefixes. Descriptor identity is independent of a physical view name.
+Principals are users or service accounts. Immutable teams, roles, and bindings resolve into a content-addressed effective descriptor (algorithm `capabilities-v3`) containing provenance and per-capability allow and deny prefixes. Prefix lists are normalized, sorted, and exact-deduplicated but never ancestor-minimized, so every prefix that can win longest-match adjudication is preserved. Descriptor identity is independent of a physical view name.
 
-Every authorization-sensitive WAL record captures descriptor identity and generation. Catalog changes remain dormant until an explicit principal transition publishes a new epoch.
+View operations capture the assigned descriptor identity and generation. Administrative canonical updates resolve one fresh descriptor from the locked catalog snapshot and capture its identity; the descriptor object is uploaded as an immutable prerequisite before the WAL record commits. Catalog changes remain dormant until an explicit principal transition publishes a new epoch.
 
 ## Control Plane
 
@@ -40,4 +40,4 @@ The control-plane document has exact top-level fields. Repository lifecycle is `
 
 Opening a write session replays committed WAL records to refresh derived transactions, changes, and active-view indexes. Canonical and view caches are reconstructed on demand from manifest-reachable packs. Intake repositories are recreated from active view generations.
 
-Backup pins one manifest generation, copies exactly its reachable WAL, packs, descriptors, configuration, and control-plane snapshot, and records hashes for restore verification.
+Backup pins one manifest generation, copies exactly its reachable WAL, packs, descriptors, configuration, and control-plane snapshot, and records hashes for restore verification. Repository configuration, manifest, WAL records, and backups intentionally omit format-version fields because this is a greenfield implementation with no legacy formats to support.

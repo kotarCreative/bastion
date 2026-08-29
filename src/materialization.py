@@ -211,7 +211,6 @@ def _install_intake_hooks(root: Path, view_id: str, intake: Path) -> None:
 
 def _canonical_cursor(manifest: Manifest) -> dict:
     return {
-        "format_version": 1,
         "applied_seq": manifest.head_seq,
         "head_record_key": manifest.wal_head.key,
         "head_publication_id": manifest.wal_head.publication_id,
@@ -270,7 +269,6 @@ def _view_cursor(
     manifest: Manifest, view_id: str, active: dict, projected_tip: str
 ) -> dict:
     return {
-        "format_version": 1,
         "view_id": view_id,
         "applied_seq": manifest.head_seq,
         "head_record_key": manifest.wal_head.key,

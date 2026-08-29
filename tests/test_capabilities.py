@@ -380,8 +380,12 @@ class AdminCapabilityTest(unittest.TestCase):
     def test_update_within_coverage_is_recorded_with_the_actor(self) -> None:
         old, new = self._stage("team-a/approved.txt", "allowed\n")
         update_canonical(self.forge, old, new, "scoped-admin")
-        transaction = wal_records(self.forge, "canonical_update")[-1]["payload"]
+        record = wal_records(self.forge, "canonical_update")[-1]
+        transaction = record["payload"]
         self.assertEqual("scoped-admin", transaction["principal_id"])
+        self.assertIn("descriptor_id", transaction)
+        self.assertEqual(transaction["descriptor_id"], record["event_fingerprint"]["descriptor_id"])
+        self.assertIn("received_at", transaction)
         self.assertEqual(new, repository_state(self.forge)[0].canonical_tip)
 
 

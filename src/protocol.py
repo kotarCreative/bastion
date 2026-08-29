@@ -114,9 +114,10 @@ def validate_commit_metadata(
     commits: list[str],
     principal_id: str,
     hook_env: dict[str, str],
+    received_at: int,
 ) -> None:
     """Enforce author binding and timestamp bounds before any promotion."""
-    deadline = time.time() + identity.TIMESTAMP_SKEW_SECONDS
+    deadline = received_at + identity.TIMESTAMP_SKEW_SECONDS
     for submitted_oid in commits:
         email, author_ts, committer_ts = commit_metadata(destination, submitted_oid, hook_env)
         identity.require_author_binding(state, principal_id, email)
@@ -134,6 +135,7 @@ def prepare_submission(
     hook_env: dict[str, str],
     state: dict | None = None,
     canonical: Path | None = None,
+    received_at: int | None = None,
 ):
     destination = intake_repo(root, name)
     canonical = canonical or canonical_repo(root)
@@ -141,8 +143,10 @@ def prepare_submission(
     enforce_pack_limits(destination, old, new, hook_env)
     verify_no_extra_objects(destination, new, hook_env)
     if state is not None:
+        if received_at is None:
+            raise ForgeError("submission is missing a captured receive time")
         validate_commit_metadata(
-            state, destination, commits, view["principal_id"], hook_env
+            state, destination, commits, view["principal_id"], hook_env, received_at
         )
     canonical_old = ref(canonical, view["canonical_ref"])
     if git(
@@ -277,8 +281,9 @@ def pre_receive(root: Path, name: str, updates: bytes) -> None:
         old, new, _updated_ref = validate_ref_update(view, parsed)
         canonical = ensure_canonical_materialized(root, manifest, repository)
         hook_env = os.environ.copy()
+        received_at = int(time.time())
         transition = prepare_submission(
-            root, name, view, descriptor, old, new, hook_env, state=control, canonical=canonical
+            root, name, view, descriptor, old, new, hook_env, state=control, canonical=canonical, received_at=received_at
         )
         for mapping in transition.mappings:
             change_id = mapping["change_id"]
@@ -321,7 +326,7 @@ def pre_receive(root: Path, name: str, updates: bytes) -> None:
             "canonical_pack": canonical_ref,
             "submission_pack": submission_ref,
             "mappings": transition.mappings,
-            "received_at": int(time.time()),
+            "received_at": received_at,
             "transport": context.transport,
             "remote_identity": context.remote_addr,
         }

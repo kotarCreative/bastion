@@ -72,6 +72,11 @@ protected service storage, database authorization, and rate limiting.
 9. A `Change-Id` never grants read, write, or ancestry authority.
 10. Canonical branch updates must pass through the serialized coordinator.
 
+`forge.py check` independently verifies these invariants from manifest-reachable
+objects using read-only control-plane access, reporting failures with stable
+categories (`REPOSITORY`, `GRAPH`, `AUTHORIZATION`, `METADATA`, `PROJECTION`,
+`ISOLATION`) and without exposing hidden path contents.
+
 ## Read Isolation
 
 Each projected repository contains an authorization-safe reachable closure and
@@ -90,29 +95,39 @@ changes can only govern future server operations.
 ## Descriptor-Bound Authorization
 
 Authorization never reads live policy at transaction time. Each view binds one
-immutable generation-1 descriptor; source transactions capture their source and
-all target descriptors before the canonical compare-and-swap, and events, jobs,
-plans, anchors, and revisions copy that exact assignment. Workers revalidate
-assignment equality at claim, plan persistence, publication, adoption, and
-completion, failing closed with `projection descriptor changed` before any ref
-movement. Recovery replays with captured descriptors and refuses to advance a
-source cursor whose view no longer matches its recorded assignment.
+immutable generation-1 descriptor; source transactions capture their source
+assignment before the canonical compare-and-swap. Workers materialize views
+from the captured assignment and fail closed if the active assignment differs.
+Recovery replays with captured descriptors and refuses to advance a source
+cursor whose view no longer matches its recorded assignment.
+
+Administrative canonical updates are viewless: they resolve one fresh effective
+descriptor from the locked catalog snapshot at command start, capture its
+identity in the WAL event, and use that immutable descriptor as the only policy
+input for every commit transition in the range. The captured descriptor is
+uploaded before the WAL record commits and remains fixed for retries and
+ambiguous-write resolution.
 
 Consequence: a worker can never publish under permissions different from those
-that authorized the submission, and independently recomputable descriptor IDs
-let the global checker verify every historical decision without trusting the
-runtime. Catalog additions are dormant until a quiescent policy transition;
-revocation then applies to future projections and pushes, while data already
-projected or downloaded is explicitly non-revocable.
+that authorized the submission, an administrative update can never collapse
+its range into a net diff, and independently recomputable descriptor IDs let the
+global checker verify every historical decision without trusting the runtime.
+Catalog additions are dormant until a quiescent policy transition; revocation
+then applies to future projections and pushes, while data already projected or
+downloaded is explicitly non-revocable.
 
 ## Write Authorization
 
 Roles grant and deny path-scoped capabilities (`read create modify delete mode
 symlink branch merge admin tag`). For every changed path the forge classifies
 its effects, requires `read` coverage plus each effect capability, and
-adjudicates pointwise: the capability applies only when the longest allow
-prefix covering the path exists and is strictly longer than any deny prefix
-covering it. Equal prefixes or a longer deny win; denies never grant access.
+adjudicates pointwise: the longest component-boundary allow prefix covering the
+path must exist; if no deny covers the path the capability is allowed;
+otherwise it is allowed only when the allow prefix is strictly longer than the
+deny prefix. Equal specificity is denied. Prefix lists are normalized, sorted,
+and exact-deduplicated but never ancestor-minimized, so a nested deny that can
+win longest-prefix adjudication is preserved and a still-narrower allow may
+override it.
 
 ## Metadata Authorization
 
@@ -121,9 +136,10 @@ principal with declared addresses may submit only commits authored by one of
 them; undeclared identities fail closed before any object promotion, and the
 global checker re-verifies every confirmed mapping against the same records.
 Principals without declared addresses remain unrestricted by explicit
-operator choice. Submitted commits must not be dated more than ten minutes
-into the future; receive time is recorded on transactions as `received_at`
-and re-verified by the checker where present. Messages stay byte-exact,
+operator choice. Each submission captures one integer `received_at` before
+metadata validation; the same value defines the future timestamp deadline and
+is written into the WAL payload. The checker re-verifies timestamp bounds
+against the recorded `received_at`. Messages stay byte-exact,
 topology stays linear with `merge` reserved, views expose exactly one
 projected ref with `branch` reserved, tags remain unsupported data-plane
 entries with `tag` reserved, and `Change-Id` ownership rules are unchanged.

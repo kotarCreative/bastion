@@ -13,7 +13,6 @@ import identity
 from errors import ForgeError
 
 
-FORMAT_VERSION = 1
 OBJECT_FORMAT = "sha1"
 PROJECTION_ALGORITHM = "projection-v2"
 OID_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -156,6 +155,18 @@ def _pack_ref(value: object, expected_kind: str | None = None) -> dict:
     return copy.deepcopy(result)
 
 
+def _normalized_capability_list(value: object, subject: str) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        _fail(f"{subject} must be a list of path strings")
+    try:
+        normalized = [identity.normalize_prefix(item) for item in value]
+    except ForgeError as error:
+        _fail(f"{subject} has an invalid prefix: {error}")
+    if value != sorted(set(normalized)):
+        _fail(f"{subject} must be sorted, unique, and normalized")
+    return copy.deepcopy(value)
+
+
 def validate_descriptor(record: object) -> dict:
     fields = {
         "id", "algorithm", "principal_id", "principal_kind", "canonical_ref",
@@ -180,8 +191,8 @@ def validate_descriptor(record: object) -> dict:
         values = payload[name]
         if not isinstance(values, dict) or set(values) != set(identity.CAPABILITIES):
             _fail(f"descriptor {name} has an invalid shape")
-        if any(not isinstance(item, list) or not all(isinstance(path, str) for path in item) for item in values.values()):
-            _fail(f"descriptor {name} has invalid paths")
+        for capability in identity.CAPABILITIES:
+            _normalized_capability_list(values[capability], f"descriptor {name}.{capability}")
     if identity.compute_descriptor_id(payload) != identifier:
         _fail("descriptor ID does not match its canonical payload")
     return copy.deepcopy(record)
@@ -221,7 +232,6 @@ class Manifest:
 
     def to_dict(self) -> dict:
         return {
-            "format_version": FORMAT_VERSION,
             "repository_id": self.repository_id,
             "object_format": self.object_format,
             "canonical_ref": self.canonical_ref,
@@ -238,7 +248,6 @@ class Manifest:
     @classmethod
     def from_dict(cls, value: object) -> "Manifest":
         fields = {
-            "format_version",
             "repository_id",
             "object_format",
             "canonical_ref",
@@ -252,8 +261,6 @@ class Manifest:
             "writer",
         }
         record = _exact(value, fields, "manifest")
-        if record["format_version"] != FORMAT_VERSION:
-            _fail("manifest format_version is unsupported")
         repository_id = _uuid(record["repository_id"], "manifest repository_id")
         if record["object_format"] != OBJECT_FORMAT:
             _fail("manifest object_format is unsupported")
@@ -346,7 +353,7 @@ def record_fingerprint(repository_id: str, kind: str, payload: dict) -> dict:
             "kind": kind,
             "repository_id": repository_id,
             **{key: payload.get(key) for key in (
-                "principal_id", "canonical_ref", "canonical_old", "canonical_new",
+                "principal_id", "descriptor_id", "canonical_ref", "canonical_old", "canonical_new",
             )},
         }
     elif kind == "policy_transition":
@@ -365,7 +372,6 @@ def record_fingerprint(repository_id: str, kind: str, payload: dict) -> dict:
 
 def validate_record(value: object, *, repository_id: str | None = None) -> dict:
     fields = {
-        "format_version",
         "seq",
         "kind",
         "event_fingerprint",
@@ -377,8 +383,6 @@ def validate_record(value: object, *, repository_id: str | None = None) -> dict:
         "payload",
     }
     record = _exact(value, fields, "WAL record")
-    if record["format_version"] != FORMAT_VERSION:
-        _fail("record format_version is unsupported")
     seq = _integer(record["seq"], "record seq", 1)
     kind = record["kind"]
     if kind not in KINDS:
@@ -533,13 +537,15 @@ def _validate_payload(
         _require_descriptor(descriptor_id, loader, value["principal_id"], value["canonical_ref"])
         return
     if kind == "canonical_update":
-        fields = {"principal_id", "canonical_ref", "canonical_old", "canonical_new", "canonical_pack", "commits"}
+        fields = {"principal_id", "descriptor_id", "canonical_ref", "canonical_old", "canonical_new", "canonical_pack", "commits", "received_at"}
         value = _exact(payload, fields, "canonical_update payload")
         _string(value["principal_id"], "canonical update principal")
+        descriptor_id = _descriptor_id(value["descriptor_id"], "canonical update descriptor_id")
         _ref(value["canonical_ref"], "canonical update ref")
         _oid(value["canonical_old"], "canonical update old")
         _oid(value["canonical_new"], "canonical update new")
         _pack_ref(value["canonical_pack"], "canonical")
+        _integer(value["received_at"], "canonical update received_at", 0)
         if not isinstance(value["commits"], list) or not value["commits"]:
             _fail("canonical update commits must be nonempty")
         seen: set[str] = set()
@@ -551,6 +557,7 @@ def _validate_payload(
             seen.add(oid)
             if commit["change_id"] is not None:
                 _string(commit["change_id"], "canonical update Change-Id")
+        _require_descriptor(descriptor_id, loader, value["principal_id"], value["canonical_ref"])
         return
     fields = {"principal_id", "canonical_frontier", "views"}
     value = _exact(payload, fields, "policy_transition payload")

@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from errors import ForgeError
 from state import load_state
-from store import STORAGE_SCHEMA_VERSION, initialize_store, open_store
+from store import initialize_store, open_store
 
 
 WORKER_SCRIPT = textwrap.dedent(
@@ -250,15 +250,6 @@ class TamperTest(AdversarialStorageBase):
         with self.assertRaises(ForgeError):
             load_state(self.root)
 
-    def test_forged_schema_version_blocks_bootstrap(self) -> None:
-        self._seed()
-        self._tamper(
-            "UPDATE storage_schema SET version = ?", (STORAGE_SCHEMA_VERSION + 7,)
-        )
-        store = open_store(self.root)
-        with self.assertRaises(ForgeError):
-            store.bootstrap()
-        store.close()
 
 
 class HostileDataTest(AdversarialStorageBase):

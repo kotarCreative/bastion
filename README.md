@@ -13,7 +13,8 @@ restrictions:
 - principals (users and service accounts), immutable teams, roles, and
   bindings resolve to content-addressed effective view descriptors;
 - every authorization decision uses the descriptor captured in the committed
-  WAL event;
+  WAL event; view assignment generations are distinct from the immutable
+  descriptor captured for administrative updates;
 - accepted commits retain their exact Git IDs in the submitting view;
 - other views receive synthetic commits only for changes visible to them;
 - hidden-only canonical commits do not move an unaffected projected ref;
@@ -66,9 +67,9 @@ git clone --no-local /tmp/bastion-forge/views/alice.git alice
 ```
 
 Roles grant and deny path-scoped capabilities (`read create modify delete mode
-symlink branch merge admin tag`); more-specific denies override broader allows.
-A principal with declared emails may only push commits authored by one of them.
-Catalog additions stay dormant until an explicit transition applies them:
+symlink branch merge admin tag`); ten capabilities are adjudicated by longest
+matching prefix, with equal specificity denied. Catalog additions stay dormant
+until an explicit transition applies them:
 
 ```bash
 python3 forge.py transition-principal /tmp/bastion-forge alice

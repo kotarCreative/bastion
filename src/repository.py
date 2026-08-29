@@ -26,7 +26,6 @@ from object_store import (
 )
 from object_store_fs import FilesystemObjectStore
 from wal import (
-    FORMAT_VERSION,
     Manifest,
     ReplayState,
     WalHead,
@@ -64,11 +63,9 @@ def _config(root: Path) -> dict:
         value = json.loads(raw)
     except (OSError, json.JSONDecodeError) as error:
         raise ForgeError(f"cannot read repository configuration: {error}") from error
-    expected = {"format_version", "repository_id", "canonical_branch", "object_store"}
+    expected = {"repository_id", "canonical_branch", "object_store"}
     if not isinstance(value, dict) or set(value) != expected:
         raise ForgeError("repository configuration has an invalid shape", "integrity")
-    if value["format_version"] != FORMAT_VERSION:
-        raise ForgeError("repository configuration format is unsupported", "integrity")
     if (
         not isinstance(value["repository_id"], str)
         or len(value["repository_id"]) != 32
@@ -95,7 +92,6 @@ def write_repository_config(
     except ValueError:
         rendered = str(object_store_path)
     value = {
-        "format_version": FORMAT_VERSION,
         "repository_id": repository_id,
         "canonical_branch": canonical_branch,
         "object_store": {"kind": "filesystem", "path": rendered},
@@ -282,7 +278,6 @@ class Repository:
     ) -> dict:
         identifier = event_id(fingerprint)
         return {
-            "format_version": FORMAT_VERSION,
             "seq": seq,
             "kind": fingerprint["kind"],
             "event_fingerprint": copy.deepcopy(fingerprint),

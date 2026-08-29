@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import time
 import uuid
 from pathlib import Path
 
@@ -319,19 +320,34 @@ def _changed_paths_between(canonical: Path, expected: str, new: str) -> set[byte
     }
 
 
+def _commit_parent(canonical: Path, oid: str) -> str:
+    """Return the first parent of a commit, or ZERO_OID for a root commit."""
+    from layout import ZERO_OID
+
+    parents = output(canonical, "show", "-s", "--format=%P", oid).split()
+    return parents[0] if parents else ZERO_OID
+
+
 def require_admin_coverage(
-    state: dict, principal_id: str, canonical: Path, expected: str, new: str
+    descriptor: dict, canonical: Path, expected: str, new: str
 ) -> None:
-    """Require the acting principal's descriptor to hold admin over every change."""
-    canonical_ref = f"refs/heads/{state['canonical_branch']}"
-    descriptor = identity.effective_descriptor(state, principal_id, canonical_ref)
+    """Require the captured descriptor to hold admin over every commit transition."""
     allow = descriptor["capabilities"]["admin"]
     restrictions = descriptor["restrictions"]["admin"]
-    for path in sorted(_changed_paths_between(canonical, expected, new)):
-        if not capability_allowed(allow, restrictions, path):
-            raise ForgeError(
-                "acting principal lacks admin coverage for the canonical update"
-            )
+    from git import first_parent_commits
+
+    previous = expected
+    for oid in first_parent_commits(canonical, expected, new):
+        before = tree_entries(canonical, previous)
+        after = tree_entries(canonical, oid)
+        changed = before.keys() | after.keys()
+        for path in changed:
+            if before.get(path) != after.get(path):
+                if not capability_allowed(allow, restrictions, path):
+                    raise ForgeError(
+                        "acting principal lacks admin coverage for the canonical update"
+                    )
+        previous = oid
 
 
 def update_canonical_ref(root: Path, expected: str, new: str, principal_id: str) -> None:
@@ -341,8 +357,15 @@ def update_canonical_ref(root: Path, expected: str, new: str, principal_id: str)
         raise ForgeError("forge initialization is incomplete")
     repository = Repository.open(root)
     canonical_ref = f"refs/heads/{state['canonical_branch']}"
+    # Capture one immutable descriptor from the locked catalog snapshot before
+    # any publication work begins. It remains fixed for retries and ambiguous
+    # write resolution, and is uploaded as an immutable prerequisite before the
+    # WAL record commits.
+    captured_descriptor = identity.effective_descriptor(state, principal_id, canonical_ref)
+    received_at = int(time.time())
     fingerprint_payload = {
         "principal_id": principal_id,
+        "descriptor_id": captured_descriptor["id"],
         "canonical_ref": canonical_ref,
         "canonical_old": expected,
         "canonical_new": new,
@@ -365,7 +388,7 @@ def update_canonical_ref(root: Path, expected: str, new: str, principal_id: str)
         info.mkdir(parents=True, exist_ok=True)
         (info / "alternates").write_text(f"{(canonical / 'objects').resolve()}\n")
         validate_canonical_update(staging, expected, new)
-        require_admin_coverage(state, principal_id, staging, expected, new)
+        require_admin_coverage(captured_descriptor, staging, expected, new)
         from git import commit_message, first_parent_commits
 
         commits = [
@@ -381,14 +404,17 @@ def update_canonical_ref(root: Path, expected: str, new: str, principal_id: str)
         pack_ref = pack.reference("packs/canonical")
         payload = {
             "principal_id": principal_id,
+            "descriptor_id": captured_descriptor["id"],
             "canonical_ref": canonical_ref,
             "canonical_old": expected,
             "canonical_new": new,
             "canonical_pack": pack_ref,
             "commits": commits,
+            "received_at": received_at,
         }
 
         def upload(target: Repository) -> None:
+            target.put_descriptor(captured_descriptor)
             upload_pack(target, "packs/canonical", pack)
             checkpoint(root, "wal.canonical_pack_uploaded")
 

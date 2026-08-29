@@ -15,6 +15,7 @@ python3 -m py_compile forge.py src/*.py tests/*.py
 ## Coverage Areas
 
 - `test_wal.py`, `test_invariants.py`: linked records, manifest CAS, object closure, and read-only checking.
+- `test_permission_integrity.py`: descriptor v3 prefix semantics, captured administrative descriptors, received-time verification, backup descriptor reachability, and checker failure categories.
 - `test_forge.py`, `test_cross_view.py`, `test_tree_operations.py`: projection and publication behavior.
 - `test_rejection_immutability.py`, `test_adversarial.py`, `test_transport_adversarial.py`: fail-closed validation and hidden-object isolation.
 - `test_identity.py`, `test_capabilities.py`, `test_metadata.py`: principals, descriptors, policy epochs, and metadata authorization.

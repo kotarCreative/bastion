@@ -70,7 +70,6 @@ class BackupRestoreTest(unittest.TestCase):
         backup_forge(fixture.root, destination)
         metadata = json.loads((destination / "manifest.json").read_text())
         self.assertEqual("bastion-wal-backup", metadata["format"])
-        self.assertEqual(1, metadata["format_version"])
         self.assertIn("manifest.json", {item["key"] for item in metadata["objects"]})
         self.assertFalse((destination / "repos").exists())
 

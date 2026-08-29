@@ -148,13 +148,13 @@ class PrefixAlgebraTest(unittest.TestCase):
             add_role(state, "empty", {key: [] for key in identity.CAPABILITIES},
                      {key: [] for key in identity.CAPABILITIES})
 
-    def test_capability_maps_must_hold_exactly_nine_keys(self) -> None:
+    def test_capability_maps_must_hold_exactly_ten_keys(self) -> None:
         state = catalog()
         allow, _deny = capability_grants(["shared"], [])
-        with self.assertRaisesRegex(ForgeError, "nine capabilities"):
+        with self.assertRaisesRegex(ForgeError, "ten capabilities"):
             add_role(state, "broken", {key: [] for key in ("read", "write")}, {})
         del allow["mode"]
-        with self.assertRaisesRegex(ForgeError, "nine capabilities"):
+        with self.assertRaisesRegex(ForgeError, "ten capabilities"):
             add_role(state, "broken", allow, {key: [] for key in identity.CAPABILITIES})
 
 
@@ -228,7 +228,7 @@ class ResolutionTest(unittest.TestCase):
         self.assertEqual(["team-a"], descriptor["capabilities"]["read"])
         self.assertEqual(["team-a", "team-b"], descriptor["capabilities"]["modify"])
 
-    def test_root_read_with_nested_write_union_minimizes(self) -> None:
+    def test_write_unions_preserve_nested_prefixes(self) -> None:
         state = catalog()
         add_principal(state, "wide")
         allow, _ = capability_grants([""], ["team-a", "team-a/private"])
@@ -236,7 +236,7 @@ class ResolutionTest(unittest.TestCase):
         bind_role(state, "wide", "principal", "wide")
         descriptor = effective_descriptor(state, "wide", "refs/heads/main")
         self.assertEqual([""], descriptor["capabilities"]["read"])
-        self.assertEqual(["team-a"], descriptor["capabilities"]["modify"])
+        self.assertEqual(["team-a", "team-a/private"], descriptor["capabilities"]["modify"])
 
     def test_denies_union_separately_from_allows(self) -> None:
         state = catalog()
@@ -252,7 +252,7 @@ class ResolutionTest(unittest.TestCase):
         descriptor = effective_descriptor(state, "alice", "refs/heads/main")
         self.assertEqual(["docs", "shared"], descriptor["capabilities"]["read"])
         self.assertEqual(
-            ["docs/drafts", "shared/private"],
+            ["docs/drafts", "shared/private", "shared/private/deep"],
             descriptor["restrictions"]["read"],
         )
 
