@@ -6,12 +6,19 @@ Run the complete suite:
 python3 -m unittest discover -s tests -t . -v
 ```
 
-The demo server tests require Flask; install them first when running those tests:
+The demo server tests require Flask, which is managed by Poetry:
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -r requirements-demo.txt
-.venv/bin/python -m unittest tests.test_demo_server -v
+python3 -m venv .poetry
+.poetry/bin/pip install poetry
+.poetry/bin/poetry install
+.poetry/bin/poetry run python -m unittest tests.test_demo_server -v
+```
+
+Run the complete suite through Poetry:
+
+```bash
+.poetry/bin/poetry run python -m unittest discover -s tests -t . -v
 ```
 
 Compile all Python entry points:
