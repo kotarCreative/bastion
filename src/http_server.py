@@ -96,6 +96,8 @@ def decode_body(
     body: bytes, encoding: str | None, maximum: int | None = None
 ) -> bytes:
     if not encoding or encoding.lower() == "identity":
+        if maximum is not None and len(body) > maximum:
+            raise HttpError(400, BODY_400)
         return body
     if encoding.lower() == "gzip":
         try:

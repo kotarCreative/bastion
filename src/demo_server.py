@@ -27,16 +27,18 @@ from flask import (
     session,
     url_for,
 )
+from werkzeug.exceptions import RequestEntityTooLarge
 
 from errors import ForgeError
-from git import output as git_output, ref as git_ref, tree_entries
+from git import git as git_command, ref as git_ref, tree_entries
 from http_server import (
     BODY_401,
     BODY_404,
     CACHE_HEADERS,
+    HttpError,
+    RECEIVE_MAX_BODY,
     SERVICES,
     UPLOAD_MAX_BODY,
-    RECEIVE_MAX_BODY,
     decode_body,
     load_tokens,
     parse_authorization,
@@ -51,17 +53,8 @@ from identity import CAPABILITIES
 from validation import capability_allowed, longest_covering, normalize_prefix
 
 
-class DemoHttpError(Exception):
-    def __init__(
-        self,
-        status: int,
-        body: bytes,
-        headers: dict[str, str] | None = None,
-    ):
-        super().__init__(f"{status}: {body.decode(errors='replace')}")
-        self.status = status
-        self.body = body
-        self.headers = headers or {}
+class DemoHttpError(HttpError):
+    """HTTP error raised by demo routes; handled like any transport HttpError."""
 
 
 def _forge_root(app: Flask) -> Path:
@@ -132,6 +125,24 @@ def _materialized_path(root: Path, view: str) -> Path:
     return materialized.path
 
 
+def _read_bounded_body(maximum: int) -> bytes:
+    """Buffer the request body in chunks without exceeding ``maximum`` bytes."""
+    chunks: list[bytes] = []
+    total = 0
+    stream = request.stream
+    try:
+        while True:
+            block = stream.read(min(65536, maximum - total + 1))
+            if not block:
+                return b"".join(chunks)
+            total += len(block)
+            chunks.append(block)
+            if total > maximum:
+                raise DemoHttpError(413, b"content too large")
+    except RequestEntityTooLarge as error:
+        raise DemoHttpError(413, b"content too large") from error
+
+
 def create_app(root: Path) -> Flask:
     _preflight(root)
 
@@ -146,14 +157,22 @@ def create_app(root: Path) -> Flask:
         "BASTION_DEMO_SECRET",
         secrets.token_hex(32),
     )
+    app.config["MAX_CONTENT_LENGTH"] = RECEIVE_MAX_BODY
+    app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
     app.url_map.strict_slashes = False
 
-    @app.errorhandler(DemoHttpError)
-    def handle_demo_http_error(error: DemoHttpError):
+    @app.errorhandler(HttpError)
+    def handle_http_error(error: HttpError):
         response = make_response(error.body, error.status)
         response.content_type = "text/plain; charset=utf-8"
         for key, value in error.headers.items():
             response.headers[key] = value
+        return response
+
+    @app.errorhandler(RequestEntityTooLarge)
+    def handle_too_large(_error: RequestEntityTooLarge):
+        response = make_response(b"content too large", 413)
+        response.content_type = "text/plain; charset=utf-8"
         return response
 
     @app.route("/", methods=["GET"])
@@ -276,18 +295,19 @@ def create_app(root: Path) -> Flask:
             abort(404)
 
         visible_entries = []
+        prefix_b = f"{path}/".encode() if path else b""
         for entry_path_b, (mode, kind, oid) in sorted(entries.items()):
-            full_path = f"{path}/{entry_path_b.decode()}" if path else entry_path_b.decode()
+            full_path_b = prefix_b + entry_path_b
             if not capability_allowed(
                 descriptor["capabilities"]["read"],
                 descriptor["restrictions"]["read"],
-                os.fsencode(full_path),
+                full_path_b,
             ):
                 continue
             visible_entries.append(
                 {
-                    "name": entry_path_b.decode(),
-                    "path": full_path,
+                    "name": entry_path_b.decode("utf-8", "replace"),
+                    "path": full_path_b.decode("utf-8", "replace"),
                     "kind": kind.decode() if isinstance(kind, bytes) else kind,
                     "oid": oid,
                 }
@@ -310,14 +330,14 @@ def create_app(root: Path) -> Flask:
         if not ref or ref == "0" * 40:
             commits: list[dict] = []
         else:
-            raw = git_output(
+            raw = git_command(
                 repo_path,
                 "log",
                 "-n",
                 "50",
                 "--format=%H%x00%s%x00%at",
                 "HEAD",
-            )
+            ).stdout.decode("utf-8", "replace")
             commits = []
             for line in raw.splitlines():
                 if "\0" not in line:
@@ -345,7 +365,12 @@ def create_app(root: Path) -> Flask:
         protocol = request.headers.get("Git-Protocol")
         completed = run_service(repo_path, service, True, b"", protocol, None, alternates)
         if completed.returncode:
-            raise DemoHttpError(500, completed.stderr[:4096])
+            app.logger.error(
+                "git advertisement failed for view %s: %s",
+                view,
+                completed.stderr[:4096].decode(errors="replace"),
+            )
+            raise DemoHttpError(500, b"git advertisement failed")
         body = pkt_line(f"# service={service}\n".encode()) + b"0000" + completed.stdout
         return make_response(
             body,
@@ -362,12 +387,9 @@ def create_app(root: Path) -> Flask:
 
         repo_path, alternates = _git_repo(root, view, service)
         protocol = request.headers.get("Git-Protocol")
-        raw = request.get_data()
-        payload = decode_body(
-            raw,
-            request.headers.get("Content-Encoding"),
-            UPLOAD_MAX_BODY if service == "git-upload-pack" else RECEIVE_MAX_BODY,
-        )
+        maximum = UPLOAD_MAX_BODY if service == "git-upload-pack" else RECEIVE_MAX_BODY
+        raw = _read_bounded_body(maximum)
+        payload = decode_body(raw, request.headers.get("Content-Encoding"), maximum)
 
         try:
             _repository, _manifest, active, _materialized = _resolve_service(root, view)
@@ -389,7 +411,13 @@ def create_app(root: Path) -> Flask:
 
         completed = run_service(repo_path, service, False, payload, protocol, extra_env, alternates)
         if completed.returncode:
-            raise DemoHttpError(500, completed.stderr[:4096])
+            app.logger.error(
+                "git %s failed for view %s: %s",
+                service,
+                view,
+                completed.stderr[:4096].decode(errors="replace"),
+            )
+            raise DemoHttpError(500, b"git service failed")
         return make_response(
             completed.stdout,
             200,
