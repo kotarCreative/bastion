@@ -281,7 +281,7 @@ def add_view(
     repository.publish(build)
     manifest, _version, replay = repository.load()
     materialized = ensure_view_materialized(root, name, manifest, replay, repository)
-    ensure_intake_materialized(root, materialized)
+    ensure_intake_materialized(root, materialized, manifest)
 
 
 def sync_view(root: Path, name: str) -> None:
@@ -291,7 +291,7 @@ def sync_view(root: Path, name: str) -> None:
     repository = Repository.open(root)
     manifest, _version, replay = repository.load()
     materialized = ensure_view_materialized(root, name, manifest, replay, repository)
-    ensure_intake_materialized(root, materialized)
+    ensure_intake_materialized(root, materialized, manifest)
 
 
 def validate_canonical_update(canonical: Path, expected: str, new: str) -> None:

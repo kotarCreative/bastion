@@ -228,6 +228,10 @@ def pre_receive(root: Path, name: str, updates: bytes) -> None:
         else None
     )
 
+    # Every build return path records the event_id of the WAL record that the
+    # returned sequence refers to, so the audit below never needs a full replay.
+    published_event_id: list[str] = []
+
     def build(manifest, replay):
         active = replay.active_views.get(name)
         if active is None:
@@ -270,6 +274,7 @@ def pre_receive(root: Path, name: str, updates: bytes) -> None:
                 payload = record["payload"]
                 if (payload["view_id"], payload["projected_ref"], payload["projected_old"], payload["projected_new"]) != request:
                     raise ForgeError("idempotency key was already used for a different request")
+                published_event_id.append(committed["event_id"])
                 return AlreadyCommitted(sequence)
         old_requests = replay.requests.get(request, [])
         if old_requests and source.projected_tip != old:
@@ -277,6 +282,7 @@ def pre_receive(root: Path, name: str, updates: bytes) -> None:
                 raise ForgeError(
                     "a new idempotency key cannot be attached to a committed request"
                 )
+            published_event_id.append(old_requests[-1])
             return AlreadyCommitted(replay.events[old_requests[-1]]["seq"])
         old, new, _updated_ref = validate_ref_update(view, parsed)
         canonical = ensure_canonical_materialized(root, manifest, repository)
@@ -341,7 +347,7 @@ def pre_receive(root: Path, name: str, updates: bytes) -> None:
                 raise ForgeError("submission pack upload metadata changed", "integrity")
             checkpoint(root, "wal.submission_pack_uploaded")
 
-        return Candidate(
+        candidate = Candidate(
             record_fingerprint(repository.repository_id, "submission", payload),
             payload,
             (upload_canonical, upload_submission),
@@ -351,17 +357,20 @@ def pre_receive(root: Path, name: str, updates: bytes) -> None:
                 shutil.rmtree(transition.candidate_object_dir, ignore_errors=True),
             ),
         )
+        published_event_id.append(candidate.event_id)
+        return candidate
 
     sequence = repository.publish(build)
     checkpoint(root, "wal.git_success_returning")
     try:
-        _manifest, _version, replay = repository.load()
+        # The last entry belongs to the attempt that produced this sequence;
+        # earlier entries belong to attempts that lost the manifest CAS race.
         audit_event(
             root,
             "receive.accept",
             f"{name}/{context.principal_id}",
             f"{context.transport} {context.remote_addr or '-'} seq={sequence}",
-            replay.records[sequence - 1]["event_id"],
+            published_event_id[-1],
         )
     except Exception:
         pass

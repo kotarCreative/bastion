@@ -11,6 +11,7 @@ import re
 import secrets
 import subprocess
 import sys
+import threading
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -119,9 +120,23 @@ def tokens_path(root: Path) -> Path:
     return root / "tokens.json"
 
 
+_TOKEN_CACHE: dict[str, tuple[tuple[int, int, int], dict[str, str]]] = {}
+_TOKEN_CACHE_LOCK = threading.Lock()
+
+
 def load_tokens(root: Path) -> dict[str, str]:
+    target = tokens_path(root)
     try:
-        data = json.loads(tokens_path(root).read_text())
+        info = target.stat()
+        stamp = (info.st_mtime_ns, info.st_size, info.st_ino)
+    except FileNotFoundError:
+        return {}
+    with _TOKEN_CACHE_LOCK:
+        cached = _TOKEN_CACHE.get(str(target))
+        if cached is not None and cached[0] == stamp:
+            return dict(cached[1])
+    try:
+        data = json.loads(target.read_text())
     except FileNotFoundError:
         return {}
     except (OSError, json.JSONDecodeError) as error:
@@ -130,7 +145,9 @@ def load_tokens(root: Path) -> dict[str, str]:
         isinstance(key, str) and isinstance(value, str) for key, value in data.items()
     ):
         raise ForgeError("forge tokens are malformed")
-    return data
+    with _TOKEN_CACHE_LOCK:
+        _TOKEN_CACHE[str(target)] = (stamp, data)
+    return dict(data)
 
 
 def add_token(root: Path, view: str) -> str:
@@ -270,11 +287,11 @@ class BastionRequestHandler(BaseHTTPRequestHandler):
         if service is None:
             raise HttpError(404, BODY_404)
         try:
-            _repository, _manifest, active, materialized = _resolve_service(self.root, view)
+            _repository, manifest, active, materialized = _resolve_service(self.root, view)
             if service == "git-upload-pack":
                 repo, alternates = materialized.path, None
             else:
-                repo = ensure_intake_materialized(self.root, materialized)
+                repo = ensure_intake_materialized(self.root, materialized, manifest)
                 alternates = materialized.path / "objects"
         except ForgeError:
             raise HttpError(404, BODY_404)

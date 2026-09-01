@@ -117,9 +117,13 @@ def has_exact_object_closure(repo: Path) -> bool:
 
 
 def tree_entries(
-    repo: Path, treeish: str, env: dict[str, str] | None = None
+    repo: Path,
+    treeish: str,
+    env: dict[str, str] | None = None,
+    recursive: bool = True,
 ) -> TreeEntries:
-    raw = git(repo, "ls-tree", "-rz", "--full-tree", treeish, env=env).stdout
+    flags = ["-rz", "--full-tree"] if recursive else ["-z"]
+    raw = git(repo, "ls-tree", *flags, treeish, env=env).stdout
     entries: TreeEntries = {}
     for item in raw.split(b"\0"):
         if not item:
@@ -134,16 +138,21 @@ def validate_no_empty_subtrees(
     repo: Path, treeish: str, env: dict[str, str] | None = None
 ) -> None:
     raw = git(repo, "ls-tree", "-rzt", "--full-tree", treeish, env=env).stdout
-    trees: list[bytes] = []
-    leaves: list[bytes] = []
+    trees: set[bytes] = set()
+    leaf_directories: set[bytes] = set()
     for item in raw.split(b"\0"):
         if not item:
             continue
         metadata, path = item.split(b"\t", 1)
         _mode, kind, _oid = metadata.split(b" ")
-        (trees if kind == b"tree" else leaves).append(path)
+        if kind == b"tree":
+            trees.add(path)
+            continue
+        parts = path.split(b"/")
+        for index in range(1, len(parts)):
+            leaf_directories.add(b"/".join(parts[:index]))
     for tree in trees:
-        if not any(path.startswith(tree + b"/") for path in leaves):
+        if tree not in leaf_directories:
             raise ForgeError("explicit empty subtrees are not supported")
 
 
@@ -158,8 +167,21 @@ def copy_object(
     source_env: dict[str, str] | None = None,
     destination_env: dict[str, str] | None = None,
 ) -> None:
-    kind = output(source, "cat-file", "-t", oid, env=source_env)
-    contents = git(source, "cat-file", kind, oid, env=source_env).stdout
+    raw = git(
+        source, "cat-file", "--batch", data=oid.encode() + b"\n", env=source_env
+    ).stdout
+    header, _, remainder = raw.partition(b"\n")
+    fields = header.split(b" ")
+    if len(fields) != 3 or fields[1] not in {b"commit", b"tree", b"blob", b"tag"}:
+        raise ForgeError("object format mismatch while copying object")
+    kind = fields[1].decode("ascii")
+    try:
+        size = int(fields[2])
+    except ValueError as error:
+        raise ForgeError("object format mismatch while copying object") from error
+    contents = remainder[:size]
+    if len(contents) != size or remainder[size : size + 1] != b"\n":
+        raise ForgeError("object format mismatch while copying object")
     copied = git(
         destination,
         "hash-object",
@@ -286,17 +308,29 @@ def make_commit(
     return git(repo, *args, data=message, env=env).stdout.decode().strip()
 
 
+def _commit_parent_pairs(
+    repo: Path, *revision: str, env: dict[str, str] | None = None
+) -> list[tuple[str, list[str]]]:
+    """One-pass (oid, parents) listing in reverse-chronological-then-reversed order."""
+    raw = git(repo, "log", "--reverse", "--format=%H%x00%P", *revision, env=env).stdout
+    pairs: list[tuple[str, list[str]]] = []
+    for line in raw.split(b"\n"):
+        if not line:
+            continue
+        oid, _, parents = line.partition(b"\0")
+        pairs.append((oid.decode("ascii"), parents.decode("ascii").split()))
+    return pairs
+
+
 def first_parent_commits(repo: Path, start: str, end: str) -> list[str]:
     revision = end if start == ZERO_OID else f"{start}..{end}"
-    lines = output(repo, "rev-list", "--reverse", "--first-parent", revision)
-    commits = lines.splitlines() if lines else []
-    for oid in commits:
-        parents = output(repo, "show", "-s", "--format=%P", oid).split()
+    pairs = _commit_parent_pairs(repo, "--first-parent", revision)
+    for _oid, parents in pairs:
         if len(parents) > 1:
             raise ForgeError(
                 "canonical merge commits are not supported by this experiment"
             )
-    return commits
+    return [oid for oid, _parents in pairs]
 
 
 def submitted_commits(
@@ -306,18 +340,17 @@ def submitted_commits(
         repo, "merge-base", "--is-ancestor", old, new, env=env, check=False
     ).returncode:
         raise ForgeError("force updates are not supported")
-    commits = output(repo, "rev-list", "--reverse", f"{old}..{new}", env=env).splitlines()
-    if not commits:
+    pairs = _commit_parent_pairs(repo, f"{old}..{new}", env=env)
+    if not pairs:
         raise ForgeError("push contains no new commits")
     expected_parent = old
-    for oid in commits:
-        parents = output(repo, "show", "-s", "--format=%P", oid, env=env).split()
+    for oid, parents in pairs:
         if parents != [expected_parent]:
             raise ForgeError(
                 "submitted history must be a linear chain from the advertised tip"
             )
         expected_parent = oid
-    return commits
+    return [oid for oid, _parents in pairs]
 
 
 def quarantine_objects(environ: dict[str, str] | None = None) -> set[str]:

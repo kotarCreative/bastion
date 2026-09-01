@@ -308,6 +308,7 @@ class _PostgresBackend:
 
     def __init__(self, dsn: str, root: Path | None = None):
         self._dsn = self._scoped_dsn(dsn, root)
+        self._database_ready = False
 
     @staticmethod
     def _scoped_dsn(dsn: str, root: Path | None) -> str:
@@ -352,7 +353,9 @@ class _PostgresBackend:
             raise ForgeError(
                 'the postgres backend requires psycopg 3: pip install "psycopg[binary]"'
             ) from error
-        self._ensure_database()
+        if not self._database_ready:
+            self._ensure_database()
+            self._database_ready = True
         try:
             connection = psycopg.connect(self._dsn, autocommit=False)
         except Exception as error:

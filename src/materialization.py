@@ -434,7 +434,11 @@ def ensure_view_materialized(
             raise
 
 
-def ensure_intake_materialized(root: Path, materialized_view: MaterializedView) -> Path:
+def ensure_intake_materialized(
+    root: Path,
+    materialized_view: MaterializedView,
+    manifest: Manifest | None = None,
+) -> Path:
     view_id = materialized_view.cursor["view_id"]
     link = intake_repo(root, view_id)
     # The branch is encoded by the only advertised ref in the view generation.
@@ -448,8 +452,8 @@ def ensure_intake_materialized(root: Path, materialized_view: MaterializedView) 
         raise ForgeError("materialized view is missing its projected tip", "integrity")
     expected_alternate = f"{(materialized_view.path / 'objects').resolve()}\n"
     with _flock(materialization_lock(root, view_id)):
-        repository = Repository.open(root)
-        manifest, _version, _replay = repository.load()
+        if manifest is None:
+            manifest, _version, _replay = Repository.open(root).load()
         cursor = materialized_view.cursor
         if (
             cursor["applied_seq"] != manifest.head_seq

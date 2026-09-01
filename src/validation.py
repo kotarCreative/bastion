@@ -140,14 +140,6 @@ def apply_changes(canonical: TreeEntries, changes: TreeChanges) -> TreeEntries:
                 raise ForgeError(
                     "submitted tree contains an unsupported entry type or mode"
                 )
-        for existing in canonical:
-            conflict = existing != path and (
-                existing.startswith(path + b"/") or path.startswith(existing + b"/")
-            )
-            if conflict and changes.get(existing, canonical[existing]) is not None:
-                raise ForgeError(
-                    "tree transition crosses a file/directory authorization boundary"
-                )
 
     result = canonical.copy()
     for path in sorted(changes):

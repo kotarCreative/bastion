@@ -82,7 +82,7 @@ def complete_projection_job(root: Path, claimed: dict) -> None:
     repository = Repository.open(root)
     manifest, _version, replay = repository.load()
     materialized = ensure_view_materialized(root, claimed["view"], manifest, replay, repository)
-    ensure_intake_materialized(root, materialized)
+    ensure_intake_materialized(root, materialized, manifest)
     with locked(root) as state:
         job = state["projection_jobs"].get(claimed["id"])
         if not job or job.get("lease_token") != claimed["lease_token"]:
