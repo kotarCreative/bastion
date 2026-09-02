@@ -8,15 +8,18 @@ demonstrations.
 
 from __future__ import annotations
 
+import base64
 import os
 import secrets
 import subprocess
 import sys
+import threading
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import parse_qsl
 
 from flask import (
     Flask,
+    Response,
     abort,
     flash,
     jsonify,
@@ -30,7 +33,7 @@ from flask import (
 from werkzeug.exceptions import RequestEntityTooLarge
 
 from errors import ForgeError
-from git import git as git_command, ref as git_ref, tree_entries
+from git import clean_env, git as git_command, ref as git_ref, tree_entries
 from http_server import (
     BODY_401,
     BODY_404,
@@ -123,6 +126,165 @@ def _materialized_path(root: Path, view: str) -> Path:
     except ForgeError as error:
         abort(404)
     return materialized.path
+
+
+BLOB_DISPLAY_LIMIT = 512 * 1024
+BLOB_STREAM_LIMIT = 8
+BLOB_STREAM_TIMEOUT = 300.0
+
+_blob_stream_slots = threading.BoundedSemaphore(BLOB_STREAM_LIMIT)
+
+
+def _display(raw: bytes) -> str:
+    """Lossy presentation text for arbitrary Git path bytes."""
+    return raw.decode("utf-8", "replace")
+
+
+def _path_b64(raw: bytes) -> str:
+    """URL-safe base64 identity for arbitrary Git path bytes."""
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def _path_argument() -> str:
+    """Byte-preserving ``path`` parameter decoded with surrogate escapes.
+
+    ``path_b64`` carries the authoritative raw path bytes; a plain ``path``
+    query parameter remains supported for legible URLs.  Flask's decoded
+    ``request.args`` is intentionally avoided for ``path`` because it
+    replaces malformed UTF-8 instead of preserving it.
+    """
+    encoded = request.args.get("path_b64", "")
+    if encoded:
+        try:
+            raw = base64.urlsafe_b64decode(encoded.encode("ascii"))
+        except (UnicodeEncodeError, ValueError):
+            abort(404)
+        return raw.decode("utf-8", "surrogateescape")
+    for key, value in parse_qsl(
+        request.query_string.decode("latin-1"),
+        keep_blank_values=True,
+        encoding="latin-1",
+    ):
+        if key == "path":
+            return value.encode("latin-1").decode("utf-8", "surrogateescape")
+    return ""
+
+
+def _requested_path() -> str:
+    """Normalized request path; "" addresses the root.  Invalid input is 404."""
+    try:
+        normalized = normalize_prefix(_path_argument())
+    except ForgeError:
+        abort(404)
+    if "\x00" in normalized:
+        abort(404)
+    return normalized
+
+
+def _leaf_allowed(descriptor: dict, normalized: str) -> bool:
+    return capability_allowed(
+        descriptor["capabilities"]["read"],
+        descriptor["restrictions"]["read"],
+        os.fsencode(normalized),
+    )
+
+
+def _visible_leaves(repo_path: Path, descriptor: dict, normalized: str) -> list[bytes]:
+    """Authorized leaf paths beneath the tree prefix, "" covering the root."""
+    allow = descriptor["capabilities"]["read"]
+    deny = descriptor["restrictions"]["read"]
+    prefix_b = os.fsencode(f"{normalized}/") if normalized else b""
+    try:
+        leaves = tree_entries(repo_path, "HEAD", recursive=True)
+    except ForgeError:
+        return []
+    return [
+        leaf_b
+        for leaf_b in leaves
+        if leaf_b.startswith(prefix_b) and capability_allowed(allow, deny, leaf_b)
+    ]
+
+
+def _crumbs(normalized: str) -> list[dict]:
+    """Breadcrumb links that preserve raw path bytes."""
+    crumbs: list[dict] = []
+    accumulated = ""
+    for part in normalized.split("/"):
+        accumulated = f"{accumulated}/{part}" if accumulated else part
+        raw = os.fsencode(accumulated)
+        crumbs.append({"name": _display(raw), "path_b64": _path_b64(raw)})
+    return crumbs
+
+
+def _blob_metadata(repo_path: Path, path: str) -> tuple[bytes, bytes, str] | None:
+    """Return (mode, kind, oid) for a leaf path, or None when absent."""
+    parent, _, leaf = path.rpartition("/")
+    treeish = f"HEAD:{parent}" if parent else "HEAD"
+    try:
+        entries = tree_entries(repo_path, treeish, recursive=False)
+    except ForgeError:
+        return None
+    return entries.get(os.fsencode(leaf))
+
+
+def _spawn_cat_file(repo_path: Path, kind: bytes, oid: str) -> subprocess.Popen:
+    return subprocess.Popen(
+        ["git", "--git-dir", os.fsencode(repo_path), "cat-file", kind, oid],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=clean_env(),
+    )
+
+
+def _reap(process: subprocess.Popen, timeout: float = 5.0) -> None:
+    for stream in (process.stdout, process.stderr):
+        if stream is not None:
+            stream.close()
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
+def _arm_watchdog(process: subprocess.Popen) -> threading.Timer:
+    timer = threading.Timer(BLOB_STREAM_TIMEOUT, process.kill)
+    timer.daemon = True
+    timer.start()
+    return timer
+
+
+def _blob_head(repo_path: Path, kind: bytes, oid: str, limit: int = 8192) -> bytes:
+    """Return the first ``limit`` bytes of a blob without reading it whole."""
+    process = _spawn_cat_file(repo_path, kind, oid)
+    timer = _arm_watchdog(process)
+    try:
+        return process.stdout.read(limit)
+    finally:
+        timer.cancel()
+        _reap(process)
+
+
+def _stream_blob(repo_path: Path, kind: bytes, oid: str):
+    """Yield chunks of a blob under concurrency and duration limits."""
+    if not _blob_stream_slots.acquire(blocking=False):
+        raise DemoHttpError(503, b"too many concurrent blob downloads")
+    process = None
+    timer = None
+    try:
+        process = _spawn_cat_file(repo_path, kind, oid)
+        timer = _arm_watchdog(process)
+        while True:
+            block = process.stdout.read(65536)
+            if not block:
+                break
+            yield block
+    finally:
+        if timer is not None:
+            timer.cancel()
+        if process is not None:
+            _reap(process)
+        _blob_stream_slots.release()
 
 
 def _read_bounded_body(maximum: int) -> bytes:
@@ -287,58 +449,179 @@ def create_app(root: Path) -> Flask:
         view_state, descriptor, _state = _active_descriptor(root, view)
         repo_path = _materialized_path(root, view)
 
-        path = request.args.get("path", "").strip("/")
-        treeish = f"HEAD:{path}" if path else "HEAD"
+        path = _requested_path()
+        allow = descriptor["capabilities"]["read"]
+        deny = descriptor["restrictions"]["read"]
+        prefix_b = os.fsencode(f"{path}/") if path else b""
         try:
-            entries = tree_entries(repo_path, treeish)
+            children = tree_entries(
+                repo_path, f"HEAD:{path}" if path else "HEAD", recursive=False
+            )
         except ForgeError:
             abort(404)
+        visible = _visible_leaves(repo_path, descriptor, path)
+        if path and not visible:
+            abort(404)
+        populated: set[bytes] = set()
+        for leaf_b in visible:
+            rest = leaf_b
+            while True:
+                rest, _, _ = rest.rpartition(b"/")
+                if not rest:
+                    break
+                populated.add(rest)
 
         visible_entries = []
-        prefix_b = f"{path}/".encode() if path else b""
-        for entry_path_b, (mode, kind, oid) in sorted(entries.items()):
+        for entry_path_b, (mode, kind, oid) in sorted(children.items()):
             full_path_b = prefix_b + entry_path_b
-            if not capability_allowed(
-                descriptor["capabilities"]["read"],
-                descriptor["restrictions"]["read"],
-                full_path_b,
-            ):
+            if kind == b"tree":
+                if full_path_b not in populated:
+                    continue
+            elif not capability_allowed(allow, deny, full_path_b):
                 continue
             visible_entries.append(
                 {
-                    "name": entry_path_b.decode("utf-8", "replace"),
-                    "path": full_path_b.decode("utf-8", "replace"),
+                    "name": _display(entry_path_b),
+                    "path": _display(full_path_b),
+                    "path_b64": _path_b64(full_path_b),
                     "kind": kind.decode() if isinstance(kind, bytes) else kind,
                     "oid": oid,
+                }
+            )
+
+        raw_path = os.fsencode(path)
+        if request.args.get("format") == "json":
+            return jsonify(
+                {
+                    "view": view,
+                    "path": _display(raw_path),
+                    "path_b64": _path_b64(raw_path),
+                    "entries": visible_entries,
                 }
             )
 
         return render_template(
             "browse.html",
             view=view,
-            path=path,
+            path=_display(raw_path),
+            crumbs=_crumbs(path),
             entries=visible_entries,
+        )
+
+    @app.route("/blob", methods=["GET"])
+    def blob():
+        root = _forge_root(app)
+        view = _require_browser_view(root)
+        view_state, descriptor, _state = _active_descriptor(root, view)
+        repo_path = _materialized_path(root, view)
+
+        normalized = _requested_path()
+        if not normalized:
+            abort(404)
+        entry = _blob_metadata(repo_path, normalized)
+        if entry is None or entry[1] in (b"tree", b"commit"):
+            if not _visible_leaves(repo_path, descriptor, normalized):
+                abort(404)
+            return redirect(
+                url_for("browse", path_b64=_path_b64(os.fsencode(normalized)))
+            )
+        if not _leaf_allowed(descriptor, normalized):
+            abort(404)
+        mode, kind, oid = entry
+        raw_path = os.fsencode(normalized)
+
+        size = int(git_command(repo_path, "cat-file", "-s", oid).stdout.strip())
+
+        if raw := request.args.get("raw"):
+            generator = _stream_blob(repo_path, kind, oid)
+            try:
+                first_chunk = next(generator)
+            except StopIteration:
+                first_chunk = b""
+            binary = mode != b"120000" and b"\0" in first_chunk
+            content_type = (
+                "text/plain; charset=utf-8"
+                if mode == b"120000" or not binary
+                else "application/octet-stream"
+            )
+
+            def generate():
+                yield first_chunk
+                yield from generator
+
+            return Response(generate(), 200, {"Content-Type": content_type, **CACHE_HEADERS})
+
+        sample = _blob_head(repo_path, kind, oid)
+        binary = mode != b"120000" and b"\0" in sample
+        too_large = not binary and size > BLOB_DISPLAY_LIMIT
+
+        if request.args.get("format") == "json":
+            if binary or too_large:
+                content: bytes | None = None
+            else:
+                content = git_command(repo_path, "cat-file", kind, oid).stdout
+            return jsonify(
+                {
+                    "view": view,
+                    "path": _display(raw_path),
+                    "path_b64": _path_b64(raw_path),
+                    "kind": kind.decode(),
+                    "mode": mode.decode(),
+                    "oid": oid,
+                    "size": size,
+                    "binary": binary,
+                    "too_large": too_large,
+                    "content": None if content is None else content.decode("utf-8", "replace"),
+                }
+            )
+
+        if binary or too_large:
+            text = None
+        else:
+            text = git_command(repo_path, "cat-file", kind, oid).stdout.decode("utf-8", "replace")
+
+        return render_template(
+            "blob.html",
+            view=view,
+            path=_display(raw_path),
+            path_b64=_path_b64(raw_path),
+            crumbs=_crumbs(normalized),
+            symlink=mode == b"120000",
+            binary=binary,
+            too_large=too_large,
+            size=size,
+            text=text,
         )
 
     @app.route("/history", methods=["GET"])
     def history():
         root = _forge_root(app)
         view = _require_browser_view(root)
+        view_state, descriptor, _state = _active_descriptor(root, view)
         repo_path = _materialized_path(root, view)
 
+        path = _requested_path()
+        if path and not (
+            _leaf_allowed(descriptor, path)
+            or _visible_leaves(repo_path, descriptor, path)
+        ):
+            abort(404)
+        raw_path = os.fsencode(path)
+
         ref = git_ref(repo_path, "HEAD")
-        if not ref or ref == "0" * 40:
-            commits: list[dict] = []
-        else:
-            raw = git_command(
-                repo_path,
+        commits: list[dict] = []
+        if ref and ref != "0" * 40:
+            arguments = [
+                "--literal-pathspecs",
                 "log",
                 "-n",
                 "50",
                 "--format=%H%x00%s%x00%at",
                 "HEAD",
-            ).stdout.decode("utf-8", "replace")
-            commits = []
+            ]
+            if path:
+                arguments.extend(("--", path))
+            raw = git_command(repo_path, *arguments).stdout.decode("utf-8", "replace")
             for line in raw.splitlines():
                 if "\0" not in line:
                     continue
@@ -351,7 +634,23 @@ def create_app(root: Path) -> Flask:
                     }
                 )
 
-        return render_template("history.html", view=view, commits=commits)
+        if request.args.get("format") == "json":
+            return jsonify(
+                {
+                    "view": view,
+                    "path": _display(raw_path),
+                    "path_b64": _path_b64(raw_path),
+                    "commits": commits,
+                }
+            )
+
+        return render_template(
+            "history.html",
+            view=view,
+            path=_display(raw_path),
+            path_b64=_path_b64(raw_path),
+            commits=commits,
+        )
 
     @app.route("/<view>.git/info/refs", methods=["GET"])
     def git_info_refs(view: str):
@@ -429,14 +728,14 @@ def create_app(root: Path) -> Flask:
 
 def _git_repo(root: Path, view: str, service: str) -> tuple[Path, Path | None]:
     try:
-        _repository, _manifest, _active, materialized = _resolve_service(root, view)
+        _repository, manifest, _active, materialized = _resolve_service(root, view)
     except ForgeError:
         raise DemoHttpError(404, BODY_404)
     if service == "git-upload-pack":
         return materialized.path, None
     from materialization import ensure_intake_materialized
 
-    return ensure_intake_materialized(root, materialized), materialized.path / "objects"
+    return ensure_intake_materialized(root, materialized, manifest), materialized.path / "objects"
 
 
 def make_server(root: Path, host: str = "127.0.0.1", port: int = 8000):

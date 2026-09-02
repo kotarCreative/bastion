@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+
+{% block title %}Blob — Bastion Demo{% endblock %}
+
+{% block content %}
+<h2>File view: <code>{{ view }}</code></h2>
+
+<p>
+  <a href="{{ url_for('browse') }}">root</a>
+  {% for crumb in crumbs %}
+    / {% if not loop.last %}<a href="{{ url_for('browse', path_b64=crumb.path_b64) }}">{{ crumb.name }}</a>{% else %}{{ crumb.name }}{% endif %}
+  {% endfor %}
+</p>
+
+<p class="muted">
+  {{ size }} bytes ·
+  <a href="{{ url_for('blob', path_b64=path_b64, raw=1) }}">raw</a> ·
+  <a href="{{ url_for('history', path_b64=path_b64) }}">history</a>
+</p>
+
+{% if symlink %}
+  <p class="muted">Symbolic link target:</p>
+  <pre><code>{{ text }}</code></pre>
+{% elif binary %}
+  <p class="muted">Binary file; not displayed. <a href="{{ url_for('blob', path_b64=path_b64, raw=1) }}">Download raw</a>.</p>
+{% elif too_large %}
+  <p class="muted">File is too large to display ({{ size }} bytes). <a href="{{ url_for('blob', path_b64=path_b64, raw=1) }}">View raw</a>.</p>
+{% else %}
+  <pre><code>{{ text }}</code></pre>
+{% endif %}
+{% endblock %}

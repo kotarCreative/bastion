@@ -5,6 +5,14 @@
 {% block content %}
 <h2>Visible history for view: <code>{{ view }}</code></h2>
 
+{% if path %}
+  <p>
+    Scoped to <code>{{ path }}</code> ·
+    <a href="{{ url_for('blob', path_b64=path_b64) }}">view</a> ·
+    <a href="{{ url_for('history') }}">all history</a>
+  </p>
+{% endif %}
+
 {% if commits %}
   <table>
     <thead>
