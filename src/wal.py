@@ -320,6 +320,34 @@ class ReplayState:
     def clone(self) -> "ReplayState":
         return copy.deepcopy(self)
 
+    def clone_for_append(self) -> "ReplayState":
+        """Copy-on-write candidate: fresh mutable indexes, shared history.
+
+        Historical WAL payloads are immutable once committed, so appending
+        one record copies only the small mutable indexes (view rows are
+        copied because frontier updates mutate them in place; request lists
+        are copied because they are appended in place) instead of
+        deep-copying every historical payload.
+        """
+        result = ReplayState()
+        result.repository_id = self.repository_id
+        result.head_seq = self.head_seq
+        result.head_record = dict(self.head_record) if self.head_record else None
+        result.canonical_ref = self.canonical_ref
+        result.canonical_tip = self.canonical_tip
+        result.canonical_packs = list(self.canonical_packs)
+        result.active_views = {
+            view_id: dict(view) for view_id, view in self.active_views.items()
+        }
+        result.change_claims = dict(self.change_claims)
+        result.events = dict(self.events)
+        result.requests = {
+            request: list(event_ids) for request, event_ids in self.requests.items()
+        }
+        result.idempotency = dict(self.idempotency)
+        result.records = list(self.records)
+        return result
+
 
 def record_fingerprint(repository_id: str, kind: str, payload: dict) -> dict:
     _uuid(repository_id, "repository id")

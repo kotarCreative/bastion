@@ -71,6 +71,11 @@ def parser() -> argparse.ArgumentParser:
         help="storage backend URI: sqlite (default) or postgres://...",
     )
     init.add_argument(
+        "--admin-database",
+        default=None,
+        help="one-shot administrative DSN used only to provision the scoped database",
+    )
+    init.add_argument(
         "--object-store",
         default="filesystem",
         help="object store: filesystem (default) or filesystem:PATH",
@@ -147,6 +152,11 @@ def parser() -> argparse.ArgumentParser:
         "--database",
         help="target storage backend URI for the restored forge",
     )
+    restore.add_argument(
+        "--admin-database",
+        default=None,
+        help="one-shot administrative DSN used only to provision the restore target",
+    )
     cancel_job = commands.add_parser("cancel-job")
     cancel_job.add_argument("root", type=Path)
     cancel_job.add_argument("job_id")
@@ -157,6 +167,7 @@ def parser() -> argparse.ArgumentParser:
     heartbeat.add_argument("root", type=Path)
     heartbeat.add_argument("token")
     heartbeat.add_argument("--seconds", type=float)
+    heartbeat.add_argument("--scope", action="append", default=[], dest="scopes")
     audit_command = commands.add_parser("audit")
     audit_command.add_argument("root", type=Path)
     return result
@@ -166,7 +177,14 @@ def main() -> int:
     args = parser().parse_args()
     try:
         if args.command == "init":
-            init_forge(args.root, args.source, args.branch, args.database, args.object_store)
+            init_forge(
+                args.root,
+                args.source,
+                args.branch,
+                args.database,
+                args.object_store,
+                admin_database=args.admin_database,
+            )
         elif args.command == "add-principal":
             _add_principal(args.root, args.principal, args.email)
         elif args.command == "add-service-account":
@@ -232,7 +250,11 @@ def main() -> int:
         elif args.command == "restore":
             from store import restore_forge
 
-            print(restore_forge(args.backup, args.root, args.database))
+            print(
+                restore_forge(
+                    args.backup, args.root, args.database, admin_database=args.admin_database
+                )
+            )
         elif args.command == "cancel-job":
             cancel_projection_job(args.root, args.job_id)
         elif args.command == "requeue-job":
@@ -240,7 +262,11 @@ def main() -> int:
         elif args.command == "heartbeat":
             from state import heartbeat_session
 
-            print(heartbeat_session(args.root, args.token, args.seconds))
+            print(
+                heartbeat_session(
+                    args.root, args.token, args.seconds, args.scopes or None
+                )
+            )
         elif args.command == "audit":
             from state import load_state as _load
 

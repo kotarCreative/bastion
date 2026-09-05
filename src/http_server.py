@@ -20,7 +20,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from errors import ForgeError
 from git import clean_env
 from layout import intake_repo, view_repo
-from state import load_state
+from state import load_state, load_state_meta
 from materialization import ensure_intake_materialized, ensure_view_materialized
 from repository import Repository
 
@@ -153,7 +153,7 @@ def load_tokens(root: Path) -> dict[str, str]:
 def add_token(root: Path, view: str) -> str:
     from state import locked
 
-    state = load_state(root)
+    state = load_state_meta(root)
     if state.get("repository_state") != "ready":
         raise ForgeError("forge initialization is incomplete")
     repository = Repository.open(root)
@@ -180,14 +180,18 @@ def service_repo(root: Path, view: str, service: str) -> tuple[Path, Path | None
     Uploads read from published view storage; receives target the isolated
     intake repository whose only object source is the sibling view store.
     """
-    _repository, _manifest, active, materialized = _resolve_service(root, view)
+    _repository, manifest, active, materialized = _resolve_service(root, view)
     if service == "git-upload-pack":
         return materialized.path, None
-    return ensure_intake_materialized(root, materialized), materialized.path / "objects"
+    return ensure_intake_materialized(root, materialized, manifest), materialized.path / "objects"
 
 
 def _resolve_service(root: Path, view: str):
-    state = load_state(root)
+    # Fetch resolution reads repository metadata and resolves the active view
+    # from the WAL snapshot; it does not load transactions, changes, jobs,
+    # teams, roles, or unrelated control-plane descriptor rows. A single
+    # process-local request phase reuses one store handle per phase.
+    state = load_state_meta(root)
     if state.get("repository_state") != "ready":
         raise ForgeError("forge initialization is incomplete")
     repository = Repository.open(root)
@@ -401,7 +405,7 @@ class BastionServer(ThreadingHTTPServer):
 
 
 def make_server(root: Path, host: str = "127.0.0.1", port: int = 8000) -> BastionServer:
-    if load_state(root).get("repository_state") != "ready":
+    if load_state_meta(root).get("repository_state") != "ready":
         raise ForgeError("forge initialization is incomplete")
     return BastionServer((host, port), root)
 

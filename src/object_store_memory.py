@@ -31,6 +31,9 @@ class MemoryObjectStore:
         self._objects: dict[str, tuple[bytes, Version]] = {}
         self._next_version = 1
         self.list_calls = 0
+        self.get_calls = 0
+        self.head_calls = 0
+        self.body_reads = 0
 
     def _version(self) -> Version:
         result = Version(str(self._next_version))
@@ -46,12 +49,14 @@ class MemoryObjectStore:
     ) -> GetResult:
         validate_key(key)
         with self._lock:
+            self.get_calls += 1
             try:
                 body, version = self._objects[key]
             except KeyError as error:
                 raise ObjectNotFound(key) from error
             if if_none_match == version:
                 raise NotModified(key)
+            self.body_reads += 1
             if byte_range is not None:
                 start, end = byte_range
                 if not 0 <= start <= end < len(body):
@@ -62,6 +67,7 @@ class MemoryObjectStore:
     def head(self, key: str) -> ObjectMeta | None:
         validate_key(key)
         with self._lock:
+            self.head_calls += 1
             current = self._objects.get(key)
             if current is None:
                 return None

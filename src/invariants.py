@@ -448,7 +448,8 @@ def check_invariants(root: Path) -> None:
     if state.get("repository_state") != "ready":
         _fail("REPOSITORY", "forge_meta", "forge initialization is incomplete")
     repository = Repository.open(root)
-    manifest, _version, replay = repository.load()
+    # The independent checker never uses cached snapshots as evidence.
+    manifest, _version, replay = repository.load(use_cache=False)
     if state.get("repository_id") != repository.repository_id:
         _fail("REPOSITORY", "forge_meta", "repository ID differs from repository configuration")
     if f"refs/heads/{state.get('canonical_branch')}" != manifest.canonical_ref:

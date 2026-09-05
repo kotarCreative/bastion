@@ -6,6 +6,7 @@ import hashlib
 import os
 import shutil
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,13 +26,13 @@ from git import (
     verify_no_extra_objects,
 )
 from layout import ZERO_OID, canonical_repo, intake_repo
-from projection import visible_advance
+from projection import visible_advance_fast as visible_advance
 from reconciliation import reconcile_commits
 from artifacts import build_canonical_pack, build_submission_pack, upload_pack
 from materialization import ensure_canonical_materialized, ensure_view_materialized
 from repository import AlreadyCommitted, Candidate, Repository
 from wal import idempotency_key_hash, record_fingerprint
-from state import audit_event, load_state
+from state import audit_event, load_state_sections
 from validation import parse_updates, validate_ref_update
 
 
@@ -63,6 +64,99 @@ def receive_context(name: str) -> ReceiveContext:
 
 def transaction_id(name: str, old: str, new: str) -> str:
     return hashlib.sha256(f"{name}\0{old}\0{new}".encode()).hexdigest()
+
+
+def transaction_parent(root: Path) -> Path:
+    """Shared parent for private receive workspaces (mode 0700, never blindly cleared)."""
+    parent = root / "transaction-objects"
+    parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(parent, 0o700)
+    except OSError:
+        pass
+    return parent
+
+
+def new_transaction_workspace(root: Path, name: str, old: str, new: str) -> Path:
+    """Create a new private candidate workspace with an exclusive suffix.
+
+    The name may contain a diagnostic request hash, but uniqueness comes from
+    the exclusive ``mkdtemp`` suffix rather than from ``(view, old, new)``.
+    Every publication attempt — including a manifest-CAS retry of the same
+    event — owns a different workspace. Callers must never ``rmtree`` a path
+    before exclusively creating and owning it.
+    """
+    parent = transaction_parent(root)
+    digest = transaction_id(name, old, new)
+    return Path(tempfile.mkdtemp(prefix=f"txn-{digest}-", dir=parent))
+
+
+def cleanup_transaction_workspace(path: Path | str | None) -> None:
+    """Idempotently remove only the workspace captured by one candidate."""
+    if path is None:
+        return
+    try:
+        target = Path(path)
+    except Exception:
+        return
+    shutil.rmtree(target, ignore_errors=True)
+
+
+def cleanup_stale_transaction_workspaces(root: Path, max_age_seconds: float = 3600.0) -> int:
+    """Remove only workspaces proven not to belong to a live process.
+
+    Crash leftovers are unreachable garbage. Startup never blindly clears the
+    shared parent; this bounded pass removes only ``txn-*`` directories whose
+    owner process is dead (via ``owner.json``) or that are older than
+    ``max_age_seconds`` without an owner record. Returns the removal count.
+    """
+    from store import _linux_boot_id, _owner_alive, host_forge_id
+
+    parent = root / "transaction-objects"
+    if not parent.is_dir() or parent.is_symlink():
+        return 0
+    try:
+        local_host = host_forge_id(root)
+    except Exception:
+        local_host = None
+    try:
+        local_boot = _linux_boot_id()
+    except Exception:
+        local_boot = None
+    removed = 0
+    now = time.time()
+    try:
+        entries = list(parent.iterdir())
+    except OSError:
+        return 0
+    for entry in entries:
+        try:
+            if not entry.is_dir() or entry.is_symlink():
+                continue
+            if not entry.name.startswith("txn-"):
+                continue
+            owner_file = entry / "owner.json"
+            if owner_file.is_file():
+                try:
+                    import json as _json
+
+                    owner = _json.loads(owner_file.read_text()).get("owner", "")
+                except Exception:
+                    owner = ""
+                if owner and _owner_alive(owner, local_host, local_boot):
+                    continue
+            else:
+                try:
+                    age = now - entry.stat().st_mtime
+                except OSError:
+                    continue
+                if age < max_age_seconds:
+                    continue
+            shutil.rmtree(entry, ignore_errors=True)
+            removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 def candidate_environment(canonical: Path, directory: Path) -> dict[str, str]:
@@ -167,9 +261,26 @@ def prepare_submission(
         tree_oid(destination, old, hook_env),
     )
 
-    transaction_objects = root / "transaction-objects" / transaction_id(name, old, new)
-    shutil.rmtree(transaction_objects, ignore_errors=True)
-    transaction_objects.mkdir(parents=True)
+    # Each call owns a distinct private workspace; concurrent identical
+    # receives never share temporary object storage.
+    transaction_objects = new_transaction_workspace(root, name, old, new)
+    try:
+        try:
+            from store import process_identity as _process_identity
+
+            owner = _process_identity()
+        except Exception:
+            owner = "unknown"
+        try:
+            import json as _json
+
+            (transaction_objects / "owner.json").write_text(
+                _json.dumps({"owner": owner, "at": time.time()})
+            )
+        except OSError:
+            pass
+    except Exception:
+        pass
     candidate_env = candidate_environment(canonical, transaction_objects)
     try:
         transition = reconcile_commits(
@@ -183,7 +294,7 @@ def prepare_submission(
             candidate_env,
         )
     except Exception:
-        shutil.rmtree(transaction_objects, ignore_errors=True)
+        cleanup_transaction_workspace(transaction_objects)
         raise
     return transition
 
@@ -217,7 +328,12 @@ def hook_pre_receive(root: Path, name: str, updates: bytes) -> int:
 def pre_receive(root: Path, name: str, updates: bytes) -> None:
     parsed = parse_updates(updates)
     context = receive_context(name)
-    control = load_state(root)
+    # Receive resolution reads repository metadata plus only the submitting
+    # principal metadata required for author validation; it does not load
+    # transactions, changes, jobs, teams, roles, or unrelated descriptors.
+    # The captured authorization descriptor still comes from immutable
+    # repository truth.
+    control = load_state_sections(root, ["principals"])
     if control.get("repository_state") != "ready":
         raise ForgeError("forge initialization is incomplete", "integrity")
     repository = Repository.open(root)
@@ -300,7 +416,7 @@ def pre_receive(root: Path, name: str, updates: bytes) -> None:
                 claim["owner_principal_id"] != active["principal_id"]
                 or claim["canonical_ref"] != manifest.canonical_ref
             ):
-                shutil.rmtree(transition.candidate_object_dir, ignore_errors=True)
+                cleanup_transaction_workspace(transition.candidate_object_dir)
                 raise ForgeError("Change-Id belongs to another principal or branch")
         checkpoint(root, "wal.validation_complete")
         canonical_pack = build_canonical_pack(
@@ -347,6 +463,7 @@ def pre_receive(root: Path, name: str, updates: bytes) -> None:
                 raise ForgeError("submission pack upload metadata changed", "integrity")
             checkpoint(root, "wal.submission_pack_uploaded")
 
+        candidate_objects = transition.candidate_object_dir
         candidate = Candidate(
             record_fingerprint(repository.repository_id, "submission", payload),
             payload,
@@ -354,7 +471,7 @@ def pre_receive(root: Path, name: str, updates: bytes) -> None:
             lambda: (
                 canonical_pack.cleanup(),
                 submission_pack.cleanup(),
-                shutil.rmtree(transition.candidate_object_dir, ignore_errors=True),
+                cleanup_transaction_workspace(candidate_objects),
             ),
         )
         published_event_id.append(candidate.event_id)

@@ -50,8 +50,8 @@ from http_server import (
     run_service,
     _resolve_service,
 )
-from identity import descriptor_for_view, resolve_principal
-from state import load_state
+from identity import resolve_principal
+from state import load_state, load_state_sections
 from identity import CAPABILITIES
 from validation import capability_allowed, longest_covering, normalize_prefix
 
@@ -65,7 +65,7 @@ def _forge_root(app: Flask) -> Path:
 
 
 def _preflight(root: Path) -> None:
-    state = load_state(root)
+    state = load_state_sections(root, ["view_descriptors"])
     if state.get("repository_state") != "ready":
         raise ForgeError("forge initialization is incomplete")
     for descriptor in state.get("view_descriptors", {}).values():
@@ -112,11 +112,42 @@ def _require_browser_view(root: Path) -> str:
     return view
 
 
+# Browser session and decision routes resolve the view assignment and
+# descriptor from the WAL snapshot, then read only the authenticated
+# principal's catalog provenance. A derived views/view_descriptors row never
+# selects the active policy. These routes never load unrelated derived
+# history (transactions/changes) or job rows.
+_BROWSER_CATALOG_SECTIONS = [
+    "principals",
+    "teams",
+    "roles",
+    "role_bindings",
+]
+
+
 def _active_descriptor(root: Path, view: str) -> tuple[dict, dict, dict]:
-    """Return (active_view_config, descriptor, state)."""
-    state = load_state(root)
-    descriptor = descriptor_for_view(state, view)
-    view_state = state["views"][view]
+    """Return (active_view_config, descriptor, state) from WAL truth."""
+    from repository import Repository
+
+    try:
+        repository = Repository.open(root)
+        _manifest, _version, replay = repository.load()
+    except ForgeError:
+        abort(404)
+    active = replay.active_views.get(view)
+    if active is None:
+        abort(404)
+    try:
+        descriptor = repository._descriptor(active["descriptor_id"])
+    except ForgeError:
+        abort(404)
+    if descriptor.get("principal_id") != active.get("principal_id"):
+        abort(404)
+    try:
+        state = load_state_sections(root, _BROWSER_CATALOG_SECTIONS)
+    except ForgeError:
+        abort(404)
+    view_state = dict(active)
     return view_state, descriptor, state
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -17,6 +18,7 @@ from object_store import (
     AmbiguousWrite,
     Create,
     GetResult,
+    NotModified,
     ObjectMeta,
     ObjectNotFound,
     ObjectStore,
@@ -36,6 +38,77 @@ from wal import (
     validate_descriptor,
     validate_record,
 )
+
+
+# Process-local incremental snapshot cache: at most the latest validated
+# snapshot per repository/configuration identity. Contents are disposable
+# derived state, never persisted as repository truth, and never used by
+# ``forge.py check`` as evidence.
+_SNAPSHOT_CACHE: dict[str, tuple[Manifest, Version, ReplayState]] = {}
+_SNAPSHOT_LOCK = threading.Lock()
+# Immutable descriptor cache keyed by (snapshot identity, descriptor ID).
+# Two restored roots sharing a repository ID establish descriptor presence
+# independently because the identity includes the normalized root/store.
+_DESCRIPTOR_CACHE: dict[tuple[str, str], dict] = {}
+
+
+def _cache_enabled() -> bool:
+    return os.environ.get("BASTION_REPO_CACHE", "1") != "0"
+
+
+# Deterministic operation counters for bounded-hot-path verification.
+_LOAD_COUNTS = {
+    "full_loads": 0,
+    "suffix_advances": 0,
+    "conditional_hits": 0,
+    "descriptor_fetches": 0,
+}
+
+
+def repository_load_counts() -> dict[str, int]:
+    return dict(_LOAD_COUNTS)
+
+
+def reset_repository_load_counts() -> None:
+    for key in _LOAD_COUNTS:
+        _LOAD_COUNTS[key] = 0
+
+
+def clear_repository_cache() -> None:
+    """Evict all cached snapshots and descriptors (tests, process reset)."""
+    with _SNAPSHOT_LOCK:
+        _SNAPSHOT_CACHE.clear()
+        _DESCRIPTOR_CACHE.clear()
+
+
+def _evict_identity(identity: str) -> None:
+    """Drop one identity's snapshot and descriptor presence.
+
+    Any mutation through a ``Repository`` handle may contradict previously
+    validated reads, so writers evict before readers can serve them stale.
+    Pure readers (no puts/deletes) keep their zero-read fast path.
+    """
+    with _SNAPSHOT_LOCK:
+        _SNAPSHOT_CACHE.pop(identity, None)
+        for cached_key in [key for key in _DESCRIPTOR_CACHE if key[0] == identity]:
+            del _DESCRIPTOR_CACHE[cached_key]
+
+
+def _snapshot_identity(repository: "Repository") -> str:
+    store = repository.store
+    backing = getattr(store, "root", None)
+    if backing is not None:
+        try:
+            store_id = str(Path(backing).resolve())
+        except OSError:
+            store_id = str(backing)
+    else:
+        store_id = f"memory:{id(store)}"
+    try:
+        root_id = str(repository.root.resolve())
+    except OSError:
+        root_id = str(repository.root)
+    return f"{root_id}\x00{repository.repository_id}\x00{store_id}"
 
 
 @dataclass(frozen=True)
@@ -150,10 +223,12 @@ class Repository:
 
     def put(self, key: str, body: bytes, *, mode: Create | Update) -> ObjectMeta:
         result = self.store.put(self._key(key), body, mode=mode)
+        _evict_identity(_snapshot_identity(self))
         return ObjectMeta(key, result.size, result.version)
 
     def delete(self, key: str, *, if_version: Version | None = None) -> None:
         self.store.delete(self._key(key), if_version=if_version)
+        _evict_identity(_snapshot_identity(self))
 
     def put_immutable(self, key: str, body: bytes) -> ObjectMeta:
         """Create an immutable value, accepting only byte-identical retries."""
@@ -200,53 +275,150 @@ class Repository:
             raise ForgeError("descriptor object ID differs from its key", "integrity")
         return descriptor
 
-    def load(self) -> tuple[Manifest, Version, ReplayState]:
-        """Read one manifest and its complete linked WAL chain without LIST."""
+    def _memoized_descriptor_loader(self, identity: str) -> Callable[[str], dict]:
+        """Fetch and canonically validate each descriptor ID at most once.
+
+        Entries are immutable and keyed by (repository identity, ID) so two
+        restored roots sharing a repository ID establish presence
+        independently.
+        """
+        local: dict[str, dict] = {}
+
+        def load(identifier: str) -> dict:
+            hit = local.get(identifier)
+            if hit is not None:
+                return hit
+            cache_key = (identity, identifier)
+            with _SNAPSHOT_LOCK:
+                remembered = _DESCRIPTOR_CACHE.get(cache_key)
+            if remembered is not None:
+                local[identifier] = remembered
+                return remembered
+            _LOAD_COUNTS["descriptor_fetches"] += 1
+            value = self._descriptor(identifier)
+            with _SNAPSHOT_LOCK:
+                _DESCRIPTOR_CACHE[cache_key] = value
+            local[identifier] = value
+            return value
+
+        return load
+
+    def load(self, *, use_cache: bool = True) -> tuple[Manifest, Version, ReplayState]:
+        """Read one manifest snapshot, incrementally when a snapshot is cached.
+
+        An unchanged load performs one conditional ``manifest.json`` GET using
+        the cached object-store version; ``NotModified`` returns a defensive
+        copy of the cached snapshot without historical WAL or descriptor
+        reads. The cached entry itself is never exposed mutably: every return
+        clones the replay state so callers cannot corrupt subsequent loads.
+        When the manifest advances, loading walks only the new suffix back to
+        the cached head. Cache eviction, process restart, or disabled caching
+        falls back to complete replay. Writers continue to use the exact
+        manifest version from their snapshot for CAS, so a process-local
+        cache cannot make a stale write commit.
+        """
+        if not use_cache or not _cache_enabled():
+            return self._load_full()
+        identity = _snapshot_identity(self)
+        with _SNAPSHOT_LOCK:
+            cached = _SNAPSHOT_CACHE.get(identity)
+        if cached is None:
+            result = self._load_full()
+            with _SNAPSHOT_LOCK:
+                _SNAPSHOT_CACHE[identity] = result
+            manifest, version, replay = result
+            return manifest, version, replay.clone()
+        manifest, version, replay = cached
         try:
-            fetched = self.get("manifest.json")
+            fetched = self.get("manifest.json", if_none_match=version)
+        except NotModified:
+            _LOAD_COUNTS["conditional_hits"] += 1
+            return manifest, version, replay.clone()
         except ObjectNotFound as error:
             raise ForgeError("repository manifest is missing", "integrity") from error
+        _LOAD_COUNTS["suffix_advances"] += 1
+        result = self._load_suffix(identity, manifest, replay, fetched)
+        with _SNAPSHOT_LOCK:
+            _SNAPSHOT_CACHE[identity] = result
+        manifest, version, replay = result
+        return manifest, version, replay.clone()
+
+    def _install_snapshot(
+        self, manifest: Manifest, version: Version, replay: ReplayState
+    ) -> None:
+        """Install a newly validated snapshot after a successful local CAS."""
+        if not _cache_enabled():
+            return
+        with _SNAPSHOT_LOCK:
+            _SNAPSHOT_CACHE[_snapshot_identity(self)] = (manifest, version, replay)
+
+    def _parse_manifest(self, body: bytes) -> Manifest:
         try:
-            raw_manifest = json.loads(fetched.body)
+            raw_manifest = json.loads(body)
         except json.JSONDecodeError as error:
             raise ForgeError("repository manifest is malformed", "integrity") from error
-        if canonical_json(raw_manifest) != fetched.body:
+        if canonical_json(raw_manifest) != body:
             raise ForgeError("repository manifest is not canonical JSON", "integrity")
         manifest = Manifest.from_dict(raw_manifest)
         if manifest.repository_id != self.repository_id:
             raise ForgeError("manifest repository ID differs from repository configuration", "integrity")
+        return manifest
+
+    def _fetch_record(self, pointer: dict, expected_seq: int) -> tuple[dict, dict]:
+        if pointer["seq"] != expected_seq:
+            raise ForgeError("WAL sequence is not contiguous", "integrity")
+        try:
+            fetched_record = self.get(pointer["key"])
+        except ObjectNotFound as error:
+            raise ForgeError("manifest references a missing WAL record", "integrity") from error
+        if sha256(fetched_record.body) != pointer["sha256"]:
+            raise ForgeError("WAL record hash differs from its pointer", "integrity")
+        try:
+            raw_record = json.loads(fetched_record.body)
+        except json.JSONDecodeError as error:
+            raise ForgeError("WAL record is malformed", "integrity") from error
+        if canonical_json(raw_record) != fetched_record.body:
+            raise ForgeError("WAL record is not canonical JSON", "integrity")
+        record = validate_record(raw_record, repository_id=self.repository_id)
+        if (
+            record["seq"] != pointer["seq"]
+            or record["event_id"] != pointer.get("event_id", record["event_id"])
+            or record["publication_id"] != pointer.get("publication_id", record["publication_id"])
+        ):
+            raise ForgeError("WAL record differs from its manifest pointer", "integrity")
+        reference = {
+            "seq": record["seq"],
+            "key": pointer["key"],
+            "sha256": pointer["sha256"],
+            "event_id": record["event_id"],
+            "publication_id": record["publication_id"],
+        }
+        return record, reference
+
+    def _check_replay_matches(self, manifest: Manifest, state: ReplayState) -> None:
+        if (
+            state.head_seq != manifest.head_seq
+            or state.canonical_ref != manifest.canonical_ref
+            or state.canonical_tip != manifest.canonical_tip
+            or state.canonical_packs != list(manifest.canonical_packs)
+            or state.head_record != manifest.wal_head.to_dict()
+        ):
+            raise ForgeError("manifest does not equal its replayed WAL state", "integrity")
+
+    def _load_full(self) -> tuple[Manifest, Version, ReplayState]:
+        """Read one manifest and its complete linked WAL chain without LIST."""
+        _LOAD_COUNTS["full_loads"] += 1
+        try:
+            fetched = self.get("manifest.json")
+        except ObjectNotFound as error:
+            raise ForgeError("repository manifest is missing", "integrity") from error
+        manifest = self._parse_manifest(fetched.body)
+        loader = self._memoized_descriptor_loader(_snapshot_identity(self))
         pointer = manifest.wal_head.to_dict()
         reversed_records: list[tuple[dict, dict]] = []
         expected_seq = manifest.head_seq
         while True:
-            if pointer["seq"] != expected_seq:
-                raise ForgeError("WAL sequence is not contiguous", "integrity")
-            try:
-                fetched_record = self.get(pointer["key"])
-            except ObjectNotFound as error:
-                raise ForgeError("manifest references a missing WAL record", "integrity") from error
-            if sha256(fetched_record.body) != pointer["sha256"]:
-                raise ForgeError("WAL record hash differs from its pointer", "integrity")
-            try:
-                raw_record = json.loads(fetched_record.body)
-            except json.JSONDecodeError as error:
-                raise ForgeError("WAL record is malformed", "integrity") from error
-            if canonical_json(raw_record) != fetched_record.body:
-                raise ForgeError("WAL record is not canonical JSON", "integrity")
-            record = validate_record(raw_record, repository_id=self.repository_id)
-            if (
-                record["seq"] != pointer["seq"]
-                or record["event_id"] != pointer.get("event_id", record["event_id"])
-                or record["publication_id"] != pointer.get("publication_id", record["publication_id"])
-            ):
-                raise ForgeError("WAL record differs from its manifest pointer", "integrity")
-            reference = {
-                "seq": record["seq"],
-                "key": pointer["key"],
-                "sha256": pointer["sha256"],
-                "event_id": record["event_id"],
-                "publication_id": record["publication_id"],
-            }
+            record, reference = self._fetch_record(pointer, expected_seq)
             reversed_records.append((record, reference))
             if record["seq"] == 1:
                 break
@@ -257,15 +429,60 @@ class Repository:
         records = list(reversed(reversed_records))
         state = ReplayState()
         for record, reference in records:
-            apply_record(state, record, record_ref=reference, descriptor_loader=self._descriptor)
+            apply_record(state, record, record_ref=reference, descriptor_loader=loader)
+        self._check_replay_matches(manifest, state)
+        return manifest, fetched.meta.version, state
+
+    def _load_suffix(
+        self,
+        identity: str,
+        cached_manifest: Manifest,
+        cached_replay: ReplayState,
+        fetched: GetResult,
+    ) -> tuple[Manifest, Version, ReplayState]:
+        """Advance a cached snapshot across one manifest generation change."""
+        manifest = self._parse_manifest(fetched.body)
+        if manifest.head_seq < cached_manifest.head_seq:
+            raise ForgeError("repository manifest moved backwards", "integrity")
+        cached_head = cached_manifest.wal_head.to_dict()
+        if manifest.head_seq == cached_manifest.head_seq:
+            if manifest.wal_head.to_dict() != cached_head:
+                raise ForgeError("repository manifest head changed at the same sequence", "integrity")
+            # Same-sequence generations must still describe the same replayed
+            # WAL state; canonical_tip/ref/packs are repository truth and are
+            # validated rather than trusted from the new manifest bytes.
+            self._check_replay_matches(manifest, cached_replay)
+            return manifest, fetched.meta.version, cached_replay
+        loader = self._memoized_descriptor_loader(identity)
+        pointer = manifest.wal_head.to_dict()
+        expected_seq = manifest.head_seq
+        suffix: list[tuple[dict, dict]] = []
+        while pointer["seq"] > cached_manifest.head_seq:
+            record, reference = self._fetch_record(pointer, expected_seq)
+            suffix.append((record, reference))
+            previous = record["previous"]
+            assert isinstance(previous, dict)
+            pointer = previous
+            expected_seq -= 1
+        # The first suffix record's exact previous sequence, key, and hash
+        # must identify the cached head; the cached manifest head separately
+        # binds its event and publication IDs.
         if (
-            state.head_seq != manifest.head_seq
-            or state.canonical_ref != manifest.canonical_ref
-            or state.canonical_tip != manifest.canonical_tip
-            or state.canonical_packs != list(manifest.canonical_packs)
-            or state.head_record != manifest.wal_head.to_dict()
+            pointer.get("seq") != cached_head["seq"]
+            or pointer.get("key") != cached_head["key"]
+            or pointer.get("sha256") != cached_head["sha256"]
         ):
-            raise ForgeError("manifest does not equal its replayed WAL state", "integrity")
+            raise ForgeError("WAL suffix does not reach the cached head", "integrity")
+        if (
+            cached_replay.head_record is None
+            or cached_replay.head_record.get("event_id") != cached_head["event_id"]
+            or cached_replay.head_record.get("publication_id") != cached_head["publication_id"]
+        ):
+            raise ForgeError("cached manifest head binding is inconsistent", "integrity")
+        state = cached_replay.clone_for_append()
+        for record, reference in reversed(suffix):
+            apply_record(state, record, record_ref=reference, descriptor_loader=loader)
+        self._check_replay_matches(manifest, state)
         return manifest, fetched.meta.version, state
 
     def _record(
@@ -377,18 +594,24 @@ class Repository:
                     "event_id": identifier,
                     "publication_id": publication_id,
                 }
-                next_state = state.clone()
+                # Publication derives a private copy-on-write candidate
+                # state; it does not deep-copy immutable historical WAL
+                # payloads merely to append one record.
+                next_state = state.clone_for_append()
                 apply_record(
                     next_state,
                     record,
                     record_ref=record_ref,
-                    descriptor_loader=self._descriptor,
+                    descriptor_loader=self._memoized_descriptor_loader(
+                        _snapshot_identity(self)
+                    ),
                 )
                 next_manifest = self._manifest_for(next_state, manifest, self.writer)
                 try:
                     checkpoint(self.root, "wal.manifest_cas_sending")
-                    self.put("manifest.json", canonical_json(next_manifest.to_dict()), mode=Update(version))
+                    meta = self.put("manifest.json", canonical_json(next_manifest.to_dict()), mode=Update(version))
                     checkpoint(self.root, "wal.manifest_cas_committed")
+                    self._install_snapshot(next_manifest, meta.version, next_state)
                     return record["seq"]
                 except PreconditionFailed:
                     last_conflict = True
@@ -457,8 +680,9 @@ class Repository:
             )
             try:
                 checkpoint(self.root, "wal.manifest_cas_sending")
-                self.put("manifest.json", canonical_json(manifest.to_dict()), mode=Create())
+                meta = self.put("manifest.json", canonical_json(manifest.to_dict()), mode=Create())
                 checkpoint(self.root, "wal.manifest_cas_committed")
+                self._install_snapshot(manifest, meta.version, state)
             except PreconditionFailed:
                 loaded, _version, replay = self.load()
                 existing = replay.events.get(candidate.event_id)

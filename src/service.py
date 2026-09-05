@@ -47,6 +47,8 @@ def init_forge(
     branch: str,
     database: str | None = None,
     object_store: str = "filesystem",
+    *,
+    admin_database: str | None = None,
 ) -> None:
     if run("git", "check-ref-format", "--branch", branch, check=False).returncode:
         raise ForgeError(f"invalid branch name: {branch}")
@@ -70,7 +72,7 @@ def init_forge(
     store = (
         open_store(root)
         if backend_record_path(root).exists()
-        else initialize_store(root, database)
+        else initialize_store(root, database, admin_database=admin_database)
     )
     try:
         store.bootstrap()
@@ -285,12 +287,15 @@ def add_view(
 
 
 def sync_view(root: Path, name: str) -> None:
+    # Explicit sync performs full validation rather than the request fast path.
     state = load_state(root)
     if state.get("repository_state") != "ready":
         raise ForgeError("forge initialization is incomplete")
     repository = Repository.open(root)
     manifest, _version, replay = repository.load()
-    materialized = ensure_view_materialized(root, name, manifest, replay, repository)
+    materialized = ensure_view_materialized(
+        root, name, manifest, replay, repository, full_validation=True
+    )
     ensure_intake_materialized(root, materialized, manifest)
 
 
@@ -473,4 +478,4 @@ def transition_principal(root: Path, principal_id: str) -> None:
     for name, view in sorted(replay.active_views.items()):
         if view["principal_id"] == principal_id:
             materialized = ensure_view_materialized(root, name, manifest, replay, repository)
-            ensure_intake_materialized(root, materialized)
+            ensure_intake_materialized(root, materialized, manifest)
