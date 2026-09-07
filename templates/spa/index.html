@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Bastion permission demo</title>
+<link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand">Bastion</span>
+  <span id="identity" class="identity" hidden></span>
+  <button id="logout" type="button" hidden>Sign out</button>
+</header>
+<main id="app">
+  <section id="login" class="card">
+    <h1>Sign in with a Bastion token</h1>
+    <p class="hint">Your credential is kept in this page's memory only. It is
+    never stored in a cookie, URL, or browser storage, and reloading the page
+    signs you out.</p>
+    <form id="login-form" autocomplete="off">
+      <label for="token">Access token</label>
+      <input id="token" name="token" type="password" autocomplete="off"
+             spellcheck="false" required>
+      <button type="submit">Sign in</button>
+      <p id="login-error" class="error" role="alert" hidden></p>
+    </form>
+  </section>
+  <section id="workspace" hidden>
+    <nav class="tabs" role="tablist">
+      <button type="button" class="tab" id="tab-summary" role="tab" aria-selected="true">Summary</button>
+      <button type="button" class="tab" id="tab-decision" role="tab" aria-selected="false">Decision inspector</button>
+      <button type="button" class="tab" id="tab-tree" role="tab" aria-selected="false">Tree</button>
+      <button type="button" class="tab" id="tab-history" role="tab" aria-selected="false">History</button>
+      <button type="button" class="tab" id="tab-clone" role="tab" aria-selected="false">Clone</button>
+    </nav>
+    <section id="panel-summary" class="card panel" role="tabpanel" aria-labelledby="tab-summary"></section>
+    <section id="panel-decision" class="card panel" role="tabpanel" aria-labelledby="tab-decision" hidden></section>
+    <section id="panel-tree" class="card panel" role="tabpanel" aria-labelledby="tab-tree" hidden></section>
+    <section id="panel-history" class="card panel" role="tabpanel" aria-labelledby="tab-history" hidden></section>
+    <section id="panel-clone" class="card panel" role="tabpanel" aria-labelledby="tab-clone" hidden></section>
+  </section>
+</main>
+<script src="/assets/app.js"></script>
+</body>
+</html>

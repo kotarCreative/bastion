@@ -37,6 +37,7 @@ roadmap work.
 - [Transaction and event model](docs/TRANSACTIONS.md)
 - [Security model](docs/SECURITY.md)
 - [Testing and local operation](docs/TESTING.md)
+- [Test deployment](docs/DEPLOYMENT.md)
 - [Roadmap](ROADMAP.md)
 
 ## Quick Start

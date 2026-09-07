@@ -63,8 +63,12 @@ class HttpForgeTest(unittest.TestCase):
         identity_harness.add_view(self.forge, "bob", ["visible"], ["visible"], "main")
         self.initial_canonical = ref(canonical_repo(self.forge), "refs/heads/main")
 
-        self.alice_token = add_token(self.forge, "alice")
-        self.bob_token = add_token(self.forge, "bob")
+        self.alice_token = add_token(
+            self.forge, "alice", scopes=["fetch", "push", "ui"]
+        )
+        self.bob_token = add_token(
+            self.forge, "bob", scopes=["fetch", "push", "ui"]
+        )
         self.server = make_server(self.forge, "127.0.0.1", 0)
         self.port = self.server.server_port
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -79,7 +83,7 @@ class HttpForgeTest(unittest.TestCase):
     def url(self, view: str, token: str | None = None) -> str:
         if token is None:
             return f"http://127.0.0.1:{self.port}/{view}.git"
-        return f"http://user:{token}@127.0.0.1:{self.port}/{view}.git"
+        return f"http://{view}:{token}@127.0.0.1:{self.port}/{view}.git"
 
     def clone(self, view: str, destination: Path, token: str | None = None,
               *extra: str) -> Path:

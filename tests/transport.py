@@ -64,11 +64,13 @@ class LoopbackTransport:
 
     def token(self, view: str) -> str:
         if view not in self._tokens:
-            self._tokens[view] = add_token(self.root, view)
+            self._tokens[view] = add_token(
+                self.root, view, scopes=["fetch", "push", "ui"]
+            )
         return self._tokens[view]
 
     def url(self, view: str) -> str:
-        return f"http://bastion:{self.token(view)}@127.0.0.1:{self.port}/{view}.git"
+        return f"http://{view}:{self.token(view)}@127.0.0.1:{self.port}/{view}.git"
 
     def attach(self, checkout: Path, view: str) -> None:
         """Point origin's push URL at the authenticated intake boundary."""

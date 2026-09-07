@@ -132,6 +132,25 @@ def parser() -> argparse.ArgumentParser:
     token_command = commands.add_parser("add-token")
     token_command.add_argument("root", type=Path)
     token_command.add_argument("view")
+    token_command.add_argument(
+        "--scope",
+        action="append",
+        default=[],
+        dest="scopes",
+        choices=["fetch", "push", "ui"],
+        help="token scope; repeatable (default: fetch and ui; push is explicit)",
+    )
+    token_command.add_argument(
+        "--expires-in",
+        default=None,
+        help="expiry like 30m, 12h, or 7d",
+    )
+    list_tokens_command = commands.add_parser("list-tokens")
+    list_tokens_command.add_argument("root", type=Path)
+    list_tokens_command.add_argument("--view", action="append", default=[])
+    revoke_command = commands.add_parser("revoke-token")
+    revoke_command.add_argument("root", type=Path)
+    revoke_command.add_argument("token_id")
     serve = commands.add_parser("serve")
     serve.add_argument("root", type=Path)
     serve.add_argument("--host", default="127.0.0.1")
@@ -224,7 +243,28 @@ def main() -> int:
         elif args.command == "add-token":
             from http_server import add_token
 
-            print(add_token(args.root, args.view))
+            print(
+                add_token(
+                    args.root,
+                    args.view,
+                    scopes=args.scopes or None,
+                    expires_in=args.expires_in,
+                )
+            )
+        elif args.command == "list-tokens":
+            import json as _json
+
+            from http_server import list_tokens
+
+            for record in list_tokens(args.root):
+                if args.view and record["view_id"] not in args.view:
+                    continue
+                print(_json.dumps(record, sort_keys=True))
+        elif args.command == "revoke-token":
+            from http_server import revoke_token
+
+            if not revoke_token(args.root, args.token_id):
+                raise SystemExit(f"unknown token: {args.token_id}")
         elif args.command == "serve":
             from http_server import serve
 

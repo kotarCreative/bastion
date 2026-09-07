@@ -8,6 +8,7 @@ import tempfile
 from pathlib import Path
 
 from errors import ForgeError
+import limits
 from layout import ZERO_OID
 from validation import TreeEntries, has_file_directory_conflict
 
@@ -18,16 +19,23 @@ def run(
     data: bytes | None = None,
     env: dict[str, str] | None = None,
     check: bool = True,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
-    process = subprocess.run(
-        args,
-        cwd=cwd,
-        input=data,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
+    if timeout is None:
+        timeout = limits.GIT_COMMAND_TIMEOUT
+    try:
+        process = subprocess.run(
+            args,
+            cwd=cwd,
+            input=data,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise ForgeError(f"{' '.join(os.fsdecode(arg) for arg in args)}: timed out", "limits") from error
     if check and process.returncode:
         detail = process.stderr.decode(errors="replace").strip()
         raise ForgeError(f"{' '.join(os.fsdecode(arg) for arg in args)}: {detail}")
@@ -194,6 +202,108 @@ def copy_object(
     ).stdout.decode().strip()
     if copied != oid:
         raise ForgeError("object format mismatch while copying object")
+
+
+def copy_objects(
+    source: Path,
+    destination: Path,
+    oids: list[str],
+    source_env: dict[str, str] | None = None,
+    destination_env: dict[str, str] | None = None,
+    batch_objects: int = 50,
+    batch_bytes: int = 8 << 20,
+) -> None:
+    """Transfer many objects with bounded batches, never one pair per blob.
+
+    Every required distinct object transfers at most once per call.  A
+    sizing pass groups the objects into batches of at most ``batch_objects``
+    or ``batch_bytes`` expanded bytes (a single larger object still forms
+    its own batch); each round trip reads one batch and stages it through
+    temporary files so only one batch is ever resident.
+    """
+    import limits as _limits
+
+    if not oids:
+        return
+    batch_objects = min(batch_objects, _limits.BLOB_BATCH_OBJECTS)
+    batch_bytes = min(batch_bytes, _limits.BLOB_BATCH_BYTES)
+    env = destination_env or clean_env()
+    query = ("".join(f"{oid}\n" for oid in oids)).encode("ascii")
+    listing = git(
+        source, "cat-file", "--batch-check=%(objectname) %(objectsize)", data=query, env=source_env
+    ).stdout.splitlines()
+    sizes: dict[str, int] = {}
+    for line in listing:
+        fields = line.split(b" ")
+        if len(fields) != 2:
+            raise ForgeError("object format mismatch while copying object")
+        identifier = fields[0].decode("ascii", "replace")
+        if fields[1] == b"missing":
+            raise ForgeError("object format mismatch while copying object")
+        try:
+            sizes[identifier] = int(fields[1])
+        except ValueError as error:
+            raise ForgeError("object format mismatch while copying object") from error
+    if set(sizes) != set(oids):
+        raise ForgeError("object format mismatch while copying object")
+    batches: list[list[str]] = []
+    current: list[str] = []
+    current_bytes = 0
+    for oid in oids:
+        size = sizes[oid]
+        if current and (
+            len(current) >= batch_objects or current_bytes + size > batch_bytes
+        ):
+            batches.append(current)
+            current = []
+            current_bytes = 0
+        current.append(oid)
+        current_bytes += size
+    if current:
+        batches.append(current)
+    with tempfile.TemporaryDirectory(prefix="bastion-copy-") as staging:
+        for batch in batches:
+            query = ("".join(f"{oid}\n" for oid in batch)).encode("ascii")
+            raw = git(
+                source, "cat-file", "--batch", data=query, env=source_env
+            ).stdout
+            names: list[str] = []
+            cursor = 0
+            for oid in batch:
+                header_end = raw.find(b"\n", cursor)
+                if header_end < 0:
+                    raise ForgeError("object format mismatch while copying object")
+                fields = raw[cursor:header_end].split(b" ")
+                if (
+                    len(fields) != 3
+                    or fields[0].decode("ascii", "replace") != oid
+                    or fields[1] not in {b"commit", b"tree", b"blob", b"tag"}
+                ):
+                    raise ForgeError("object format mismatch while copying object")
+                try:
+                    size = int(fields[2])
+                except ValueError as error:
+                    raise ForgeError(
+                        "object format mismatch while copying object"
+                    ) from error
+                contents = raw[header_end + 1 : header_end + 1 + size]
+                if len(contents) != size or raw[header_end + 1 + size : header_end + 2 + size] != b"\n":
+                    raise ForgeError("object format mismatch while copying object")
+                target = os.path.join(staging, oid)
+                with open(target, "wb") as handle:
+                    handle.write(contents)
+                names.append(target)
+                cursor = header_end + 1 + size + 1
+            produced = git(
+                destination,
+                "hash-object",
+                "-w",
+                "--stdin-paths",
+                data=("".join(f"{name}\n" for name in names)).encode(),
+                env=env,
+            ).stdout.decode().split()
+            if produced != batch:
+                raise ForgeError("object format mismatch while copying object")
 
 
 def temporary_index(
@@ -391,6 +501,50 @@ def verify_no_extra_objects(repo: Path, new: str, env: dict[str, str]) -> None:
     )
     if quarantined - reachable:
         raise ForgeError("push contains objects unreachable from the submitted tip")
+
+
+def fsck_strict(
+    repo: Path, oids: list[str] | set[str], env: dict[str, str] | None = None
+) -> None:
+    """Apply the same strict object checks as post-publication materialization.
+
+    Run before any immutable upload or manifest CAS so admission rejects
+    object defects in quarantine instead of poisoning published stores.
+    """
+    if not oids:
+        return
+    result = git(
+        repo,
+        "fsck",
+        "--strict",
+        "--full",
+        "--no-dangling",
+        "--no-progress",
+        *sorted(oids),
+        env=env,
+        check=False,
+    )
+    if result.returncode:
+        raise ForgeError("push contains malformed objects", "malformed")
+
+
+def strict_commit_headers(repo: Path, oids: list[str], env: dict[str, str]) -> None:
+    """Require exactly one author and committer header per submitted commit.
+
+    Git's fsck tolerates duplicated commit headers on some versions, which
+    would make author binding depend on version-specific header selection.
+    """
+    for oid in oids:
+        raw = git(repo, "cat-file", "commit", oid, env=env).stdout
+        names: list[bytes] = []
+        for line in raw.split(b"\n"):
+            if not line:
+                break
+            if line.startswith(b" ") and names:
+                continue  # continuation of the previous header value
+            names.append(line.split(b" ", 1)[0])
+        if names.count(b"author") != 1 or names.count(b"committer") != 1:
+            raise ForgeError("push contains malformed commit headers", "malformed")
 
 
 def copy_submitted_closure(repo: Path, old: str, new: str, env: dict[str, str]) -> None:

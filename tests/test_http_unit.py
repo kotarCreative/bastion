@@ -15,11 +15,14 @@ from tests import identity_harness
 from errors import ForgeError
 from http_server import (
     add_token,
+    authenticate_token,
     decode_body,
-    load_tokens,
+    list_tokens,
     parse_authorization,
+    parse_git_authorization,
     parse_route,
     parse_service,
+    revoke_token,
 )
 
 
@@ -105,10 +108,14 @@ class AuthorizationTest(unittest.TestCase):
         self.assertEqual(parse_authorization(basic("user", "token")), "token")
         self.assertEqual(parse_authorization(basic("", "token")), "token")
         self.assertEqual(parse_authorization(basic("us er", "to:ken")), "to:ken")
+        self.assertEqual(
+            parse_git_authorization(basic("alice", "token")), ("alice", "token")
+        )
 
     def test_bearer(self) -> None:
         self.assertEqual(parse_authorization("Bearer token"), "token")
         self.assertEqual(parse_authorization("bearer token"), "token")
+        self.assertEqual(parse_git_authorization("Bearer token"), (None, "token"))
 
     def test_invalid(self) -> None:
         for header in (
@@ -170,20 +177,49 @@ class TokenTest(unittest.TestCase):
         first = add_token(self.forge, "alice")
         second = add_token(self.forge, "alice")
         self.assertNotEqual(first, second)
-        tokens = load_tokens(self.forge)
-        self.assertEqual(tokens, {first: "alice", second: "alice"})
-        data = json.loads((self.forge / "tokens.json").read_text())
-        self.assertEqual(data, {first: "alice", second: "alice"})
+        self.assertTrue(first.startswith("bst1."))
+        self.assertTrue(second.startswith("bst1."))
+        records = list_tokens(self.forge)
+        self.assertEqual(len(records), 2)
+        self.assertTrue(all(item["view_id"] == "alice" for item in records))
+        # Digests and secrets never appear in listings.
+        self.assertFalse(any("digest" in key for item in records for key in item))
+        self.assertFalse(any("secret" in key for item in records for key in item))
+        for item in records:
+            self.assertEqual(item["scopes"], ["fetch", "ui"])
+        self.assertFalse((self.forge / "tokens.json").exists())
+        self.assertIsNotNone(authenticate_token(self.forge, first))
+        self.assertIsNotNone(authenticate_token(self.forge, second))
 
     def test_unknown_view_rejected_without_state_change(self) -> None:
         with self.assertRaises(ForgeError):
             add_token(self.forge, "carol")
         self.assertFalse((self.forge / "tokens.json").exists())
+        self.assertEqual(list_tokens(self.forge), [])
 
     def test_revocation_takes_effect(self) -> None:
         token = add_token(self.forge, "alice")
-        (self.forge / "tokens.json").unlink()
-        self.assertEqual(load_tokens(self.forge), {})
+        token_id = token.split(".")[1]
+        self.assertIsNotNone(authenticate_token(self.forge, token))
+        self.assertTrue(revoke_token(self.forge, token_id))
+        self.assertIsNone(authenticate_token(self.forge, token))
+        self.assertFalse(revoke_token(self.forge, "AAAAAAAAAAAAAAAAAAAAAA"))
+
+    def test_scope_enforcement(self) -> None:
+        fetch_only = add_token(self.forge, "alice", scopes=["fetch"])
+        record = authenticate_token(self.forge, fetch_only)
+        assert record is not None
+        self.assertEqual(record["scopes"], ["fetch"])
+        push_only = add_token(
+            self.forge, "alice", scopes=["push"], expires_in="60m"
+        )
+        record = authenticate_token(self.forge, push_only)
+        assert record is not None
+        self.assertEqual(record["scopes"], ["push"])
+        with self.assertRaises(ForgeError):
+            add_token(self.forge, "alice", scopes=["admin"])
+        with self.assertRaises(ForgeError):
+            add_token(self.forge, "alice", expires_in="never")
 
 
 if __name__ == "__main__":

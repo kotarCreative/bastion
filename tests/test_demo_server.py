@@ -1,4 +1,4 @@
-"""Tests for the Flask-hosted permission demo server."""
+"""Tests for the Flask-hosted permission demo server (spec 013 surface)."""
 
 from __future__ import annotations
 
@@ -6,8 +6,8 @@ import base64
 import os
 import subprocess
 import tempfile
-import threading
 import unittest
+import urllib.parse
 from pathlib import Path
 
 import forge
@@ -74,362 +74,208 @@ class DemoServerTest(unittest.TestCase):
         self.nadia_token = add_token(self.forge, "nadia")
         recover(self.forge, load_state(self.forge))
 
-        os.environ["BASTION_DEMO_SECRET"] = "test-secret-do-not-use"
         self.app = create_app(self.forge)
         self.client = self.app.test_client()
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def _basic(self, token: str) -> dict[str, str]:
-        encoded = base64.b64encode(f"x-access-token:{token}".encode()).decode()
-        return {"Authorization": f"Basic {encoded}"}
+    def _bearer(self, token: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {token}"}
 
-    def _login(self, token: str) -> None:
-        response = self.client.post("/login", data={"token": token}, follow_redirects=True)
-        self.assertEqual(response.status_code, 200)
+    def _b64(self, raw: bytes) -> str:
+        return base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
-    def test_landing_page_requires_token(self) -> None:
+    def _login_session(self, token: str) -> None:
+        """Legacy cookie sessions no longer exist; this helper is gone."""
+        raise AssertionError("cookie sessions were removed by spec 015 B2")
+
+    # -- browser application shell ----------------------------------------
+
+    def test_landing_serves_application_shell(self) -> None:
         response = self.client.get("/")
         self.assertEqual(response.status_code, 200)
-        self.assertIn(b"Enter the token", response.data)
+        self.assertIn(b"/assets/app.js", response.data)
+        self.assertIn(b"/assets/app.css", response.data)
+        self.assertNotIn(b"<script>", response.data)  # external script only
 
-    def test_login_rejects_bad_token(self) -> None:
-        response = self.client.post("/login", data={"token": "not-a-token"}, follow_redirects=True)
-        self.assertEqual(response.status_code, 200)
-        self.assertIn(b"Invalid token", response.data)
+    def test_assets_are_served(self) -> None:
+        css = self.client.get("/assets/app.css")
+        js = self.client.get("/assets/app.js")
+        self.assertEqual(css.status_code, 200)
+        self.assertEqual(js.status_code, 200)
+        self.assertIn("text/css", css.content_type)
+        self.assertIn("javascript", js.content_type)
 
-    def test_login_accepts_good_token(self) -> None:
-        response = self.client.post("/login", data={"token": self.alice_token}, follow_redirects=True)
-        self.assertEqual(response.status_code, 200)
-        self.assertIn(b"alice", response.data)
+    def test_application_never_persists_credentials(self) -> None:
+        js = self.client.get("/assets/app.js").data.decode()
+        self.assertNotIn("document.cookie", js)
+        self.assertNotIn("localStorage", js)
+        self.assertNotIn("sessionStorage", js)
+        self.assertNotIn("innerHTML", js)
+        self.assertNotIn("outerHTML", js)
+        self.assertIn("page memory only", js)
+        self.assertIn("Bearer ", js)
+        # The token input is cleared right after use.
+        self.assertIn('tokenInput.value = ""', js)
+        shell = self.client.get("/").data.decode()
+        self.assertIn('type="password"', shell)
+        shell_without_quotes = shell
+        self.assertNotIn("<style", shell_without_quotes)
 
-    def test_whoami_html(self) -> None:
-        self._login(self.alice_token)
-        response = self.client.get("/whoami")
-        self.assertEqual(response.status_code, 200)
-        text = response.data.decode()
-        self.assertIn("alice", text)
-        self.assertIn("Descriptor ID", text)
-        self.assertIn("read", text)
-        self.assertIn("visible", text)
+    def test_unknown_routes_are_generic(self) -> None:
+        for path in ("/login", "/logout", "/whoami", "/evaluate", "/browse",
+                     "/blob", "/history", "/alice.git", "/nope"):
+            with self.subTest(path=path):
+                response = self.client.get(path)
+                self.assertEqual(response.status_code, 404)
+                self.assertEqual(response.data, b"not found")
 
-    def test_whoami_json(self) -> None:
-        self._login(self.alice_token)
-        response = self.client.get("/whoami?format=json")
-        self.assertEqual(response.status_code, 200)
-        data = response.get_json()
-        self.assertEqual(data["view"], "alice")
-        self.assertEqual(data["descriptor_id"], data["descriptor_id"])
-        self.assertIn("read", data["capabilities"])
-        self.assertIn("visible", data["capabilities"]["read"])
+    def test_security_headers_on_every_response(self) -> None:
+        expected = {
+            "Content-Security-Policy": (
+                "default-src 'none'; script-src 'self'; style-src 'self'; "
+                "connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+            ),
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+        }
+        for path in ("/", "/assets/app.css", "/assets/app.js", "/nope"):
+            with self.subTest(path=path):
+                response = self.client.get(path)
+                for key, value in expected.items():
+                    self.assertEqual(response.headers.get(key), value)
 
-    def test_evaluate_allowed_and_denied(self) -> None:
-        self._login(self.alice_token)
-        response = self.client.post("/evaluate", data={"capability": "read", "path": "visible/file.txt"})
-        self.assertEqual(response.status_code, 200)
-        self.assertIn(b"allowed", response.data)
+    def test_no_cookies_ever_set(self) -> None:
+        for path, method, kwargs in (
+            ("/", "get", {}),
+            ("/assets/app.js", "get", {}),
+            ("/nope", "get", {}),
+            ("/api/v1/session", "get", {"headers": _bearer_header(self.alice_token)}),
+        ):
+            response = getattr(self.client, method)(path, **kwargs)
+            self.assertIsNone(response.headers.get("Set-Cookie"))
 
-        response = self.client.post("/evaluate", data={"capability": "read", "path": "hidden/secret.txt"})
-        self.assertEqual(response.status_code, 200)
-        self.assertIn(b"denied", response.data)
+    # -- API surface (Bearer only, memory-only credentials) -----------------
 
-    def test_browse_shows_visible_entries(self) -> None:
-        self._login(self.alice_token)
-        response = self.client.get("/browse")
-        self.assertEqual(response.status_code, 200)
-        text = response.data.decode()
-        self.assertIn("visible", text)
-        self.assertNotIn("hidden", text)
+    def test_api_requires_bearer_without_cookie_fallback(self) -> None:
+        response = self.client.get("/api/v1/session")
+        self.assertEqual(response.status_code, 401)
+        response = self.client.get(
+            "/api/v1/session",
+            headers={"Authorization": "Bearer junk"},
+        )
+        self.assertEqual(response.status_code, 401)
 
-    def test_history_shows_commits(self) -> None:
-        self._login(self.alice_token)
-        response = self.client.get("/history")
+    def test_session_envelope_shape(self) -> None:
+        response = self.client.get("/api/v1/session", headers=_bearer_header(self.alice_token))
         self.assertEqual(response.status_code, 200)
-        # The view sees the synthetic projection commit, not the hidden canonical message.
-        self.assertIn(b"projected canonical change", response.data)
+        body = response.get_json()
+        self.assertEqual(body["view_id"], "alice")
+        self.assertEqual(body["principal"]["id"], "alice")
+        self.assertIn("capabilities", body["descriptor"])
+        self.assertIn("restrictions", body["descriptor"])
+        self.assertNotIn("canonical_frontier", body)
+        self.assertEqual(response.headers.get("Cache-Control"), "no-store")
 
-    def test_browse_json(self) -> None:
-        self._login(self.alice_token)
-        response = self.client.get("/browse?format=json")
+    def test_tree_scopes_to_visible_paths(self) -> None:
+        response = self.client.get(
+            "/api/v1/tree", headers=_bearer_header(self.alice_token)
+        )
         self.assertEqual(response.status_code, 200)
-        data = response.get_json()
-        self.assertEqual(data["view"], "alice")
-        self.assertEqual(data["path"], "")
-        paths = [entry["path"] for entry in data["entries"]]
+        paths = {entry["path_display"] for entry in response.get_json()["entries"]}
         self.assertIn("visible", paths)
         self.assertNotIn("hidden", paths)
 
-    def test_blob_shows_visible_file(self) -> None:
-        self._login(self.alice_token)
-        response = self.client.get("/blob?path=visible/file.txt")
-        self.assertEqual(response.status_code, 200)
-        self.assertIn(b"visible 2", response.data)
-        self.assertNotIn(b"secret", response.data)
-
-    def test_blob_denies_hidden_path(self) -> None:
-        self._login(self.alice_token)
-        response = self.client.get("/blob?path=hidden/secret.txt")
-        self.assertEqual(response.status_code, 404)
-        self.assertNotIn(b"secret 1", response.data)
-
-    def test_blob_missing_path_is_404(self) -> None:
-        self._login(self.alice_token)
-        response = self.client.get("/blob?path=visible/absent.txt")
-        self.assertEqual(response.status_code, 404)
-
-    def test_blob_invalid_path_is_404(self) -> None:
-        self._login(self.alice_token)
-        for path in ("../escape", "visible/../../etc", ""):
-            response = self.client.get(f"/blob?path={path}")
-            self.assertEqual(response.status_code, 404)
-
-    def test_blob_directory_redirects_to_browse(self) -> None:
-        self._login(self.alice_token)
-        response = self.client.get("/blob?path=visible")
-        self.assertEqual(response.status_code, 302)
-        followed = self.client.get(response.headers["Location"])
-        self.assertEqual(followed.status_code, 200)
-        self.assertIn(b"file.txt", followed.data)
-
-    def test_blob_raw_text(self) -> None:
-        self._login(self.alice_token)
-        response = self.client.get("/blob?path=visible/file.txt&raw=1")
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data, b"visible 2\n")
-        self.assertEqual(
-            response.headers["Content-Type"], "text/plain; charset=utf-8"
-        )
-
-    def test_blob_raw_binary(self) -> None:
-        self._login(self.alice_token)
-        raw = self.client.get("/blob?path=visible/blob.bin&raw=1")
-        self.assertEqual(raw.status_code, 200)
-        self.assertEqual(raw.data, b"\x00\x01binary")
-        self.assertEqual(
-            raw.headers["Content-Type"], "application/octet-stream"
-        )
-
-        page = self.client.get("/blob?path=visible/blob.bin")
-        self.assertEqual(page.status_code, 200)
-        self.assertIn(b"Binary file", page.data)
-
-    def test_blob_json(self) -> None:
-        self._login(self.alice_token)
-        response = self.client.get("/blob?path=visible/file.txt&format=json")
-        self.assertEqual(response.status_code, 200)
-        data = response.get_json()
-        self.assertEqual(data["path"], "visible/file.txt")
-        self.assertEqual(data["kind"], "blob")
-        self.assertEqual(data["content"], "visible 2\n")
-        self.assertFalse(data["binary"])
-
-    def test_blob_missing_intermediate_directory_is_404(self) -> None:
-        self._login(self.alice_token)
-        response = self.client.get("/blob?path=visible/absent/deep.txt")
-        self.assertEqual(response.status_code, 404)
-
-    def test_blob_json_honors_display_limit(self) -> None:
-        self._login(self.alice_token)
-        original_limit = demo_server.BLOB_DISPLAY_LIMIT
-        try:
-            demo_server.BLOB_DISPLAY_LIMIT = 1
-            response = self.client.get("/blob?path=visible/file.txt&format=json")
-            self.assertEqual(response.status_code, 200)
-            data = response.get_json()
-            self.assertTrue(data["too_large"])
-            self.assertIsNone(data["content"])
-        finally:
-            demo_server.BLOB_DISPLAY_LIMIT = original_limit
-
-    def test_blob_raw_streams_large_content(self) -> None:
-        self._login(self.alice_token)
-        original_limit = demo_server.BLOB_DISPLAY_LIMIT
-        try:
-            demo_server.BLOB_DISPLAY_LIMIT = 1
-            response = self.client.get("/blob?path=visible/file.txt&raw=1")
-            self.assertEqual(response.status_code, 200)
-            self.assertEqual(response.data, b"visible 2\n")
-            self.assertEqual(
-                response.headers["Content-Type"], "text/plain; charset=utf-8"
+    def test_hidden_tree_prefix_is_generic_404(self) -> None:
+        hidden = self._b64(b"hidden")
+        for token in (self.alice_token, self.bob_token):
+            response = self.client.get(
+                "/api/v1/tree",
+                query_string={"path_b64": hidden},
+                headers=_bearer_header(token),
             )
-        finally:
-            demo_server.BLOB_DISPLAY_LIMIT = original_limit
+            self.assertEqual(response.status_code, 404)
+            self.assertEqual(response.get_json(), {"error": "not-found"})
 
-    def test_browse_denies_hidden_directory(self) -> None:
-        self._login(self.alice_token)
-        response = self.client.get("/browse?path=hidden")
-        self.assertEqual(response.status_code, 404)
-
-    def test_browse_allows_visible_directory(self) -> None:
-        self._login(self.alice_token)
-        response = self.client.get("/browse?path=visible")
+    def test_decisions_endpoint(self) -> None:
+        response = self.client.post(
+            "/api/v1/decisions",
+            headers={**_bearer_header(self.alice_token), "Content-Type": "application/json"},
+            json={"capability": "read", "path_b64": self._b64(b"visible/file.txt")},
+        )
         self.assertEqual(response.status_code, 200)
-        text = response.data.decode()
-        self.assertIn("file.txt", text)
-        self.assertNotIn("secret.txt", text)
+        body = response.get_json()
+        self.assertTrue(body["allowed"])
+        response = self.client.post(
+            "/api/v1/decisions",
+            headers={**_bearer_header(self.alice_token), "Content-Type": "application/json"},
+            json={"capability": "read", "path_b64": self._b64(b"hidden/secret.txt")},
+        )
+        self.assertFalse(response.get_json()["allowed"])
 
-    def test_history_scoped_to_visible_path(self) -> None:
-        self._login(self.alice_token)
-        response = self.client.get("/history?path=visible/file.txt")
+    def test_history_envelope(self) -> None:
+        response = self.client.get("/api/v1/history", headers=_bearer_header(self.alice_token))
         self.assertEqual(response.status_code, 200)
-        self.assertIn(b"visible/file.txt", response.data)
-        self.assertIn(b"projected canonical change", response.data)
+        commits = response.get_json()["commits"]
+        self.assertTrue(commits)
+        self.assertIn("oid", commits[0])
+        self.assertIn("message_display", commits[0])
 
-    def test_history_denies_hidden_path(self) -> None:
-        self._login(self.alice_token)
-        response = self.client.get("/history?path=hidden/secret.txt")
-        self.assertEqual(response.status_code, 404)
-
-    def test_history_json(self) -> None:
-        self._login(self.alice_token)
-        response = self.client.get("/history?format=json")
-        self.assertEqual(response.status_code, 200)
-        data = response.get_json()
-        self.assertEqual(data["view"], "alice")
-        self.assertEqual(data["path"], "")
-        self.assertTrue(data["commits"])
-        self.assertIn("oid", data["commits"][0])
-        self.assertIn("message", data["commits"][0])
-
-    def test_narrow_grant_directories_remain_traversable(self) -> None:
-        self._login(self.nadia_token)
-        root = self.client.get("/browse?format=json")
-        self.assertEqual(root.status_code, 200)
-        entries = {entry["path"]: entry for entry in root.get_json()["entries"]}
-        self.assertIn("visible", entries)
-        self.assertNotIn("hidden", entries)
-
-        scoped = self.client.get("/browse?path=visible")
-        self.assertEqual(scoped.status_code, 200)
-        text = scoped.data.decode()
-        self.assertIn("file.txt", text)
-        self.assertNotIn("blob.bin", text)
-
-        directory = self.client.get("/blob?path=visible")
-        self.assertEqual(directory.status_code, 302)
-        followed = self.client.get(directory.headers["Location"])
-        self.assertEqual(followed.status_code, 200)
-        self.assertIn(b"file.txt", followed.data)
-
-        denied = self.client.get("/blob?path=visible/blob.bin")
-        self.assertEqual(denied.status_code, 404)
-
-        history = self.client.get("/history?path=visible")
-        self.assertEqual(history.status_code, 200)
-        self.assertIn(b"projected canonical change", history.data)
-
-    def test_non_utf8_path_round_trips(self) -> None:
-        self._login(self.alice_token)
-        encoded = base64.urlsafe_b64encode(b"visible/weird-\xff.txt").decode("ascii")
-
-        page = self.client.get(f"/blob?path_b64={encoded}")
-        self.assertEqual(page.status_code, 200)
-        self.assertIn(b"weird bytes", page.data)
-
-        raw = self.client.get(f"/blob?path_b64={encoded}&raw=1")
-        self.assertEqual(raw.status_code, 200)
-        self.assertEqual(raw.data, b"weird bytes\n")
-
-        fallback = self.client.get("/blob?path=visible/weird-%FF.txt&raw=1")
-        self.assertEqual(fallback.status_code, 200)
-        self.assertEqual(fallback.data, b"weird bytes\n")
-
-        listing = self.client.get("/browse?path=visible&format=json")
-        data = listing.get_json()
-        matches = [entry for entry in data["entries"] if entry["path_b64"] == encoded]
-        self.assertEqual(len(matches), 1)
-        self.assertEqual(matches[0]["path"], "visible/weird-\ufffd.txt")
-
-    def test_history_preserves_path_whitespace(self) -> None:
-        self._login(self.alice_token)
-        blob = self.client.get("/blob?path=visible/trailing.txt%20&raw=1")
-        self.assertEqual(blob.status_code, 200)
-        self.assertEqual(blob.data, b"padded\n")
-
-        history = self.client.get("/history?path=visible/trailing.txt%20")
-        self.assertEqual(history.status_code, 200)
-        self.assertIn(b"projected canonical change", history.data)
-        self.assertNotIn(b"No history is visible", history.data)
-
-    def test_nul_byte_paths_are_404(self) -> None:
-        self._login(self.alice_token)
-        for route in ("browse", "blob", "history"):
-            response = self.client.get(f"/{route}?path=visible/%00x")
-            self.assertEqual(response.status_code, 404, route)
-        encoded = base64.urlsafe_b64encode(b"visible/\x00x").decode("ascii")
-        response = self.client.get(f"/blob?path_b64={encoded}")
-        self.assertEqual(response.status_code, 404)
-
-    def test_blob_raw_stream_limit_returns_503(self) -> None:
-        self._login(self.alice_token)
-        original = demo_server._blob_stream_slots
-        try:
-            demo_server._blob_stream_slots = threading.BoundedSemaphore(0)
-            response = self.client.get("/blob?path=visible/file.txt&raw=1")
-            self.assertEqual(response.status_code, 503)
-        finally:
-            demo_server._blob_stream_slots = original
+    # -- Git routes ----------------------------------------------------------
 
     def test_git_info_refs_requires_auth(self) -> None:
-        response = self.client.get("/alice.git/info/refs?service=git-upload-pack")
+        response = self.client.get(
+            "/alice.git/info/refs", query_string={"service": "git-upload-pack"}
+        )
         self.assertEqual(response.status_code, 401)
-        self.assertIn("WWW-Authenticate", response.headers)
 
     def test_git_info_refs_rejects_wrong_view_token(self) -> None:
         response = self.client.get(
-            "/bob.git/info/refs?service=git-upload-pack",
-            headers=self._basic(self.alice_token),
+            "/alice.git/info/refs",
+            query_string={"service": "git-upload-pack"},
+            headers={"Authorization": _basic_header("bob", self.bob_token)},
         )
         self.assertEqual(response.status_code, 404)
 
     def test_git_info_refs_returns_advertisement(self) -> None:
         response = self.client.get(
-            "/alice.git/info/refs?service=git-upload-pack",
-            headers=self._basic(self.alice_token),
+            "/alice.git/info/refs",
+            query_string={"service": "git-upload-pack"},
+            headers={"Authorization": _basic_header("alice", self.alice_token)},
         )
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(
-            response.headers["Content-Type"],
-            "application/x-git-upload-pack-advertisement",
-        )
-        self.assertIn(b"# service=git-upload-pack", response.data)
+        self.assertIn(b"refs/heads/main", response.data)
+        self.assertEqual(response.headers.get("Cache-Control"), "no-store")
 
     def test_git_upload_pack_returns_result(self) -> None:
-        # First discover the advertised tip.
-        refs = self.client.get(
-            "/alice.git/info/refs?service=git-upload-pack",
-            headers=self._basic(self.alice_token),
+        from http_server import pkt_line
+
+        tip = forge.output(forge.view_repo(self.forge, "alice"), "rev-parse", "HEAD")
+        payload = (
+            pkt_line(f"want {tip} agent=bastion-test\n".encode())
+            + b"0000"
+            + b"0009done\n"
         )
-        self.assertEqual(refs.status_code, 200)
-        body = refs.data
-        # Find the first ref OID in the advertisement, stripping the pkt-line length.
-        oid: str | None = None
-        for line in body.splitlines():
-            text = line.decode(errors="replace")
-            if not text.endswith(" refs/heads/main"):
-                continue
-            # pkt-line lines are "<4-hex-length><payload>"
-            if len(text) > 44 and all(c in "0123456789abcdef" for c in text[4:44]):
-                oid = text[4:44]
-                break
-        self.assertIsNotNone(oid)
-        want = f"0032want {oid}\n00000009done\n".encode()
         response = self.client.post(
             "/alice.git/git-upload-pack",
-            data=want,
+            data=payload,
             headers={
-                **self._basic(self.alice_token),
+                "Authorization": _basic_header("alice", self.alice_token),
                 "Content-Type": "application/x-git-upload-pack-request",
             },
         )
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(
-            response.headers["Content-Type"],
-            "application/x-git-upload-pack-result",
-        )
-        # A NAK or a packfile are both valid first-packet responses.
-        self.assertTrue(response.data.startswith(b"0008NAK\n") or b"PACK" in response.data)
+        self.assertIn(b"PACK", response.data)
+
+
+def _bearer_header(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _basic_header(view: str, token: str) -> str:
+    encoded = base64.b64encode(f"{view}:{token}".encode()).decode()
+    return f"Basic {encoded}"
 
 
 if __name__ == "__main__":

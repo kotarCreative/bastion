@@ -45,11 +45,11 @@ def request(url: str, method: str = "GET", body: bytes | None = None,
         return error.code, error.read()
 
 
-def auth(token: str) -> dict:
+def auth(token: str, user: str = "alice") -> dict:
     import base64
     return {
         "Authorization": "Basic "
-        + base64.b64encode(f"bastion:{token}".encode()).decode(),
+        + base64.b64encode(f"{user}:{token}".encode()).decode(),
     }
 
 

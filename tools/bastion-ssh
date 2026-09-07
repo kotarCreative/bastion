@@ -109,7 +109,7 @@ def request(backend: str, token: str, view: str, service: str,
             protocol: str | None) -> bytes:
     headers = {
         "Authorization": "Basic "
-        + base64.b64encode(f"bastion:{token}".encode()).decode(),
+        + base64.b64encode(f"{view}:{token}".encode()).decode(),
         "User-Agent": "bastion-ssh",
     }
     if protocol:

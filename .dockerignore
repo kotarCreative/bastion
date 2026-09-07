@@ -1,0 +1,11 @@
+.git
+.agents
+.codex
+.poetry
+.pytest_cache
+.venv
+__pycache__
+*.py[cod]
+.benchmarks
+work
+results.json

@@ -180,23 +180,48 @@ ownership rules.
 
 ## HTTP Transport
 
-An experimental smart-HTTP endpoint serves every view with one shared token
-per view (`forge.py add-token`, `forge.py serve`). Authorization happens
-before any Git process starts. Unknown views and unauthorized views return
-identical 404 responses, so view existence is not enumerable. Unknown or
-malformed credentials return 401. Hidden objects are absent from view
-repositories by construction, so direct OID wants fail inside Git without
-server-side special cases.
+An experimental smart-HTTP endpoint serves every view with one digest token per
+view (`forge.py add-token`, `forge.py serve`). Authorization happens before any
+repository replay, materialization, or Git process starts. Unknown views and
+unauthorized views return identical 404 responses, so view existence is not
+enumerable. Unknown or malformed credentials return 401; a valid credential
+without the required scope returns 403. Required scopes are enforced through
+one shared predicate (`tokens.has_scope`) across browser, API, advertisement,
+and Git RPC routes: fetch routes require `fetch`, receive routes require `push`,
+and every demo API route requires `ui`.
 
-The endpoint is a testing boundary, not a production service: there is no
-TLS, no rate limiting, no identity beyond shared tokens, buffered request
-bodies, and non-uniform error timing.
+The endpoint is a testing boundary, not a production service: there is no TLS
+and no production identity beyond digest tokens. Resource behavior is bounded
+by the spec-013 hosted profile (`src/limits.py`): strict HTTP framing (one
+decimal `Content-Length` or exact chunked encoding, never both; signed chunk
+sizes, malformed CRLF, short reads, excessive trailers, and slow clients are
+rejected), incremental gzip decoding under cumulative output and 32:1 ratio
+caps (never a whole-body decompressor), request bodies streamed to Git in
+bounded chunks, bounded active requests and Git subprocesses with tighter
+receive limits plus per-IP and per-token admission (429/503), per-route
+deadlines, and each Git RPC in its own process group that is terminated with a
+grace period and reaped on timeout, client disconnect, or shutdown (504 before
+response headers; a streamed 200 that hits a child failure simply terminates
+the connection because its status can no longer change).
+
+Receive admission also enforces the aggregate expanded-object budget, the
+volume free-space floor plus receive reserve, and the WAL sequence budget
+(exhausted budgets surface as `[limits]` rejections through the receive hook,
+or `503 demo-read-only` on the receive advertisement). Startup fails closed on
+invalid or unsafe limit overrides.
+
+Intake admission performs strict pre-publication object checks: every intake
+runs with `receive.fsckObjects=true`, and `prepare_submission` re-applies the
+same strict fsck over the submitted objects (plus a duplicate-header check for
+commit author/committer lines) in quarantine before any immutable upload or
+manifest CAS. Rejected pushes leave repository truth unchanged and permit a
+subsequent valid push and fetch.
 
 ## Protocol And Object Risks Still Open
 
 The following are not production-proven:
 
-- SSH transport and production HTTP identity (TLS, principals, rate limits);
+- SSH transport and production HTTP identity (TLS, principals);
 - older Git wire-protocol configuration;
 - shallow and partial clone;
 - thin packs and delta-base confidentiality;
@@ -204,8 +229,31 @@ The following are not production-proven:
 - repack, bitmap, commit-graph, and multi-pack-index behavior;
 - signed commits and tags;
 - SHA-256 object format;
-- resource exhaustion and decompression limits;
 - forge web, API, diff, search, archive, webhook, and CI surfaces;
 - indistinguishable hidden-conflict error behavior.
+
+See [ROADMAP.md](../ROADMAP.md) for the work required before production claims.
+
+## Backups
+
+`forge.py backup` writes a quiesced, verified snapshot: the `global` storage
+lease blocks catalog, token, and derived-index writers for the capture, the
+database is exported inside that window, and quiescence is verified after the
+export — the pinned manifest generation must be unchanged and the fence
+(`repository_id`, `last_indexed_seq`, branch) must be read from the exported
+database snapshot itself, not from an earlier independent load. A backup that
+raced a publication or ships an index ahead of its WAL refuses with a stable
+error and leaves no partial destination.
+
+`forge.py restore` rebuilds a throwaway target only after verifying every
+artifact hash, the repository identity, and the database/WAL fence. A snapshot
+whose index is behind its WAL is recovered from the pinned WAL; an
+ahead-of-truth snapshot fails cleanly unless `--repair-derived` explicitly
+rebuilds only derived rows (views, transactions, changes, projection jobs) —
+authoritative catalog rows, token digests, and the audit log are never
+discarded or invented. A failed restore removes the partial target. The
+restore drill (invariants, authenticated clone/fetch, a catalog write, and a
+permitted push on a throwaway target) is covered by
+`tests/test_backup_consistency_015.py`.
 
 See [ROADMAP.md](../ROADMAP.md) for the work required before production claims.

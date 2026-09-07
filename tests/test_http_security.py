@@ -67,8 +67,12 @@ class HttpSecurityTest(unittest.TestCase):
         identity_harness.add_view(self.forge, "alice", ["visible"], ["visible"], "main")
         identity_harness.add_view(self.forge, "bob", ["visible"], ["visible"], "main")
 
-        self.alice_token = add_token(self.forge, "alice")
-        self.bob_token = add_token(self.forge, "bob")
+        self.alice_token = add_token(
+            self.forge, "alice", scopes=["fetch", "push", "ui"]
+        )
+        self.bob_token = add_token(
+            self.forge, "bob", scopes=["fetch", "push", "ui"]
+        )
         self.server = make_server(self.forge, "127.0.0.1", 0)
         self.port = self.server.server_port
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -83,8 +87,8 @@ class HttpSecurityTest(unittest.TestCase):
     def base(self) -> str:
         return f"http://127.0.0.1:{self.port}"
 
-    def basic(self, token: str) -> str:
-        return "Basic " + base64.b64encode(f"user:{token}".encode()).decode()
+    def basic(self, view: str, token: str) -> str:
+        return "Basic " + base64.b64encode(f"{view}:{token}".encode()).decode()
 
     def request(self, path: str, method: str = "GET",
                 headers: dict[str, str] | None = None,
@@ -108,9 +112,13 @@ class HttpSecurityTest(unittest.TestCase):
         return snapshot
 
     def forge_snapshot(self) -> tuple[bytes, bytes, dict[str, str]]:
+        import json as _json
+
+        from http_server import list_tokens
+
         return (
             document_bytes(self.forge),
-            (self.forge / "tokens.json").read_bytes(),
+            _json.dumps(list_tokens(self.forge), sort_keys=True).encode(),
             self.refs_snapshot(),
         )
 
@@ -131,7 +139,8 @@ class HttpSecurityTest(unittest.TestCase):
         for headers in (
             {"Authorization": "Bearer does-not-exist"},
             {"Authorization": "Basic !!!"},
-            {"Authorization": "Basic " + base64.b64encode(b"user:wrong").decode()},
+            {"Authorization": "Basic " + base64.b64encode(b"alice:wrong").decode()},
+            {"Authorization": "Basic " + base64.b64encode(b"alice:bst1.bad").decode()},
             {"Authorization": "Digest zzz"},
         ):
             status, _, _ = self.request(
@@ -139,20 +148,27 @@ class HttpSecurityTest(unittest.TestCase):
             )
             self.assertEqual(status, 401, headers)
 
+    def test_basic_username_mismatch_is_indistinguishable_from_unknown_view(
+        self,
+    ) -> None:
+        status, body, _ = self.request(
+            "/alice.git/info/refs?service=git-upload-pack",
+            headers={"Authorization": self.basic("bob", self.alice_token)},
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(body, b"not found")
+
     def test_revoked_token_fails_immediately(self) -> None:
+        from http_server import revoke_token
+
         token = add_token(self.forge, "alice")
         status, _, _ = self.request(
             "/alice.git/info/refs?service=git-upload-pack",
             headers={"Authorization": f"Bearer {token}"},
         )
         self.assertEqual(status, 200)
-        path = self.forge / "tokens.json"
-        remaining = {
-            key: value
-            for key, value in json.loads(path.read_text()).items()
-            if key != token
-        }
-        path.write_text(json.dumps(remaining))
+        token_id = token.split(".")[1]
+        self.assertTrue(revoke_token(self.forge, token_id))
         status, _, _ = self.request(
             "/alice.git/info/refs?service=git-upload-pack",
             headers={"Authorization": f"Bearer {token}"},
@@ -261,7 +277,7 @@ class HttpSecurityTest(unittest.TestCase):
 
     def test_direct_oid_want_of_hidden_object_fails(self) -> None:
         clone = self.root / "want-clone"
-        url = f"http://user:{self.alice_token}@127.0.0.1:{self.port}/alice.git"
+        url = f"http://alice:{self.alice_token}@127.0.0.1:{self.port}/alice.git"
         command("git", "clone", "-q", "--no-local", url, str(clone))
         result = git(clone, "fetch", "--no-tags", url, self.hidden_blob, check=False)
         self.assertNotEqual(result.returncode, 0)
@@ -271,7 +287,7 @@ class HttpSecurityTest(unittest.TestCase):
     def test_direct_oid_want_of_canonical_commit_fails(self) -> None:
         canonical_tip = ref(canonical_repo(self.forge), "refs/heads/main")
         clone = self.root / "want-canonical"
-        url = f"http://user:{self.alice_token}@127.0.0.1:{self.port}/alice.git"
+        url = f"http://alice:{self.alice_token}@127.0.0.1:{self.port}/alice.git"
         command("git", "clone", "-q", "--no-local", url, str(clone))
         result = git(clone, "fetch", "--no-tags", url, canonical_tip, check=False)
         self.assertNotEqual(result.returncode, 0)

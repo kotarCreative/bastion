@@ -1,0 +1,116 @@
+name: bastion-test
+
+x-bastion-service: &bastion-service
+  build:
+    context: ..
+    dockerfile: Dockerfile
+  image: bastion:test
+  environment: &bastion-environment
+    BASTION_DATA_DIR: /var/lib/bastion
+    BASTION_ROOT: /var/lib/bastion/forge
+  volumes:
+    - bastion-data:/var/lib/bastion
+  restart: unless-stopped
+  read_only: true
+  tmpfs:
+    - /tmp:size=268435456,mode=1777
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  cap_add:
+    - CHOWN
+    - SETGID
+    - SETUID
+  networks:
+    - bastion
+
+services:
+  bastion-web:
+    <<: *bastion-service
+    command:
+      - gunicorn
+      - --bind=0.0.0.0:8000
+      - --workers=1
+      - --threads=16
+      - --worker-class=gthread
+      - --timeout=660
+      - --graceful-timeout=30
+      - --access-logfile=-
+      - --error-logfile=-
+      - wsgi:app
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
+  bastion-git:
+    <<: *bastion-service
+    command: ["python", "forge.py", "serve", "/var/lib/bastion/forge", "--host", "0.0.0.0", "--port", "8001"]
+    expose:
+      - "8001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8001), 3).close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
+  bastion-worker:
+    <<: *bastion-service
+    command: ["/app/deployment/worker-loop.sh"]
+    environment:
+      <<: *bastion-environment
+      BASTION_WORKER_INTERVAL_SECONDS: ${BASTION_WORKER_INTERVAL_SECONDS:-2}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,time; age=time.time()-os.path.getmtime('/var/lib/bastion/worker-ready'); raise SystemExit(0 if age < 30 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 4
+      start_period: 15s
+
+  caddy:
+    image: caddy:2.11.4-alpine
+    environment:
+      BASTION_HOST: ${BASTION_HOST:-localhost}
+    ports:
+      - "${BASTION_HTTP_PORT:-8080}:80"
+      - "${BASTION_HTTPS_PORT:-8443}:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      bastion-web:
+        condition: service_healthy
+      bastion-git:
+        condition: service_healthy
+      bastion-worker:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - bastion
+
+  bootstrap:
+    <<: *bastion-service
+    command: ["/app/deployment/bootstrap-demo.sh"]
+    restart: "no"
+    profiles: ["tools"]
+
+  cli:
+    <<: *bastion-service
+    command: ["python", "forge.py", "--help"]
+    restart: "no"
+    profiles: ["tools"]
+
+volumes:
+  bastion-data:
+  caddy-data:
+  caddy-config:
+
+networks:
+  bastion:
