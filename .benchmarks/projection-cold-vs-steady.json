@@ -1,0 +1,22 @@
+{
+    "big": {
+        "cold_blobs": 5002,
+        "cold_processes": 213,
+        "cold_seconds": 1.0951,
+        "steady_blobs": 4,
+        "steady_processes": 85,
+        "steady_seconds": 0.2428
+    },
+    "environment": {
+        "platform": "Linux-7.1.4-arch1-1-x86_64-with-glibc2.43",
+        "python": "3.14.6"
+    },
+    "small": {
+        "cold_blobs": 502,
+        "cold_processes": 33,
+        "cold_seconds": 0.1276,
+        "steady_blobs": 4,
+        "steady_processes": 85,
+        "steady_seconds": 0.1529
+    }
+}

@@ -581,7 +581,7 @@ class ReceiveIsolationTest(unittest.TestCase):
             "projection_epoch": active["projection_epoch"],
             "canonical_ref": manifest.canonical_ref,
             "projected_ref": active["projected_ref"],
-            "canonical_frontier": source.cursor["canonical_frontier"],
+            "canonical_frontier": active["canonical_frontier"],
             "projected_tip": source.projected_tip,
         }
         descriptor = repository._descriptor(active["descriptor_id"])
@@ -812,6 +812,10 @@ class RepositorySnapshotTest(unittest.TestCase):
         )
         template = repository._descriptor(source_id)
         payload = {key: value for key, value in template.items() if key != "id"}
+        # A descriptor assignment must be unique per principal, so the
+        # suffix fixture binds a fresh principal instead of an existing
+        # one that already holds a committed descriptor.
+        payload["principal_id"] = "carol"
         payload["restrictions"] = _copy.deepcopy(payload["restrictions"])
         payload["restrictions"]["read"] = sorted(
             set(payload["restrictions"]["read"]) | {"shared/extra-deny"}
@@ -825,7 +829,7 @@ class RepositorySnapshotTest(unittest.TestCase):
             canonical_json(new_descriptor),
             mode=Create(),
         )
-        principal = template["principal_id"]
+        principal = payload["principal_id"]
         view_payload = {
             "view_id": "carol",
             "principal_id": principal,

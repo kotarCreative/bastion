@@ -374,8 +374,12 @@ class AdversarialHttpWireTest(unittest.TestCase):
 
         identity_harness.add_view(self.forge, "alice", ["visible"], ["visible"], "main")
         identity_harness.add_view(self.forge, "bob", ["visible"], ["visible"], "main")
-        self.alice_token = add_token(self.forge, "alice")
-        self.bob_token = add_token(self.forge, "bob")
+        self.alice_token = add_token(
+            self.forge, "alice", scopes=["fetch", "push", "ui"]
+        )
+        self.bob_token = add_token(
+            self.forge, "bob", scopes=["fetch", "push", "ui"]
+        )
         self.server = make_server(self.forge, "127.0.0.1", 0)
         self.port = self.server.server_port
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -405,9 +409,13 @@ class AdversarialHttpWireTest(unittest.TestCase):
         return {"Authorization": f"Bearer {self.alice_token}"}
 
     def snapshot(self) -> tuple[bytes, bytes, str]:
+        import json as _json
+
+        from http_server import list_tokens
+
         return (
             document_bytes(self.forge),
-            (self.forge / "tokens.json").read_bytes(),
+            _json.dumps(list_tokens(self.forge), sort_keys=True).encode(),
             subprocess.run(
                 ["git", "--git-dir", str(canonical_repo(self.forge)), "for-each-ref"],
                 stdout=subprocess.PIPE, check=True,

@@ -14,13 +14,16 @@ from pathlib import Path
 import identity
 from errors import ForgeError
 from failpoints import checkpoint
+import limits
 from git import (
     clean_env,
     commit_metadata,
+    fsck_strict,
     git,
     output,
     quarantine_objects,
     ref,
+    strict_commit_headers,
     submitted_commits,
     tree_oid,
     verify_no_extra_objects,
@@ -36,9 +39,9 @@ from state import audit_event, load_state_sections
 from validation import parse_updates, validate_ref_update
 
 
-MAX_PUSH_COMMITS = int(os.environ.get("BASTION_MAX_PUSH_COMMITS", "4096"))
-MAX_PUSH_OBJECTS = int(os.environ.get("BASTION_MAX_PUSH_OBJECTS", "100000"))
-MAX_OBJECT_BYTES = int(os.environ.get("BASTION_MAX_OBJECT_BYTES", str(64 << 20)))
+MAX_PUSH_COMMITS = limits.MAX_PUSH_COMMITS
+MAX_PUSH_OBJECTS = limits.MAX_PUSH_OBJECTS
+MAX_OBJECT_BYTES = limits.MAX_OBJECT_BYTES
 
 
 @dataclass(frozen=True)
@@ -167,7 +170,11 @@ def candidate_environment(canonical: Path, directory: Path) -> dict[str, str]:
 
 
 def enforce_pack_limits(repo: Path, old: str, new: str, env: dict[str, str]) -> None:
-    """Reject abusive packs before any validation work begins."""
+    """Reject abusive packs before any validation work begins.
+
+    Object bytes are counted from the batch-check census without loading
+    any object contents, bounding the aggregate expanded-object budget.
+    """
     count = output(repo, "rev-list", "--count", f"{old}..{new}", env=env)
     try:
         if int(count) > MAX_PUSH_COMMITS:
@@ -188,10 +195,12 @@ def enforce_pack_limits(repo: Path, old: str, new: str, env: dict[str, str]) -> 
             check=False,
         ).stdout
         seen = 0
+        expanded = 0
         for line in listing.splitlines():
             fields = line.split()
             if len(fields) == 3 and fields[1] in {b"blob", b"tree", b"commit", b"tag"}:
                 seen += 1
+                expanded += int(fields[2])
                 if int(fields[2]) > MAX_OBJECT_BYTES:
                     raise ForgeError(
                         "push contains an oversized object", "limits"
@@ -200,6 +209,34 @@ def enforce_pack_limits(repo: Path, old: str, new: str, env: dict[str, str]) -> 
             raise ForgeError(
                 "quarantined objects could not be inspected", "integrity"
             )
+        if expanded > limits.MAX_PUSH_BYTES:
+            raise ForgeError(
+                "push exceeds the aggregate expanded-object budget", "limits"
+            )
+
+
+def enforce_object_integrity(
+    destination: Path, old: str, new: str, commits: list[str], env: dict[str, str]
+) -> None:
+    """Reject object defects before immutable uploads and manifest CAS.
+
+    Every submitted object receives the strict checks that post-publication
+    materialization enforces, so admission cannot promote a pack that would
+    later fail view validation. Pack checksums alone are insufficient.
+    """
+    quarantined = sorted(quarantine_objects(env))
+    if not quarantined:
+        quarantined = output(
+            destination,
+            "rev-list",
+            "--objects",
+            "--no-object-names",
+            new,
+            f"^{old}",
+            env=env,
+        ).splitlines()
+    fsck_strict(destination, quarantined, env)
+    strict_commit_headers(destination, commits, env)
 
 
 def validate_commit_metadata(
@@ -235,6 +272,7 @@ def prepare_submission(
     canonical = canonical or canonical_repo(root)
     commits = submitted_commits(destination, old, new, hook_env)
     enforce_pack_limits(destination, old, new, hook_env)
+    enforce_object_integrity(destination, old, new, commits, hook_env)
     verify_no_extra_objects(destination, new, hook_env)
     if state is not None:
         if received_at is None:
@@ -363,7 +401,7 @@ def pre_receive(root: Path, name: str, updates: bytes) -> None:
             "projection_epoch": active["projection_epoch"],
             "canonical_ref": manifest.canonical_ref,
             "projected_ref": active["projected_ref"],
-            "canonical_frontier": source.cursor["canonical_frontier"],
+            "canonical_frontier": active["canonical_frontier"],
             "projected_tip": source.projected_tip,
         }
         descriptor = repository._descriptor(active["descriptor_id"])
@@ -419,6 +457,8 @@ def pre_receive(root: Path, name: str, updates: bytes) -> None:
                 cleanup_transaction_workspace(transition.candidate_object_dir)
                 raise ForgeError("Change-Id belongs to another principal or branch")
         checkpoint(root, "wal.validation_complete")
+        if limits.free_below_floor(root):
+            raise ForgeError("volume is below the receive free-space reserve", "limits")
         canonical_pack = build_canonical_pack(
             canonical, transition.canonical_old, transition.canonical_new,
             candidate_environment(canonical, transition.candidate_object_dir),

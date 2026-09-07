@@ -182,7 +182,10 @@ class MaterializationTest(unittest.TestCase):
             self.fixture.admin_update(
                 [{b"hidden/concurrent.txt": (b"100644", b"hidden advancement\n")}]
             )
-            self.assertNotEqual(old_intake, intake_link.resolve())
+            # Spec 015 D2: a hidden-only canonical advance never rebuilds
+            # the view or its intake; the in-flight receive keeps running
+            # against the generation it captured.
+            self.assertEqual(old_intake, intake_link.resolve())
             self.assertTrue(old_intake.is_dir())
             release.touch()
             _stdout, stderr = process.communicate(timeout=30)

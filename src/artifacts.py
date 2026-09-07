@@ -51,7 +51,11 @@ class BuiltPack:
 
 
 def _build(repo: Path, revisions: bytes, env: dict[str, str] | None) -> BuiltPack:
-    directory = Path(tempfile.mkdtemp(prefix="bastion-pack-"))
+    # Git creates pack-objects output in the repository's object filesystem
+    # before renaming it to the requested prefix. Keep the destination on
+    # that same filesystem so deployments with a separate /tmp mount do not
+    # fail with EXDEV during the final rename.
+    directory = Path(tempfile.mkdtemp(prefix="bastion-pack-", dir=repo.parent))
     prefix = directory / "pack"
     try:
         produced = git(

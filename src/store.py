@@ -108,6 +108,12 @@ DOCUMENT_TABLES = (
     "projection_jobs",
 )
 
+# Digest-only hosted bearer tokens (spec 013). This table is deliberately
+# outside DOCUMENT_TABLES/_STATE_SECTIONS so the generic control-plane
+# document shape stays stable; tokens are accessed through dedicated
+# transactional methods that atomically append audit rows.
+HTTP_TOKENS_TABLE = "http_tokens"
+
 _STATE_SECTIONS = {
     "principals": "principals",
     "teams": "teams",
@@ -278,6 +284,11 @@ def _sqlite_ddl() -> list[str]:
             detail TEXT NOT NULL,
             at REAL NOT NULL,
             event_id TEXT NULL)""",
+        f"""CREATE TABLE IF NOT EXISTS {HTTP_TOKENS_TABLE} (
+            key TEXT PRIMARY KEY,
+            doc TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            checksum TEXT NOT NULL)""",
     ] + [
         f"""CREATE TABLE IF NOT EXISTS {table} (
             key TEXT PRIMARY KEY,
@@ -307,6 +318,11 @@ def _postgres_ddl() -> str:
             detail TEXT NOT NULL,
             at DOUBLE PRECISION NOT NULL,
             event_id TEXT NULL)""",
+        f"""CREATE TABLE IF NOT EXISTS {HTTP_TOKENS_TABLE} (
+            key TEXT PRIMARY KEY,
+            doc TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            checksum TEXT NOT NULL)""",
     ] + [
         f"""CREATE TABLE IF NOT EXISTS {table} (
             key TEXT PRIMARY KEY,
@@ -487,7 +503,12 @@ _PG_POOLS: dict[str, _PgPool] = {}
 _PG_POOLS_LOCK = threading.Lock()
 
 
-_RESTORE_TABLE_ALLOWLIST = ("forge_meta", *DOCUMENT_TABLES, "audit_log")
+_RESTORE_TABLE_ALLOWLIST = (
+    "forge_meta",
+    *DOCUMENT_TABLES,
+    HTTP_TOKENS_TABLE,
+    "audit_log",
+)
 
 
 def _restore_limits() -> dict[str, int]:
@@ -532,11 +553,22 @@ def _read_restore_tables(tables_dir: Path) -> dict[str, list[dict]]:
     except OSError as error:
         raise ForgeError("database backup directory is unreadable", "integrity") from error
     expected = sorted(f"{table}.ndjson" for table in _RESTORE_TABLE_ALLOWLIST)
-    if names != expected:
+    legacy_expected = sorted(
+        f"{table}.ndjson"
+        for table in _RESTORE_TABLE_ALLOWLIST
+        if table != HTTP_TOKENS_TABLE
+    )
+    # Pre-013 backups predate the digest-only token table; accept them as
+    # empty token sets rather than rejecting a previously valid backup.
+    allow_missing_tokens = names == legacy_expected
+    if names != expected and not allow_missing_tokens:
         raise ForgeError("database backup table set is unexpected", "integrity")
     total = 0
     result: dict[str, list[dict]] = {}
     for table in _RESTORE_TABLE_ALLOWLIST:
+        if table == HTTP_TOKENS_TABLE and allow_missing_tokens:
+            result[table] = []
+            continue
         path = tables_dir / f"{table}.ndjson"
         try:
             metadata = os.stat(path, follow_symlinks=False)
@@ -825,7 +857,12 @@ class _PostgresBackend:
 
             connection.execute("START TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             try:
-                tables = ["forge_meta", *DOCUMENT_TABLES, "audit_log"]
+                tables = [
+                    "forge_meta",
+                    *DOCUMENT_TABLES,
+                    HTTP_TOKENS_TABLE,
+                    "audit_log",
+                ]
                 for table in tables:
                     identifier = _sql.Identifier(table)
                     with connection.cursor(name=f"bastion_dump_{table}") as cursor:
@@ -916,7 +953,12 @@ class _PostgresBackend:
                 from psycopg import sql as _sql
 
                 with connection.cursor() as cursor:
-                    for table in ["forge_meta", *DOCUMENT_TABLES, "audit_log"]:
+                    for table in [
+                        "forge_meta",
+                        *DOCUMENT_TABLES,
+                        HTTP_TOKENS_TABLE,
+                        "audit_log",
+                    ]:
                         cursor.execute(
                             _sql.SQL("DELETE FROM {}").format(_sql.Identifier(table))
                         )
@@ -1240,6 +1282,70 @@ class Store:
             self.backend.rollback(self.connection)
             raise ForgeError("cannot read forge state", "storage") from None
 
+    def iter_section_where_field(self, section: str, field: str, value: str) -> dict:
+        """Rows whose JSON ``field`` equals ``value``, filtered by the backend.
+
+        Adding unrelated catalog rows never causes a full-table read: the
+        database evaluates the JSON predicate per row and returns only
+        matches.
+        """
+        if section not in _STATE_SECTIONS:
+            raise ForgeError(f"unknown control-plane section: {section}")
+        table = _STATE_SECTIONS[section]
+        begin_read = getattr(self.backend, "begin_read", self.backend.begin)
+        begin_read(self.connection)
+        try:
+            if self.backend.kind == "sqlite":
+                rows = self._fetchall(
+                    f"SELECT key, doc FROM {table} "
+                    f"WHERE json_extract(doc, {self.backend.param}) = {self.backend.param}",
+                    (f"$.{field}", value),
+                )
+            else:
+                rows = self._fetchall(
+                    f"SELECT key, doc FROM {table} "
+                    f"WHERE doc::jsonb->>{self.backend.param} = {self.backend.param}",
+                    (field, value),
+                )
+            self.backend.rollback(self.connection)
+            return {row["key"]: json.loads(row["doc"]) for row in rows}
+        except ForgeError:
+            self.backend.rollback(self.connection)
+            raise
+        except Exception as error:
+            self.backend.rollback(self.connection)
+            raise ForgeError(f"cannot read {section}: {error}") from error
+
+    def iter_section_where_member(self, section: str, member: str) -> dict:
+        """Rows whose JSON ``members`` array contains ``member``."""
+        if section not in _STATE_SECTIONS:
+            raise ForgeError(f"unknown control-plane section: {section}")
+        table = _STATE_SECTIONS[section]
+        begin_read = getattr(self.backend, "begin_read", self.backend.begin)
+        begin_read(self.connection)
+        try:
+            if self.backend.kind == "sqlite":
+                rows = self._fetchall(
+                    f"SELECT key, doc FROM {table} WHERE EXISTS ("
+                    f"SELECT 1 FROM json_each(json_extract(doc, {self.backend.param})) "
+                    f"WHERE json_each.value = {self.backend.param})",
+                    ("$.members", member),
+                )
+            else:
+                rows = self._fetchall(
+                    f"SELECT key, doc FROM {table} "
+                    f"WHERE doc::jsonb->'members' @> jsonb_build_array({self.backend.param})",
+                    (member,),
+                )
+            self.backend.rollback(self.connection)
+            return {row["key"]: json.loads(row["doc"]) for row in rows}
+        except ForgeError:
+            self.backend.rollback(self.connection)
+            raise
+        except Exception as error:
+            self.backend.rollback(self.connection)
+            raise ForgeError(f"cannot read {section}: {error}") from error
+
     def load_row(self, section: str, key: str) -> dict | None:
         """Fetch one checksummed row by primary key (indexed direct lookup)."""
         if section not in _STATE_SECTIONS:
@@ -1416,7 +1522,7 @@ class Store:
         failpoint_root: Path | None,
         baseline: dict | None = None,
         baseline_versions: dict | None = None,
-    ) -> None:
+    ) -> dict | None:
         """Persist changed aggregates in one short optimistic transaction.
 
         ``baseline`` is the document this session loaded (post-recovery);
@@ -1425,7 +1531,13 @@ class Store:
         ``baseline_versions`` optionally carries the per-row
         (version, checksum) map captured at load time for ABA-safe
         conflict detection.
+
+        Returns the exact post-commit outcome (per-section row versions
+        written and keys deleted) so the caller can refresh its session
+        baseline from the versions it just committed, or ``None`` when the
+        save failed before any committed write.
         """
+        outcome: dict = {"sections": {}, "deleted": {}, "meta": None}
         begin_write = getattr(self.backend, "begin_write", self.backend.begin)
         begin_write(self.connection)
         try:
@@ -1468,6 +1580,7 @@ class Store:
                     id_column=True,
                     baseline_section=baseline_meta_section,
                     baseline_versions_section=baseline_meta_versions,
+                    outcome=outcome,
                 )
             for section, table in _STATE_SECTIONS.items():
                 desired_section = state.get(section, {})
@@ -1492,6 +1605,8 @@ class Store:
                     deletable,
                     baseline_section,
                     versions_section,
+                    outcome=outcome,
+                    section=section,
                 )
             if failpoint_root is not None:
                 from failpoints import checkpoint
@@ -1503,6 +1618,7 @@ class Store:
 
                 checkpoint(failpoint_root, "state.replaced")
                 checkpoint(failpoint_root, "state.directory_fsynced")
+            return outcome
         except ForgeError:
             self.backend.rollback(self.connection)
             raise
@@ -1518,6 +1634,8 @@ class Store:
         deletable_keys: set[str] | None = None,
         baseline_section: dict | None = None,
         baseline_versions_section: dict | None = None,
+        outcome: dict | None = None,
+        section: str | None = None,
     ) -> None:
         if id_column:
             seeded = self._fetchall(
@@ -1580,6 +1698,15 @@ class Store:
                 or document != baseline_section.get(key)
                 or key not in baseline_section
             ]
+        def record_write(key: str, version: int, checksum: str) -> None:
+            if outcome is None:
+                return
+            if id_column:
+                outcome["meta"] = (version, checksum)
+                return
+            assert section is not None
+            outcome["sections"].setdefault(section, {})[key] = (version, checksum)
+
         for key, document in desired_items:
             digest = _checksum(document)
             encoded = json.dumps(document, sort_keys=True)
@@ -1619,6 +1746,7 @@ class Store:
                         "INSERT INTO forge_meta (id, doc, version, checksum)",
                         (1, encoded, 1, digest),
                     )
+                    record_write(key, 1, digest)
                 else:
                     try:
                         self._insert_placeholder_free(
@@ -1641,6 +1769,7 @@ class Store:
                                 f"optimistic concurrency conflict on {table}.{key}"
                             ) from None
                         raise
+                    record_write(key, 1, digest)
                 continue
             old_version, old_checksum = current
             if baseline_section is not None and not id_column and key not in baseline_section:
@@ -1688,6 +1817,7 @@ class Store:
             )
             if updated != 1:
                 raise ForgeError(f"optimistic concurrency conflict on {table}.{key}")
+            record_write(key, old_version + 1, digest)
         if id_column:
             return
         # Rows vanish only when this session observed them at load time and
@@ -1722,6 +1852,8 @@ class Store:
             removed = self._execute(statement, predicate)
             if removed != 1:
                 raise ForgeError(f"optimistic concurrency conflict on {table}.{key}")
+            if outcome is not None and section is not None:
+                outcome["deleted"].setdefault(section, set()).add(key)
 
     # -- leases -------------------------------------------------------------
 
@@ -1958,6 +2090,168 @@ class Store:
         )
         return rows
 
+    # -- digest-only hosted tokens (spec 013) ----------------------------------
+
+    def _insert_audit_locked(
+        self, kind: str, subject: str, detail: str, event_id: str | None = None
+    ) -> None:
+        self._execute(
+            "INSERT INTO audit_log (kind, subject, detail, at, event_id) VALUES "
+            f"({self.backend.param}, {self.backend.param}, {self.backend.param}, "
+            f"{self.backend.param}, {self.backend.param})",
+            (kind, subject, detail, time.time(), event_id),
+        )
+
+    def create_http_token(self, record: dict) -> None:
+        """Insert one token row and its audit row in a single transaction."""
+        from tokens import validate_record
+
+        validated = validate_record(record)
+        encoded = json.dumps(validated, sort_keys=True)
+        checksum = _checksum(validated)
+        begin_write = getattr(self.backend, "begin_write", self.backend.begin)
+        begin_write(self.connection)
+        try:
+            self._insert_placeholder_free(
+                f"INSERT INTO {HTTP_TOKENS_TABLE} (key, doc, version, checksum)",
+                (validated["token_id"], encoded, 1, checksum),
+            )
+            # Audit rows never carry digests or secrets.
+            self._insert_audit_locked(
+                "token.issue",
+                f"{validated['view_id']}/{validated['token_id']}",
+                f"scopes={','.join(validated['scopes'])}",
+            )
+            self.backend.commit(self.connection)
+        except ForgeError:
+            self.backend.rollback(self.connection)
+            raise
+        except Exception as error:
+            self.backend.rollback(self.connection)
+            message = _sanitize_backend_error(error).lower()
+            if (
+                "unique" in message
+                or "duplicate" in message
+                or "already exists" in message
+                or "primary key" in message
+            ):
+                raise ForgeError("token identifier collision") from None
+            raise ForgeError("cannot issue token", "storage") from None
+
+    def load_http_token(self, token_id: str) -> dict | None:
+        begin_read = getattr(self.backend, "begin_read", self.backend.begin)
+        begin_read(self.connection)
+        try:
+            rows = self._fetchall(
+                f"SELECT doc, checksum FROM {HTTP_TOKENS_TABLE} "
+                f"WHERE key = {self.backend.param}",
+                (token_id,),
+            )
+            self.backend.rollback(self.connection)
+        except ForgeError:
+            raise
+        except Exception as error:
+            raise ForgeError("cannot read token", "storage") from None
+        if not rows:
+            return None
+        try:
+            parsed = json.loads(rows[0]["doc"])
+        except json.JSONDecodeError as error:
+            raise ForgeError("token row is corrupt", "integrity") from error
+        if _checksum(parsed) != rows[0]["checksum"]:
+            raise ForgeError("token row failed its integrity checksum", "integrity")
+        from tokens import validate_record
+
+        return validate_record(parsed)
+
+    def list_http_tokens(self, view_id: str | None = None) -> list[dict]:
+        begin_read = getattr(self.backend, "begin_read", self.backend.begin)
+        begin_read(self.connection)
+        try:
+            rows = self._fetchall(
+                f"SELECT key, doc, checksum FROM {HTTP_TOKENS_TABLE} ORDER BY key",
+                (),
+            )
+            self.backend.rollback(self.connection)
+        except ForgeError:
+            raise
+        except Exception as error:
+            raise ForgeError("cannot list tokens", "storage") from None
+        from tokens import validate_record
+
+        result: list[dict] = []
+        for row in rows:
+            try:
+                parsed = json.loads(row["doc"])
+            except json.JSONDecodeError as error:
+                raise ForgeError("token row is corrupt", "integrity") from error
+            if _checksum(parsed) != row["checksum"]:
+                raise ForgeError("token row failed its integrity checksum", "integrity")
+            validated = validate_record(parsed)
+            if view_id is not None and validated["view_id"] != view_id:
+                continue
+            result.append(validated)
+        return result
+
+    def revoke_http_token(self, token_id: str) -> bool:
+        """Mark one token revoked and audit it atomically; False if unknown."""
+        import time as _time
+
+        from tokens import validate_record
+
+        begin_write = getattr(self.backend, "begin_write", self.backend.begin)
+        begin_write(self.connection)
+        try:
+            rows = self._fetchall(
+                f"SELECT doc, version, checksum FROM {HTTP_TOKENS_TABLE} "
+                f"WHERE key = {self.backend.param}",
+                (token_id,),
+            )
+            if not rows:
+                self.backend.rollback(self.connection)
+                return False
+            try:
+                parsed = json.loads(rows[0]["doc"])
+            except json.JSONDecodeError as error:
+                raise ForgeError("token row is corrupt", "integrity") from error
+            if _checksum(parsed) != rows[0]["checksum"]:
+                raise ForgeError("token row failed its integrity checksum", "integrity")
+            validated = validate_record(parsed)
+            if validated["revoked_at"] is not None:
+                self.backend.rollback(self.connection)
+                return True
+            validated["revoked_at"] = int(_time.time())
+            encoded = json.dumps(validated, sort_keys=True)
+            checksum = _checksum(validated)
+            updated = self._execute(
+                f"UPDATE {HTTP_TOKENS_TABLE} SET doc = {self.backend.param}, "
+                f"version = {self.backend.param}, checksum = {self.backend.param} "
+                f"WHERE key = {self.backend.param} "
+                f"AND version = {self.backend.param}",
+                (encoded, int(rows[0]["version"]) + 1, checksum, token_id, rows[0]["version"]),
+            )
+            if updated != 1:
+                raise ForgeError("token revocation conflict")
+            self._insert_audit_locked(
+                "token.revoke",
+                f"{validated['view_id']}/{validated['token_id']}",
+                f"scopes={','.join(validated['scopes'])}",
+            )
+            self.backend.commit(self.connection)
+            return True
+        except ForgeError:
+            try:
+                self.backend.rollback(self.connection)
+            except Exception:
+                pass
+            raise
+        except Exception as error:
+            try:
+                self.backend.rollback(self.connection)
+            except Exception:
+                pass
+            raise ForgeError("cannot revoke token", "storage") from None
+
     def stats(self) -> dict:
         counts: dict[str, dict[str, int]] = {}
         for label, table in (("transactions", "transactions"), ("jobs", "projection_jobs")):
@@ -2062,16 +2356,72 @@ def initialize_store(
 
 
 def backup_forge(root: Path, destination: Path) -> Path:
-    """Write a consistent backup directory and return its path."""
+    """Write a consistent, quiesced backup directory and return its path.
+
+    Catalog, token, and derived-index writers take the ``global`` lease, so
+    acquiring it blocks them for the snapshot.  Receives publish through the
+    manifest CAS without the lease, so quiescence is additionally verified
+    after the database export: the pinned manifest generation must be
+    unchanged and the fence must come from the database snapshot actually
+    exported.  A racing publication or an index ahead of the pinned WAL
+    refuses the backup instead of shipping a snapshot that would fail its
+    first catalog write after restore.
+    """
     store = open_store(root)
-    document = store.load_document()
-    if document.get("repository_state") != "ready":
-        store.close()
-        raise ForgeError("forge initialization is incomplete")
     try:
-        return _backup_repository(root, destination, store, document)
+        document = store.load_document()
+        if document.get("repository_state") != "ready":
+            raise ForgeError("forge initialization is incomplete")
+        owner = owner_identity(root)
+        store.acquire_leases(["global"], owner, root)
+        try:
+            return _backup_repository(root, destination, store)
+        finally:
+            store.release_leases(["global"], owner)
     finally:
         store.close()
+
+
+def _sqlite_database_fence(path: Path) -> dict:
+    """Read the fence from the exported SQLite image itself."""
+    import sqlite3
+
+    connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        row = connection.execute(
+            "SELECT doc FROM forge_meta WHERE id = 1"
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        raise ForgeError("backup database has no forge metadata", "integrity")
+    meta = json.loads(row[0])
+    return {
+        "repository_id": meta.get("repository_id"),
+        "last_indexed_seq": int(meta.get("last_indexed_seq", 0)),
+        "canonical_branch": meta.get("canonical_branch"),
+    }
+
+
+def _postgres_database_fence(tables_dir: Path) -> dict:
+    """Read the fence from the exported forge_meta table snapshot."""
+    source = tables_dir / "forge_meta.ndjson"
+    line = source.read_text().splitlines()[0] if source.exists() else ""
+    if not line:
+        raise ForgeError("backup database has no forge metadata", "integrity")
+    record = json.loads(line)
+    meta = record["doc"]
+    return {
+        "repository_id": meta.get("repository_id"),
+        "last_indexed_seq": int(meta.get("last_indexed_seq", 0)),
+        "canonical_branch": meta.get("canonical_branch"),
+    }
+
+
+def _database_fence(destination: Path, backend_kind: str) -> dict:
+    if backend_kind == "sqlite":
+        return _sqlite_database_fence(destination / "database.sqlite3")
+    return _postgres_database_fence(destination / "tables")
 
 
 def restore_forge(
@@ -2080,8 +2430,14 @@ def restore_forge(
     database: str | None = None,
     *,
     admin_database: str | None = None,
+    repair_derived: bool = False,
 ) -> Path:
-    """Reconstruct a forge from a backup directory into ``new_root``."""
+    """Reconstruct a forge from a backup directory into ``new_root``.
+
+    A snapshot whose database index is ahead of its pinned WAL is refused
+    unless ``repair_derived`` explicitly rebuilds derived rows from the
+    WAL.  The repair never touches authoritative catalog or token state.
+    """
     manifest_path = backup / "manifest.json"
     try:
         raw = manifest_path.read_bytes()
@@ -2094,7 +2450,9 @@ def restore_forge(
         raise ForgeError("backup format is unsupported")
     if new_root.exists() and any(new_root.iterdir()):
         raise ForgeError(f"restore target is not empty: {new_root}")
-    return _restore_repository(backup, new_root, database, manifest, admin_database)
+    return _restore_repository(
+        backup, new_root, database, manifest, admin_database, repair_derived
+    )
 
 
 def _hash_file(path: Path) -> tuple[int, str]:
@@ -2111,7 +2469,7 @@ def _hash_file(path: Path) -> tuple[int, str]:
 
 
 def _backup_repository(
-    root: Path, destination: Path, store: Store, document: dict
+    root: Path, destination: Path, store: Store
 ) -> Path:
     """Copy the exact manifest-reachable object closure, never live caches."""
     from repository import Repository
@@ -2187,18 +2545,9 @@ def _backup_repository(
                 "sha256": sha256(kind_body),
             }
         )
-        tokens = root / "tokens.json"
-        if tokens.exists():
-            token_body = tokens.read_bytes()
-            (destination / "tokens.json").write_bytes(token_body)
-            artifacts.append(
-                {
-                    "category": "config",
-                    "path": "tokens.json",
-                    "size": len(token_body),
-                    "sha256": sha256(token_body),
-                }
-            )
+        # Spec 013: backups carry only token digests inside the pinned
+        # control-plane snapshot (sqlite image or postgres table exports).
+        # Legacy raw tokens.json is never backed up.
         if backend_kind == "sqlite":
             store.backend.dump(destination / "database.sqlite3")
             size, digest = _hash_file(destination / "database.sqlite3")
@@ -2222,6 +2571,33 @@ def _backup_repository(
                         "sha256": digest,
                     }
                 )
+        # The fence comes from the database snapshot actually exported, not
+        # from an independently loaded earlier document.  Quiescence is then
+        # verified: the pinned manifest generation must be unchanged and the
+        # exported index must not be ahead of the pinned WAL.
+        fence = _database_fence(destination, backend_kind)
+        fresh_repository = Repository.open(root)
+        fresh_manifest, _fresh_version, _fresh_replay = fresh_repository.load(use_cache=False)
+        if (
+            fresh_manifest.head_seq != manifest.head_seq
+            or fresh_manifest.wal_head.key != manifest.wal_head.key
+        ):
+            raise ForgeError(
+                "backup raced a repository publication; retry when the forge is quiet",
+                "conflict",
+            )
+        if fence["repository_id"] != repository.repository_id:
+            raise ForgeError(
+                "backup database belongs to a different repository", "integrity"
+            )
+        if fence["canonical_branch"] != manifest.canonical_ref.split("/")[-1]:
+            raise ForgeError(
+                "backup database branch differs from the pinned manifest", "integrity"
+            )
+        if fence["last_indexed_seq"] > manifest.head_seq:
+            raise ForgeError(
+                "backup database index is ahead of the pinned WAL", "integrity"
+            )
         for entry in copied:
             artifacts.append(
                 {
@@ -2239,7 +2615,8 @@ def _backup_repository(
             "backend": backend_kind,
             "head_seq": manifest.head_seq,
             "wal_head": manifest.wal_head.to_dict(),
-            "last_indexed_seq": document.get("last_indexed_seq", 0),
+            "last_indexed_seq": fence["last_indexed_seq"],
+            "quiesced": True,
             "manifest_sha256": sha256(manifest_body),
             "objects": copied,
             "artifacts": sorted(artifacts, key=lambda item: item["path"]),
@@ -2483,7 +2860,12 @@ def _pg_drop_database(admin_dsn: str, scoped_dsn: str) -> None:
 
 
 def _restore_repository(
-    backup: Path, new_root: Path, database: str | None, metadata: dict, admin_database: str | None = None
+    backup: Path,
+    new_root: Path,
+    database: str | None,
+    metadata: dict,
+    admin_database: str | None = None,
+    repair_derived: bool = False,
 ) -> Path:
     from object_store_fs import FilesystemObjectStore
     from object_store import Create, validate_key
@@ -2613,6 +2995,8 @@ def _restore_repository(
         for table in _RESTORE_TABLE_ALLOWLIST:
             expected = artifacts.get(f"tables/{table}.ndjson")
             if expected is None:
+                if table == HTTP_TOKENS_TABLE and not (tables_dir / f"{table}.ndjson").exists():
+                    continue
                 raise ForgeError("WAL backup table is unlisted", "integrity")
             _read_backup_file(backup, f"tables/{table}.ndjson", expected)
         _reject_unlisted_table_files(tables_dir, set(_RESTORE_TABLE_ALLOWLIST))
@@ -2655,15 +3039,12 @@ def _restore_repository(
             config["canonical_branch"],
             new_root / "object-store",
         )
-        tokens = backup / "tokens.json"
-        if tokens.exists():
-            if "tokens.json" in artifacts:
-                token_body = _read_backup_file(backup, "tokens.json", artifacts["tokens.json"])
-                (new_root / "tokens.json").write_bytes(token_body)
-            elif is_legacy:
-                shutil.copy2(tokens, new_root / "tokens.json")
-            else:
-                raise ForgeError("WAL backup contains an unlisted artifact", "integrity")
+        # Spec 013: raw tokens.json is never restored. Legacy backups may
+        # still ship the file; verify it when listed, then drop it so the
+        # restored root starts without legacy bearer state (digest tokens
+        # live in the database).
+        if "tokens.json" in artifacts:
+            _read_backup_file(backup, "tokens.json", artifacts["tokens.json"])
         object_root = new_root / "object-store"
         filesystem = FilesystemObjectStore(object_root)
         for entry in object_entries:
@@ -2689,6 +3070,31 @@ def _restore_repository(
         loaded, _version, replay = repository.load()
         if loaded.head_seq != manifest.get("head_seq"):
             raise ForgeError("WAL backup manifest head differs", "integrity")
+        # Validate the restored database/WAL fence and repository identity
+        # before accepting the target.  Behind-head derived rows are rebuilt
+        # from the pinned WAL by recovery; an ahead-of-truth index must fail
+        # cleanly or be explicitly repaired by rebuilding derived rows only.
+        from state import load_state_sections
+
+        restored_meta = load_state_sections(new_root, [])
+        if restored_meta.get("repository_id") != manifest.get("repository_id"):
+            raise ForgeError(
+                "backup database repository identity differs from the manifest",
+                "integrity",
+            )
+        if restored_meta.get("canonical_branch") != config["canonical_branch"]:
+            raise ForgeError(
+                "backup database branch differs from the restored repository",
+                "integrity",
+            )
+        restored_indexed = int(restored_meta.get("last_indexed_seq", 0))
+        if restored_indexed > loaded.head_seq:
+            if not repair_derived:
+                raise ForgeError(
+                    "backup index is ahead of its WAL; the snapshot is inconsistent",
+                    "integrity",
+                )
+            repair_derived_state(new_root)
         ensure_canonical_materialized(new_root, loaded, repository)
         for view in sorted(replay.active_views):
             materialized = ensure_view_materialized(new_root, view, loaded, replay, repository)
@@ -2751,6 +3157,29 @@ def _reject_unlisted_table_files(tables_dir: Path, allowed: set[str]) -> None:
             continue
         if not name.endswith(".ndjson") or name[:-7] not in allowed:
             raise ForgeError("database backup table is unlisted", "integrity")
+
+
+def repair_derived_state(new_root: Path) -> None:
+    """Rebuild WAL-derived rows after an explicit ahead-of-truth repair.
+
+    Only derived state is reset: the views index, transactions, changes,
+    and projection jobs are dropped and ``last_indexed_seq`` rewinds so the
+    pinned WAL repopulates them.  Authoritative catalog rows, tokens, and
+    the audit log are never discarded or invented here.
+    """
+    from state import load_state, locked, save_state
+
+    store = open_store(new_root)
+    try:
+        document = store.load_document()
+        for section in ("views", "transactions", "changes", "projection_jobs"):
+            document[section] = {}
+        document["last_indexed_seq"] = 0
+        store.save_document(document, [], new_root)
+    finally:
+        store.close()
+    with locked(new_root):
+        pass
 
 
 def _clear_sqlite_leases(path: Path) -> None:

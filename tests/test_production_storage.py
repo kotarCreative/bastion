@@ -11,7 +11,7 @@ from pathlib import Path
 import forge
 from errors import ForgeError
 from invariants import check_invariants
-from store import backup_forge, restore_forge
+from store import _SqliteBackend, backup_forge, restore_forge
 
 
 def _cleanup_directory(directory: Path) -> None:
@@ -32,18 +32,34 @@ class BackupRestoreTest(unittest.TestCase):
         self.addCleanup(_cleanup_directory, base)
         original_get = Repository.get
         manifest_reads = 0
+        order: list[str] = []
 
         def get(repository, key, **kwargs):
             nonlocal manifest_reads
             if key == "manifest.json":
                 manifest_reads += 1
-                if manifest_reads > 1:
+                if manifest_reads > 2:
                     raise AssertionError("backup re-read a moving manifest")
+                order.append("manifest")
             return original_get(repository, key, **kwargs)
 
-        with patch.object(Repository, "get", new=get):
+        original_dump = _SqliteBackend.dump
+
+        def dump(backend, target):
+            order.append("dump")
+            return original_dump(backend, target)
+
+        with patch.object(Repository, "get", new=get), patch.object(
+            _SqliteBackend, "dump", dump
+        ):
             backup_forge(fixture.root, base / "backup")
-        self.assertEqual(1, manifest_reads)
+        # One read pins the generation for the object copy; one post-dump
+        # read verifies quiescence.  The verify read happens after the
+        # database export, never during object copying.
+        self.assertEqual(2, manifest_reads)
+        self.assertEqual(["manifest", "dump", "manifest"], order)
+        metadata = json.loads((base / "backup" / "manifest.json").read_text())
+        self.assertTrue(metadata["quiesced"])
 
     def test_backup_restore_reconstructs_wal_and_accepts_pushes(self) -> None:
         from tests.storage_helpers import repository_state

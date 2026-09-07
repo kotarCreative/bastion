@@ -256,7 +256,12 @@ def _validate_submission_authorization(
         shutil.rmtree(object_dir, ignore_errors=True)
     if transition.canonical_new != payload["canonical_new"]:
         _fail("AUTHORIZATION", record["seq"], "reconciled canonical tip differs from record")
-    if transition.mappings != payload_mappings:
+    # Frozen snapshot payloads surface tuples of mapping proxies; compare
+    # normalized plain containers so the reference-equivalence check is
+    # structural, not container-type-sensitive.
+    if [dict(item) for item in payload_mappings] != [
+        dict(item) for item in transition.mappings
+    ]:
         _fail("AUTHORIZATION", record["seq"], "reconciled mappings differ from record")
 
 
@@ -471,6 +476,16 @@ def check_invariants(root: Path) -> None:
                 if kind == "view_create":
                     descriptor = _descriptor_for_record(repository, record)
                     _validate_view_create(record, descriptor, manifest.canonical_ref)
+                    for other in running_views.values():
+                        if (
+                            other["principal_id"] == payload["principal_id"]
+                            and other["descriptor_id"] != payload["descriptor_id"]
+                        ):
+                            _fail(
+                                "AUTHORIZATION",
+                                record["seq"],
+                                "view creation does not match the principal's committed assignment",
+                            )
                     running_views[payload["view_id"]] = {
                         "principal_id": payload["principal_id"],
                         "projected_ref": payload["projected_ref"],

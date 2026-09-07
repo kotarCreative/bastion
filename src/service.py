@@ -271,9 +271,34 @@ def add_view(
             if all(existing[key] == value for key, value in desired.items()):
                 return AlreadyCommitted(existing["epoch_start_seq"])
             raise ForgeError(f"view already exists: {name}")
+        # Policy fencing: validate the principal's committed assignment on
+        # this exact WAL snapshot, for every CAS retry.  An intervening
+        # transition invalidates the captured descriptor, so the candidate
+        # is rebuilt against the committed assignment instead of
+        # publishing a view that retains revoked access.
+        assigned = {
+            view["descriptor_id"]
+            for view in replay.active_views.values()
+            if view["principal_id"] == principal_id
+        }
+        if len(assigned) > 1:
+            raise ForgeError(
+                "principal has inconsistent committed assignments", "integrity"
+            )
+        effective = descriptor
+        if assigned:
+            committed_id = next(iter(assigned))
+            if committed_id != effective["id"]:
+                effective = repository._descriptor(committed_id)
+                if not effective["capabilities"].get("read"):
+                    raise ForgeError("principal has no effective readable path")
         payload = {
             "view_id": name,
-            **desired,
+            "principal_id": principal_id,
+            "projected_ref": f"refs/heads/{branch}",
+            "descriptor_id": effective["id"],
+            "descriptor_generation": 1,
+            "projection_epoch": 1,
             "canonical_frontier": manifest.canonical_tip,
         }
         return Candidate(

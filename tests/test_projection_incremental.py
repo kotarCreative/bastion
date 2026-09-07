@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import platform
 import statistics
 import subprocess
 import sys
@@ -22,6 +23,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from errors import ForgeError
+import limits
 from projection import (
     IncrementalProjector,
     compile_read_matcher,
@@ -643,8 +645,7 @@ class DeterministicBenchmarkTest(unittest.TestCase):
         )
         descriptor = self._policies()[0]
 
-        def count_for(canonical: Path, commits: list[str], tag: str) -> int:
-            calls: list[list[str]] = []
+        def counting_context(calls: list[list[str]]):
             real_run = _subprocess.run
 
             def counting(*args, **kwargs):
@@ -653,21 +654,102 @@ class DeterministicBenchmarkTest(unittest.TestCase):
                     calls.append([os.fsdecode(part) for part in argv[1:10]])
                 return real_run(*args, **kwargs)
 
-            destination = _init_bare(base / f"scale-{tag}.git")
-            reset_fast_projection_stats()
-            with mock.patch.object(_subprocess, "run", counting):
-                project_history_fast(
-                    canonical, destination, "0" * 40, commits[-1], "0" * 40, descriptor
-                )
-            return len(calls)
+            return mock.patch.object(_subprocess, "run", counting)
 
-        # Same changed paths on 2k vs 20k files: identical process counts.
-        # (The full 10k->100k spread is exercised the same way; the reduced
-        # pair keeps this regression test fast while proving independence.)
-        self.assertEqual(
-            count_for(small, small_commits, "small"),
-            count_for(big, big_commits, "big"),
-        )
+        def phases(canonical: Path, commits: list[str], tag: str) -> tuple[int, int]:
+            """Split cold construction from steady incremental work.
+
+            Cold bootstrap transfers the initial visible data in bounded
+            batches (its cost is linear in initial data and is budgeted
+            separately).  The steady gate then advances the same one-file
+            commits with the rest of the tree unchanged: its process count
+            must not depend on the unchanged file count at all.
+            """
+            destination = _init_bare(base / f"steady-{tag}.git")
+            cold_calls: list[list[str]] = []
+            started = time.perf_counter()
+            reset_fast_projection_stats()
+            with counting_context(cold_calls):
+                cold_tip, _frontier, _anchors = project_history_fast(
+                    canonical, destination, "0" * 40, commits[0], "0" * 40, descriptor
+                )
+            cold_seconds = time.perf_counter() - started
+            cold_blobs = fast_projection_stats()["blobs_transferred"]
+            steady_calls: list[list[str]] = []
+            started = time.perf_counter()
+            reset_fast_projection_stats()
+            with counting_context(steady_calls):
+                project_history_fast(
+                    canonical, destination, commits[0], commits[-1], cold_tip, descriptor
+                )
+            steady_seconds = time.perf_counter() - started
+            steady_blobs = fast_projection_stats()["blobs_transferred"]
+            return (
+                len(cold_calls),
+                cold_blobs,
+                cold_seconds,
+                len(steady_calls),
+                steady_blobs,
+                steady_seconds,
+            )
+
+        (
+            small_cold,
+            small_cold_blobs,
+            small_cold_seconds,
+            small_steady,
+            small_steady_blobs,
+            small_steady_seconds,
+        ) = phases(small, small_commits, "small")
+        (
+            big_cold,
+            big_cold_blobs,
+            big_cold_seconds,
+            big_steady,
+            big_steady_blobs,
+            big_steady_seconds,
+        ) = phases(big, big_commits, "big")
+
+        # Steady-state gate: same changed paths on 2k vs 20k files must
+        # cost identical processes and transfer no unchanged blobs.
+        self.assertEqual(small_steady, big_steady)
+        self.assertEqual(small_steady_blobs, big_steady_blobs)
+        # Cold-transfer budget: batches are bounded by object count and
+        # expanded bytes, so the process count stays linear in initial
+        # visible data — never two subprocesses per blob.
+        for cold_processes, cold_blobs in (
+            (small_cold, small_cold_blobs),
+            (big_cold, big_cold_blobs),
+        ):
+            budget = 2 * (cold_blobs // limits.BLOB_BATCH_OBJECTS + 1) + 80
+            self.assertLessEqual(cold_processes, budget)
+
+        # Measured artifacts (no portable latency thresholds asserted).
+        report = {
+            "small": {
+                "cold_processes": small_cold,
+                "cold_blobs": small_cold_blobs,
+                "cold_seconds": round(small_cold_seconds, 4),
+                "steady_processes": small_steady,
+                "steady_blobs": small_steady_blobs,
+                "steady_seconds": round(small_steady_seconds, 4),
+            },
+            "big": {
+                "cold_processes": big_cold,
+                "cold_blobs": big_cold_blobs,
+                "cold_seconds": round(big_cold_seconds, 4),
+                "steady_processes": big_steady,
+                "steady_blobs": big_steady_blobs,
+                "steady_seconds": round(big_steady_seconds, 4),
+            },
+            "environment": {
+                "python": sys.version.split()[0],
+                "platform": platform.platform(),
+            },
+        }
+        report_path = base / "cold-vs-steady-benchmark.json"
+        report_path.write_text(json.dumps(report, indent=2, sort_keys=True))
+        print(f"\ncold-vs-steady benchmark: {report_path}\n{json.dumps(report, sort_keys=True)}")
 
     def test_reduced_fixture_is_fully_byte_identical(self) -> None:
         base = Path(tempfile.mkdtemp())

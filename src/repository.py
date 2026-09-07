@@ -303,45 +303,50 @@ class Repository:
 
         return load
 
-    def load(self, *, use_cache: bool = True) -> tuple[Manifest, Version, ReplayState]:
+    def load(self, *, use_cache: bool = True):
         """Read one manifest snapshot, incrementally when a snapshot is cached.
 
         An unchanged load performs one conditional ``manifest.json`` GET using
-        the cached object-store version; ``NotModified`` returns a defensive
-        copy of the cached snapshot without historical WAL or descriptor
-        reads. The cached entry itself is never exposed mutably: every return
-        clones the replay state so callers cannot corrupt subsequent loads.
-        When the manifest advances, loading walks only the new suffix back to
-        the cached head. Cache eviction, process restart, or disabled caching
-        falls back to complete replay. Writers continue to use the exact
-        manifest version from their snapshot for CAS, so a process-local
-        cache cannot make a stale write commit.
+        the cached object-store version; ``NotModified`` returns the cached
+        immutable snapshot projection without historical WAL or descriptor
+        reads and without copying any record.  The cached writer state is
+        never exposed mutably: readers receive a ``ReplaySnapshot`` whose
+        containers reject mutation, so one reader cannot corrupt the cache
+        or another reader.  When the manifest advances, loading walks only
+        the new suffix back to the cached head.  Cache eviction, process
+        restart, or disabled caching falls back to complete replay.
+        Writers continue to use the exact manifest version from their
+        snapshot for CAS, so a process-local cache cannot make a stale
+        write commit.
         """
         if not use_cache or not _cache_enabled():
-            return self._load_full()
+            manifest, version, state = self._load_full()
+            return manifest, version, state.snapshot()
         identity = _snapshot_identity(self)
         with _SNAPSHOT_LOCK:
             cached = _SNAPSHOT_CACHE.get(identity)
         if cached is None:
-            result = self._load_full()
+            manifest, version, state = self._load_full()
+            frozen = state.snapshot()
             with _SNAPSHOT_LOCK:
-                _SNAPSHOT_CACHE[identity] = result
-            manifest, version, replay = result
-            return manifest, version, replay.clone()
-        manifest, version, replay = cached
+                _SNAPSHOT_CACHE[identity] = (manifest, version, state, frozen)
+            return manifest, version, frozen
+        manifest, version, state, frozen = cached
         try:
             fetched = self.get("manifest.json", if_none_match=version)
         except NotModified:
             _LOAD_COUNTS["conditional_hits"] += 1
-            return manifest, version, replay.clone()
+            return manifest, version, frozen
         except ObjectNotFound as error:
             raise ForgeError("repository manifest is missing", "integrity") from error
         _LOAD_COUNTS["suffix_advances"] += 1
-        result = self._load_suffix(identity, manifest, replay, fetched)
+        new_manifest, new_version, new_state = self._load_suffix(
+            identity, manifest, state, fetched
+        )
+        new_frozen = new_state.snapshot()
         with _SNAPSHOT_LOCK:
-            _SNAPSHOT_CACHE[identity] = result
-        manifest, version, replay = result
-        return manifest, version, replay.clone()
+            _SNAPSHOT_CACHE[identity] = (new_manifest, new_version, new_state, new_frozen)
+        return new_manifest, new_version, new_frozen
 
     def _install_snapshot(
         self, manifest: Manifest, version: Version, replay: ReplayState
@@ -349,8 +354,14 @@ class Repository:
         """Install a newly validated snapshot after a successful local CAS."""
         if not _cache_enabled():
             return
+        frozen = replay.snapshot()
         with _SNAPSHOT_LOCK:
-            _SNAPSHOT_CACHE[_snapshot_identity(self)] = (manifest, version, replay)
+            _SNAPSHOT_CACHE[_snapshot_identity(self)] = (
+                manifest,
+                version,
+                replay,
+                frozen,
+            )
 
     def _parse_manifest(self, body: bytes) -> Manifest:
         try:
@@ -395,13 +406,14 @@ class Repository:
         }
         return record, reference
 
-    def _check_replay_matches(self, manifest: Manifest, state: ReplayState) -> None:
+    def _check_replay_matches(self, manifest: Manifest, state) -> None:
+        head_record = dict(state.head_record) if state.head_record else {}
         if (
             state.head_seq != manifest.head_seq
             or state.canonical_ref != manifest.canonical_ref
             or state.canonical_tip != manifest.canonical_tip
-            or state.canonical_packs != list(manifest.canonical_packs)
-            or state.head_record != manifest.wal_head.to_dict()
+            or list(state.canonical_packs) != list(manifest.canonical_packs)
+            or head_record != manifest.wal_head.to_dict()
         ):
             raise ForgeError("manifest does not equal its replayed WAL state", "integrity")
 
@@ -473,10 +485,15 @@ class Repository:
             or pointer.get("sha256") != cached_head["sha256"]
         ):
             raise ForgeError("WAL suffix does not reach the cached head", "integrity")
+        cached_head_record = (
+            cached_replay.head_record
+            if isinstance(cached_replay.head_record, dict)
+            else dict(cached_replay.head_record or {})
+        )
         if (
-            cached_replay.head_record is None
-            or cached_replay.head_record.get("event_id") != cached_head["event_id"]
-            or cached_replay.head_record.get("publication_id") != cached_head["publication_id"]
+            not cached_head_record
+            or cached_head_record.get("event_id") != cached_head["event_id"]
+            or cached_head_record.get("publication_id") != cached_head["publication_id"]
         ):
             raise ForgeError("cached manifest head binding is inconsistent", "integrity")
         state = cached_replay.clone_for_append()
@@ -549,9 +566,13 @@ class Repository:
         self, build_event: Callable[[Manifest, ReplayState], Candidate | AlreadyCommitted]
     ) -> int:
         """Publish exactly one event through the manifest CAS linearization point."""
+        import limits
+
         last_conflict = False
         for _attempt in range(3):
             manifest, version, state = self.load()
+            if manifest.head_seq >= limits.MAX_WAL_SEQUENCE:
+                raise ForgeError("WAL sequence budget is exhausted", "limits")
             candidate = build_event(manifest, state)
             if isinstance(candidate, AlreadyCommitted):
                 return candidate.seq

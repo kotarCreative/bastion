@@ -59,6 +59,7 @@ _COUNTS = {
     "full_view_validations": 0,
     "light_view_checks": 0,
     "view_generations_built": 0,
+    "suffix_view_rebuilds": 0,
     "full_canonical_validations": 0,
     "light_canonical_checks": 0,
     "canonical_generations_built": 0,
@@ -138,6 +139,12 @@ def _write_executable(path: Path, contents: str) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _intake_receive_checks(path: Path) -> bool:
+    """Whether receive-side object checking stays configured on an intake."""
+    result = git(path, "config", "--bool", "--get", "receive.fsckObjects", check=False)
+    return not result.returncode and result.stdout.decode().strip() == "true"
+
+
 def _read_cursor(path: Path) -> dict | None:
     try:
         raw = (path / "bastion-cursor.json").read_bytes()
@@ -214,6 +221,7 @@ def initialize_intake(path: Path, active_generation: Path, branch: str) -> Path:
     for key, value in (
         ("receive.denyDeletes", "true"),
         ("receive.denyNonFastForwards", "true"),
+        ("receive.fsckObjects", "true"),
         ("receive.maxInputSize", os.environ.get("BASTION_MAX_PACK_BYTES", str(256 * 1024 * 1024))),
         ("core.logAllRefUpdates", "false"),
         ("core.hooksPath", "hooks"),
@@ -243,10 +251,14 @@ def _install_intake_hooks(root: Path, view_id: str, intake: Path) -> None:
 
 
 def _canonical_cursor(manifest: Manifest) -> dict:
+    """Canonical content identity: the projected tip, not the WAL head.
+
+    Canonical materialization is a pure function of ``canonical_tip``;
+    unrelated WAL appends (view creation, policy transitions, hidden-only
+    canonical commits) do not change canonical content and must not
+    invalidate the generation.
+    """
     return {
-        "applied_seq": manifest.head_seq,
-        "head_record_key": manifest.wal_head.key,
-        "head_publication_id": manifest.wal_head.publication_id,
         "canonical_ref": manifest.canonical_ref,
         "canonical_tip": manifest.canonical_tip,
     }
@@ -285,6 +297,10 @@ def _light_valid_canonical(path: Path, manifest: Manifest) -> bool:
     return True
 
 
+def _registered_canonical_packs(registered) -> tuple[str, ...]:
+    return registered[2] if registered is not None and len(registered) > 2 else ()
+
+
 def ensure_canonical_materialized(
     root: Path, manifest: Manifest, repository: Repository | None = None
 ) -> Path:
@@ -309,8 +325,12 @@ def ensure_canonical_materialized(
                 _CANONICAL_REGISTRATIONS[cache_key] = (
                     dict(_canonical_cursor(manifest)),
                     str(active),
+                    tuple(pack["pack_key"] for pack in manifest.canonical_packs),
                 )
                 return active
+        # A changed tip builds a private candidate that links the verified
+        # immutable objects of the previous generation and installs only the
+        # new packs, instead of recopying the full history.
         generation = (
             materializations_dir(root)
             / "canonical"
@@ -319,7 +339,18 @@ def ensure_canonical_materialized(
         generation.parent.mkdir(parents=True, exist_ok=True)
         initialize_view_generation(generation, _branch(manifest.canonical_ref))
         try:
-            for pack in manifest.canonical_packs:
+            installed = _registered_canonical_packs(registered)
+            installed_keys = set(installed)
+            if active is not None and installed:
+                _link_tree(active / "objects", generation / "objects")
+                required = [
+                    pack
+                    for pack in manifest.canonical_packs
+                    if pack["pack_key"] not in installed_keys
+                ]
+            else:
+                required = list(manifest.canonical_packs)
+            for pack in required:
                 install_pack(repository, pack, generation / "objects")
             git(generation, "update-ref", manifest.canonical_ref, manifest.canonical_tip)
             git(generation, "symbolic-ref", "HEAD", manifest.canonical_ref)
@@ -328,9 +359,11 @@ def ensure_canonical_materialized(
             _write_cursor(generation, _canonical_cursor(manifest))
             _activate(root, link, generation)
             _COUNTS["canonical_generations_built"] += 1
+            installed_keys.update(pack["pack_key"] for pack in required)
             _CANONICAL_REGISTRATIONS[cache_key] = (
                 dict(_canonical_cursor(manifest)),
                 str(generation),
+                tuple(sorted(installed_keys)),
             )
             return generation
         except Exception:
@@ -338,20 +371,126 @@ def ensure_canonical_materialized(
             raise
 
 
-def _view_cursor(
-    manifest: Manifest, view_id: str, active: dict, projected_tip: str
-) -> dict:
+def _view_cursor(view_id: str, active: dict, projected_tip: str) -> dict:
+    """View content identity, independent of unrelated WAL appends.
+
+    Reuse is decided from the descriptor assignment, projection epoch, ref,
+    and projected tip.  Unrelated records (another principal's view
+    creation, hidden-only canonical commits) never invalidate a proved
+    generation.
+    """
     return {
         "view_id": view_id,
-        "applied_seq": manifest.head_seq,
-        "head_record_key": manifest.wal_head.key,
-        "head_publication_id": manifest.wal_head.publication_id,
-        "projection_epoch": active["projection_epoch"],
         "descriptor_id": active["descriptor_id"],
         "descriptor_generation": active["descriptor_generation"],
-        "canonical_frontier": active["canonical_frontier"],
+        "projection_epoch": active["projection_epoch"],
+        "projected_ref": active["projected_ref"],
         "projected_tip": projected_tip,
     }
+
+
+def _view_identity(active: dict) -> tuple:
+    return (
+        active["descriptor_id"],
+        active["descriptor_generation"],
+        active["projection_epoch"],
+        active["projected_ref"],
+    )
+
+
+def _visible_changes(canonical: Path, old: str, new: str, descriptor: dict) -> bool:
+    """Whether any commit in a canonical advance touches a visible path.
+
+    Looking only at the net diff between ``old`` and ``new`` is insufficient:
+    an intermediate visible change can be added and then removed before the
+    final tip. That commit still changes projected history and must invalidate
+    the reuse shortcut.
+    """
+    if old == new:
+        return False
+    from validation import visible
+
+    commits = git(canonical, "rev-list", "--reverse", f"{old}..{new}").stdout.split()
+    for commit in commits:
+        raw = git(
+            canonical,
+            "diff-tree",
+            "-r",
+            "--root",
+            "--name-only",
+            "-z",
+            "--no-commit-id",
+            commit,
+        ).stdout
+        if any(path and visible(path, descriptor) for path in raw.split(b"\0")):
+            return True
+    return False
+
+
+def _suffix_affects_view(
+    canonical: Path,
+    view_id: str,
+    active: dict,
+    descriptor: dict,
+    records: list[dict] | tuple,
+) -> bool:
+    """Whether any WAL suffix record changes this view's projected tip."""
+    for record in records:
+        kind = record["kind"]
+        if kind == "view_create":
+            continue
+        if kind == "policy_transition":
+            if any(
+                item["view_id"] == view_id for item in record["payload"]["views"]
+            ):
+                return True
+            continue
+        if kind == "submission":
+            payload = record["payload"]
+            if (
+                payload["view_id"] == view_id
+                and payload["projection_epoch"] == active["projection_epoch"]
+                and payload["descriptor_id"] == active["descriptor_id"]
+            ):
+                return True
+            if _visible_changes(
+                canonical, payload["canonical_old"], payload["canonical_new"], descriptor
+            ):
+                return True
+        elif kind == "canonical_update":
+            payload = record["payload"]
+            if _visible_changes(
+                canonical, payload["canonical_old"], payload["canonical_new"], descriptor
+            ):
+                return True
+    return False
+
+
+def _link_tree(source: Path, destination: Path) -> None:
+    """Hardlink every regular file of ``source`` into ``destination``.
+
+    Verified immutable objects are reused without recopying bytes; the
+    candidate becomes physically self-contained because old generations are
+    never deleted (generation GC is deferred by spec).
+    """
+    source_root = source.resolve()
+    destination_root = destination.resolve()
+    for path in sorted(source_root.rglob("*")):
+        if path.is_dir():
+            (destination_root / path.relative_to(source_root)).mkdir(
+                parents=True, exist_ok=True
+            )
+            continue
+        if not path.is_file():
+            continue
+        target = destination_root / path.relative_to(source_root)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            continue
+        try:
+            os.link(path, target)
+        except OSError:
+            shutil.copy2(path, target)
 
 
 def _light_valid_view(path: Path, cursor: dict, projected_ref: str) -> bool:
@@ -400,18 +539,31 @@ def _receipt_path(root: Path, view_id: str) -> Path:
 
 
 def _expected_receipt(
-    manifest: Manifest, view_id: str, active: dict, cursor: dict, generation: Path
+    manifest: Manifest,
+    view_id: str,
+    active: dict,
+    cursor: dict,
+    generation: Path,
+    applied_seq: int,
+    epoch_frontier: str,
 ) -> dict:
+    """Progress receipt bound to per-view identity, not the global head.
+
+    ``applied_seq`` is the last WAL sequence applied to the generation;
+    ``epoch_frontier`` is the canonical frontier the epoch bootstrapped
+    from.  Neither moves when unrelated records append, so a restart
+    reuses the generation instead of reconstructing from the epoch.
+    """
     return {
         "repository_id": manifest.repository_id,
-        "manifest_head": manifest.wal_head.to_dict(),
         "view_id": view_id,
         "descriptor_id": active["descriptor_id"],
         "descriptor_generation": active["descriptor_generation"],
         "projection_epoch": active["projection_epoch"],
-        "canonical_frontier": active["canonical_frontier"],
+        "epoch_frontier": epoch_frontier,
         "projected_ref": active["projected_ref"],
         "projected_tip": cursor["projected_tip"],
+        "applied_seq": applied_seq,
         "generation": generation.name,
     }
 
@@ -510,12 +662,14 @@ def ensure_view_materialized(
 ) -> MaterializedView:
     """Materialize one view generation, reusing validated work when safe.
 
-    Full validation (cursor, single ref, hooks, no unsafe alternates/grafts/
-    shallow state, strict fsck, exact closure) is mandatory when a generation
-    is built and on the first acceptance per process. Later requests for an
-    unchanged registered generation perform only lightweight identity checks.
-    ``full_validation=True`` (``forge.py sync``/``check``) skips only the
-    lightweight fast path; it still rebuilds when full checks fail.
+    Reuse decisions bind to per-view projection identity (descriptor
+    assignment, epoch, ref, projected tip) instead of the global WAL head,
+    so unrelated records never rebuild a proved generation.  A changed view
+    reuses the verified immutable objects of its previous generation in a
+    private candidate and applies only the affecting suffix.  Full
+    validation (cursor, single ref, hooks, no unsafe alternates/grafts/
+    shallow state, strict fsck, exact closure) is mandatory when a
+    generation is built and on the first acceptance per process.
     """
     repository = repository or Repository.open(root)
     active = replay_state.active_views.get(view_id)
@@ -524,43 +678,82 @@ def ensure_view_materialized(
     cache_key = (str(root.resolve()), view_id)
     link = view_repo(root, view_id)
     with _flock(materialization_lock(root, view_id)):
-        # The expected tip is derived from current WAL state, never from a
-        # self-consistent on-disk cursor alone.
         active_path = _resolved_symlink(link)
         registered = _VIEW_REGISTRATIONS.get(cache_key)
+        applied_seq: int | None = None
         if (
             not full_validation
             and registered is not None
             and active_path is not None
             and registered[1] == str(active_path)
         ):
-            registered_cursor = registered[0]
+            registered_cursor, registered_applied = registered[0], registered[2]
             if registered_cursor == _view_cursor(
-                manifest, view_id, active, registered_cursor["projected_tip"]
+                view_id, active, registered_cursor["projected_tip"]
             ) and _light_valid_view(
                 active_path, registered_cursor, active["projected_ref"]
             ):
-                _COUNTS["light_view_checks"] += 1
-                return MaterializedView(active_path, dict(registered_cursor))
+                canonical = ensure_canonical_materialized(root, manifest, repository)
+                descriptor = repository._descriptor(active["descriptor_id"])
+                suffix = replay_state.records[registered_applied:]
+                if not _suffix_affects_view(
+                    canonical, view_id, active, descriptor, suffix
+                ):
+                    _COUNTS["light_view_checks"] += 1
+                    _VIEW_REGISTRATIONS[cache_key] = (
+                        dict(registered_cursor),
+                        str(active_path),
+                        manifest.head_seq,
+                    )
+                    return MaterializedView(active_path, dict(registered_cursor))
+                applied_seq = registered_applied
         if active_path is not None:
-            # Restart path: a receipt that exactly matches current WAL state
-            # and the on-disk cursor supplies the expected projected tip. One
-            # full validation of the existing generation, then accept without
-            # rebuilding. Missing, corrupt, stale, future, or contradictory
-            # receipts cause verified reconstruction.
+            # Restart path: a receipt bound to per-view identity and
+            # progress supplies the expected projected tip. One full
+            # validation of the existing generation, then reuse when the
+            # suffix since the receipt proved unrelated. Missing, corrupt,
+            # stale, or contradictory receipts cause verified
+            # reconstruction.
             receipt = _read_receipt(root, view_id)
             if receipt is not None:
-                cursor = _view_cursor(
-                    manifest, view_id, active, receipt.get("projected_tip", "")
+                cursor = _view_cursor(view_id, active, receipt.get("projected_tip", ""))
+                identity_matches = all(
+                    receipt.get(field) == value
+                    for field, value in (
+                        ("repository_id", manifest.repository_id),
+                        ("view_id", view_id),
+                        ("descriptor_id", active["descriptor_id"]),
+                        ("descriptor_generation", active["descriptor_generation"]),
+                        ("projection_epoch", active["projection_epoch"]),
+                        ("projected_ref", active["projected_ref"]),
+                        ("generation", active_path.name),
+                    )
                 )
-                if (
-                    receipt == _expected_receipt(manifest, view_id, active, cursor, active_path)
-                    and _read_cursor(active_path) == cursor
-                    and _valid_view(active_path, cursor, active["projected_ref"])
-                ):
-                    _VIEW_REGISTRATIONS[cache_key] = (dict(cursor), str(active_path))
-                    return MaterializedView(active_path, dict(cursor))
+                if identity_matches and applied_seq is None:
+                    if (
+                        cursor["projected_tip"]
+                        and _read_cursor(active_path) == cursor
+                        and _valid_view(active_path, cursor, active["projected_ref"])
+                    ):
+                        canonical = ensure_canonical_materialized(root, manifest, repository)
+                        descriptor = repository._descriptor(active["descriptor_id"])
+                        suffix = replay_state.records[receipt["applied_seq"]:]
+                        if not _suffix_affects_view(
+                            canonical, view_id, active, descriptor, suffix
+                        ):
+                            _VIEW_REGISTRATIONS[cache_key] = (
+                                dict(cursor),
+                                str(active_path),
+                                manifest.head_seq,
+                            )
+                            return MaterializedView(active_path, dict(cursor))
+                        # Validation passed; only the affecting suffix must
+                        # be built onto this verified base.
+                        applied_seq = receipt["applied_seq"]
         canonical = ensure_canonical_materialized(root, manifest, repository)
+        descriptor = repository._descriptor(active["descriptor_id"])
+        epoch_start = _record_at(replay_state, active["epoch_start_seq"])
+        epoch_frontier = epoch_start["payload"]["canonical_frontier"]
         generation = (
             materializations_dir(root)
             / "views"
@@ -572,31 +765,43 @@ def ensure_view_materialized(
         branch = _branch(active["projected_ref"])
         initialize_view_generation(generation, branch)
         try:
-            start = _record_at(replay_state, active["epoch_start_seq"])
-            descriptor = repository._descriptor(active["descriptor_id"])
             projected_tip = ZERO_OID
-            if start["kind"] == "view_create":
-                projected_tip, _frontier, _anchors = project_history_fast(
-                    canonical, generation, ZERO_OID,
-                    start["payload"]["canonical_frontier"], ZERO_OID, descriptor
-                )
-            elif start["kind"] == "policy_transition":
-                frontier = start["payload"]["canonical_frontier"]
-                projected_tree = project_tree(canonical, generation, frontier, descriptor)
-                projected_tip = make_commit(
-                    generation,
-                    projected_tree,
-                    ZERO_OID,
-                    b"projected policy epoch\n",
-                    author_environment(canonical, frontier, projected=True),
-                )
-            else:
-                raise ForgeError("active view epoch starts with an invalid WAL event", "integrity")
+            tracked_entries = None
+            start_index = active["epoch_start_seq"]
+            previous = None
+            if applied_seq is not None and active_path is not None:
+                # Verified suffix work: link the previous generation's
+                # immutable objects into the private candidate and apply
+                # only the records after its proven progress point.
+                previous_tip = ref(active_path, active["projected_ref"])
+                if previous_tip != ZERO_OID and applied_seq >= active["epoch_start_seq"]:
+                    _link_tree(active_path / "objects", generation / "objects")
+                    projected_tip = previous_tip
+                    start_index = applied_seq
+                    previous = active_path
+            if previous is None:
+                start = epoch_start
+                if start["kind"] == "view_create":
+                    projected_tip, _frontier, _anchors = project_history_fast(
+                        canonical, generation, ZERO_OID,
+                        start["payload"]["canonical_frontier"], ZERO_OID, descriptor
+                    )
+                elif start["kind"] == "policy_transition":
+                    frontier = start["payload"]["canonical_frontier"]
+                    projected_tree = project_tree(canonical, generation, frontier, descriptor)
+                    projected_tip = make_commit(
+                        generation,
+                        projected_tree,
+                        ZERO_OID,
+                        b"projected policy epoch\n",
+                        author_environment(canonical, frontier, projected=True),
+                    )
+                else:
+                    raise ForgeError("active view epoch starts with an invalid WAL event", "integrity")
             # Tracked projected entries cross record boundaries so one catch-up
             # run lists its base tree once, not once per record. Evidence
             # jumps (installed packs) invalidate the tracked entries.
-            tracked_entries = None
-            for record in replay_state.records[active["epoch_start_seq"] :]:
+            for record in replay_state.records[start_index:]:
                 payload = record["payload"]
                 if record["kind"] == "submission":
                     if payload["view_id"] == view_id and (
@@ -623,7 +828,7 @@ def ensure_view_materialized(
             if projected_tip == ZERO_OID:
                 raise ForgeError("view materialization produced no projected commit", "integrity")
             git(generation, "update-ref", active["projected_ref"], projected_tip)
-            cursor = _view_cursor(manifest, view_id, active, projected_tip)
+            cursor = _view_cursor(view_id, active, projected_tip)
             _write_cursor(generation, cursor)
             # A new generation is activated only after its full validation:
             # cursor, single ref, hooks, no unsafe state, strict fsck, and
@@ -632,8 +837,20 @@ def ensure_view_materialized(
                 raise ForgeError("view materialization failed validation", "integrity")
             _activate(root, link, generation)
             _COUNTS["view_generations_built"] += 1
-            _write_receipt(root, view_id, _expected_receipt(manifest, view_id, active, cursor, generation))
-            _VIEW_REGISTRATIONS[cache_key] = (dict(cursor), str(generation))
+            if previous is not None:
+                _COUNTS["suffix_view_rebuilds"] += 1
+            _write_receipt(
+                root,
+                view_id,
+                _expected_receipt(
+                    manifest, view_id, active, cursor, generation, manifest.head_seq, epoch_frontier
+                ),
+            )
+            _VIEW_REGISTRATIONS[cache_key] = (
+                dict(cursor),
+                str(generation),
+                manifest.head_seq,
+            )
             from failpoints import checkpoint
 
             checkpoint(root, "wal.secondary_materialized")
@@ -647,6 +864,7 @@ def ensure_intake_materialized(
     root: Path,
     materialized_view: MaterializedView,
     manifest: Manifest | None = None,
+    replay: ReplayState | None = None,
 ) -> Path:
     view_id = materialized_view.cursor["view_id"]
     link = intake_repo(root, view_id)
@@ -662,33 +880,57 @@ def ensure_intake_materialized(
     expected_alternate = f"{(materialized_view.path / 'objects').resolve()}\n"
     with _flock(materialization_lock(root, view_id)):
         if manifest is None:
-            manifest, _version, _replay = Repository.open(root).load()
+            manifest, _version, replay = Repository.open(root).load()
+        elif replay is None:
+            _manifest, _version, replay = Repository.open(root).load()
         cursor = materialized_view.cursor
+        # The captured view materialization must still match committed
+        # identity: descriptor assignment, epoch, ref, and tip.  Unrelated
+        # WAL appends do not supersede it; a rebuilt generation (new tip)
+        # or a policy change does.
+        active = replay.active_views.get(view_id)
         if (
-            cursor["applied_seq"] != manifest.head_seq
-            or cursor["head_record_key"] != manifest.wal_head.key
-            or cursor["head_publication_id"] != manifest.wal_head.publication_id
+            active is None
+            or _view_identity(active)
+            != _view_identity(
+                {
+                    "descriptor_id": cursor["descriptor_id"],
+                    "descriptor_generation": cursor["descriptor_generation"],
+                    "projection_epoch": cursor["projection_epoch"],
+                    "projected_ref": cursor["projected_ref"],
+                }
+            )
+            or cursor["projected_tip"] != target_tip
         ):
             raise ForgeError("materialized view was superseded", "conflict")
-        active = _resolved_symlink(link)
-        if active is not None and _read_cursor(active) == cursor:
-            alternate = active / "objects" / "info" / "alternates"
-            advertised = git(active, "for-each-ref", "--format=%(refname)", check=False)
+        active_generation = _resolved_symlink(view_repo(root, view_id))
+        if active_generation is not None and active_generation != materialized_view.path:
+            active_cursor = _read_cursor(active_generation)
+            if (
+                active_cursor is not None
+                and active_cursor.get("projected_tip") != cursor["projected_tip"]
+            ):
+                raise ForgeError("materialized view was superseded", "conflict")
+        active_intake = _resolved_symlink(link)
+        if active_intake is not None and _read_cursor(active_intake) == cursor:
+            alternate = active_intake / "objects" / "info" / "alternates"
+            advertised = git(active_intake, "for-each-ref", "--format=%(refname)", check=False)
             if (
                 alternate.is_file()
                 and alternate.read_text() == expected_alternate
-                and ref(active, projected_ref) == target_tip
-                and _uses_repository_hooks(active)
+                and ref(active_intake, projected_ref) == target_tip
+                and _uses_repository_hooks(active_intake)
+                and _intake_receive_checks(active_intake)
                 and not advertised.returncode
                 and advertised.stdout.decode().splitlines() == [projected_ref]
             ):
-                _install_intake_hooks(root, view_id, active)
-                return active
+                _install_intake_hooks(root, view_id, active_intake)
+                return active_intake
         generation = (
             materializations_dir(root)
             / "intakes"
             / view_id
-            / f"{cursor['applied_seq']}-{uuid.uuid4().hex}.git"
+            / f"{cursor['descriptor_generation']}-{cursor['projection_epoch']}-{uuid.uuid4().hex}.git"
         )
         generation.parent.mkdir(parents=True, exist_ok=True)
         try:

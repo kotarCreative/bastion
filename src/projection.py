@@ -17,6 +17,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+import limits
 from errors import ForgeError
 from git import (
     author_environment,
@@ -43,17 +44,28 @@ def project_tree(
     source_env: dict[str, str] | None = None,
     destination_env: dict[str, str] | None = None,
 ) -> str:
+    from git import copy_objects
+
     visible_paths = {}
     validate_no_empty_subtrees(canonical, canonical_treeish, source_env)
+    blob_oids: list[str] = []
+    seen_blobs: set[str] = set()
     for path, entry in tree_entries(canonical, canonical_treeish, source_env).items():
         if not visible(path, descriptor):
             continue
         mode, kind, oid = entry
         if kind == b"blob":
-            copy_object(canonical, destination, oid, source_env, destination_env)
+            if oid not in seen_blobs:
+                seen_blobs.add(oid)
+                blob_oids.append(oid)
         elif kind != b"commit":
             raise ForgeError("unsupported canonical tree entry")
         visible_paths[path] = (mode, kind, oid)
+    # One batched transfer for every required distinct object instead of a
+    # cat-file/hash-object subprocess pair per blob.
+    copy_objects(
+        canonical, destination, blob_oids, source_env, destination_env
+    )
     return write_tree(destination, visible_paths, destination_env)
 
 
@@ -477,14 +489,62 @@ class IncrementalProjector:
             data=query,
             env=self.destination_env,
         ).stdout.splitlines()
-        missing = [oid for oid in fresh if oid.encode("ascii") not in listing]
-        self.stored.update(oid for oid in fresh if oid not in missing)
+        present = {line.decode("ascii", "replace") for line in listing}
+        missing = [oid for oid in fresh if oid not in present]
+        self.stored.update(oid for oid in fresh if oid in present)
         if not missing:
             return
-        batch_size = 50
+        # Expanded sizes come from the source: the destination lacks the
+        # missing objects by definition.  Batches stay bounded by aggregate
+        # expanded bytes before any content is read.
+        size_query = ("".join(f"{oid}\n" for oid in missing)).encode("ascii")
+        size_lines = _git_counted(
+            self.canonical,
+            "cat-file",
+            "--batch-check=%(objectname) %(objectsize)",
+            data=size_query,
+            env=self.source_env,
+        ).stdout.splitlines()
+        sizes: dict[str, int] = {}
+        for line in size_lines:
+            fields = line.split(b" ")
+            if len(fields) != 2 or fields[0].decode("ascii", "replace") not in missing:
+                raise ForgeError("object format mismatch while copying object")
+            try:
+                sizes[fields[0].decode("ascii")] = int(fields[1])
+            except ValueError as error:
+                raise ForgeError("object format mismatch while copying object") from error
+        if set(sizes) != set(missing):
+            raise ForgeError("canonical object is missing from its database")
+
+        def batches() -> list[list[str]]:
+            """Group missing blobs into bounded transfer batches.
+
+            Batches stop at the object count or aggregate expanded-byte
+            budget, whichever comes first.  A single object larger than
+            the byte budget still forms its own batch so oversized blobs
+            transfer instead of stalling.
+            """
+            groups: list[list[str]] = []
+            current: list[str] = []
+            current_bytes = 0
+            for oid in missing:
+                size = sizes[oid]
+                if current and (
+                    len(current) >= limits.BLOB_BATCH_OBJECTS
+                    or current_bytes + size > limits.BLOB_BATCH_BYTES
+                ):
+                    groups.append(current)
+                    current = []
+                    current_bytes = 0
+                current.append(oid)
+                current_bytes += size
+            if current:
+                groups.append(current)
+            return groups
+
         with tempfile.TemporaryDirectory(prefix="bastion-projection-") as staging:
-            for start_index in range(0, len(missing), batch_size):
-                batch = missing[start_index : start_index + batch_size]
+            for batch in batches():
                 payload = ("".join(f"{oid}\n" for oid in batch)).encode("ascii")
                 raw = _git_counted(
                     self.canonical, "cat-file", "--batch", data=payload, env=self.source_env

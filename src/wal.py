@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Callable
 
 import identity
@@ -49,12 +50,22 @@ def idempotency_key_hash(repository_id: str, key: str) -> str:
     )
 
 
+def _is_mapping(value: object) -> bool:
+    """Whether a value behaves as a read-only or plain mapping.
+
+    Frozen snapshot projections surface ``MappingProxyType`` views; WAL
+    validators accept both so immutable snapshots flow through the same
+    validation as fresh records.
+    """
+    return isinstance(value, dict) or isinstance(value, MappingProxyType)
+
+
 def _fail(message: str) -> None:
     raise ForgeError(f"invalid WAL object: {message}", "integrity")
 
 
-def _exact(value: object, fields: set[str], subject: str) -> dict:
-    if not isinstance(value, dict):
+def _exact(value: object, fields: set[str], subject: str) -> object:
+    if not _is_mapping(value):
         _fail(f"{subject} must be an object")
     missing = fields - set(value)
     extra = set(value) - fields
@@ -152,7 +163,7 @@ def _pack_ref(value: object, expected_kind: str | None = None) -> dict:
     _integer(result["pack_size"], "pack reference pack_size", 1)
     _integer(result["idx_size"], "pack reference idx_size", 1)
     _integer(result["object_count"], "pack reference object_count", 0)
-    return copy.deepcopy(result)
+    return dict(result)
 
 
 def _normalized_capability_list(value: object, subject: str) -> list[str]:
@@ -348,6 +359,102 @@ class ReplayState:
         result.records = list(self.records)
         return result
 
+    def snapshot(self) -> "ReplaySnapshot":
+        """Build the read-only projection of this replayed generation."""
+        return ReplaySnapshot(self)
+
+
+def _freeze_value(value: object) -> object:
+    """Recursively convert containers into immutable read-only views.
+
+    Dicts become mapping proxies and lists become tuples.  Leaves (strings,
+    integers, bytes, None) are shared; one freeze per installed snapshot
+    replaces a deep copy per read.
+    """
+    if isinstance(value, dict):
+        return MappingProxyType(
+            {key: _freeze_value(item) for key, item in value.items()}
+        )
+    if isinstance(value, list):
+        return tuple(_freeze_value(item) for item in value)
+    if isinstance(value, tuple):
+        return tuple(_freeze_value(item) for item in value)
+    return value
+
+
+class ReplaySnapshot:
+    """Read-only projection of one replayed WAL generation.
+
+    Readers receive this instead of the private mutable writer state, so a
+    warm read performs zero historical copies and mutation attempts fail
+    instead of corrupting the shared cache or another reader.
+    """
+
+    __slots__ = (
+        "_state",
+        "repository_id",
+        "head_seq",
+        "head_record",
+        "canonical_ref",
+        "canonical_tip",
+        "canonical_packs",
+        "active_views",
+        "change_claims",
+        "events",
+        "requests",
+        "idempotency",
+        "records",
+    )
+
+    def __init__(self, state: ReplayState) -> None:
+        self._state = state
+        self.repository_id = state.repository_id
+        self.head_seq = state.head_seq
+        self.head_record = _freeze_value(state.head_record)
+        self.canonical_ref = state.canonical_ref
+        self.canonical_tip = state.canonical_tip
+        self.canonical_packs = tuple(
+            _freeze_value(pack) for pack in state.canonical_packs
+        )
+        self.active_views = MappingProxyType(
+            {
+                view_id: _freeze_value(view)
+                for view_id, view in state.active_views.items()
+            }
+        )
+        self.change_claims = MappingProxyType(
+            {
+                key: _freeze_value(value)
+                for key, value in state.change_claims.items()
+            }
+        )
+        self.events = MappingProxyType(
+            {key: _freeze_value(value) for key, value in state.events.items()}
+        )
+        self.requests = MappingProxyType(
+            {key: tuple(value) for key, value in state.requests.items()}
+        )
+        self.idempotency = MappingProxyType(
+            {
+                key: _freeze_value(value)
+                for key, value in state.idempotency.items()
+            }
+        )
+        self.records = tuple(_freeze_value(record) for record in state.records)
+
+    @property
+    def source(self) -> ReplayState:
+        """The cache-private mutable source state (never exposed mutably)."""
+        return self._state
+
+    def clone_for_append(self) -> ReplayState:
+        """Writer candidates fork from the private source state."""
+        return self._state.clone_for_append()
+
+    def clone(self) -> ReplayState:
+        """A private deep copy, for callers that genuinely need mutability."""
+        return copy.deepcopy(self._state)
+
 
 def record_fingerprint(repository_id: str, kind: str, payload: dict) -> dict:
     _uuid(repository_id, "repository id")
@@ -416,7 +523,7 @@ def validate_record(value: object, *, repository_id: str | None = None) -> dict:
     if kind not in KINDS:
         _fail("record kind is unsupported")
     fingerprint = record["event_fingerprint"]
-    if not isinstance(fingerprint, dict):
+    if not _is_mapping(fingerprint):
         _fail("record event_fingerprint must be an object")
     event = _hash(record["event_id"], "record event_id")
     if event_id(fingerprint) != event:
@@ -439,7 +546,7 @@ def validate_record(value: object, *, repository_id: str | None = None) -> dict:
     _integer(record["created_at"], "record created_at", 0)
     _uuid(record["writer"], "record writer")
     _uuid(record["publication_id"], "record publication_id")
-    if not isinstance(record["payload"], dict):
+    if not _is_mapping(record["payload"]):
         _fail("record payload must be an object")
     normalized = copy.deepcopy(record)
     normalized["event_fingerprint"] = copy.deepcopy(fingerprint)
@@ -655,6 +762,12 @@ def apply_record(
             _fail("view already exists")
         if payload["canonical_frontier"] != state.canonical_tip:
             _fail("view canonical frontier is not the current canonical tip")
+        for existing_view in state.active_views.values():
+            if (
+                existing_view["principal_id"] == payload["principal_id"]
+                and existing_view["descriptor_id"] != payload["descriptor_id"]
+            ):
+                _fail("view creation does not match the principal's committed assignment")
         state.active_views[view_id] = {
             "principal_id": payload["principal_id"],
             "projected_ref": payload["projected_ref"],

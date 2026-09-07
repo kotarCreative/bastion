@@ -57,17 +57,112 @@ def load_state_row(root: Path, section: str, key: str) -> dict | None:
         store.close()
 
 
+def load_principal_provenance(root: Path, principal_id: str) -> dict:
+    """Load only the catalog rows required to resolve one principal.
+
+    The principal row, the teams containing it, its direct and team
+    bindings, and the referenced roles are targeted lookups; unrelated
+    catalog rows never enter the response work.
+    """
+    store = open_store(root)
+    try:
+        principal = store.load_row("principals", principal_id)
+        if principal is None:
+            return {
+                "principals": {},
+                "teams": {},
+                "role_bindings": {},
+                "roles": {},
+            }
+        document = {
+            "principals": {principal_id: principal},
+            "teams": store.iter_section_where_member("teams", principal_id),
+            "role_bindings": store.iter_section_where_field(
+                "role_bindings", "subject_id", principal_id
+            ),
+            "roles": {},
+        }
+        for team_id in sorted(document["teams"]):
+            for key, binding in store.iter_section_where_field(
+                "role_bindings", "subject_id", team_id
+            ).items():
+                document["role_bindings"].setdefault(key, binding)
+        role_ids = sorted(
+            {binding.get("role_id") for binding in document["role_bindings"].values()}
+        )
+        for role_id in role_ids:
+            if not role_id:
+                continue
+            role = store.load_row("roles", role_id)
+            if role is not None:
+                document["roles"][role_id] = role
+        return document
+    finally:
+        store.close()
+
+
+_META_KEYS = ("canonical_branch", "repository_state", "repository_id", "last_indexed_seq")
+
+
+def _refresh_session_baseline(session: dict, state: dict, outcome: dict | None) -> None:
+    """Advance the session baseline to the exact committed versions.
+
+    The refresh uses the versions this session just committed rather than a
+    later unprotected read, so another writer's versions are never adopted.
+    A failed save never reaches this path and leaves the last committed
+    baseline intact.
+    """
+    if outcome is None:
+        return
+    versions = session.get("baseline_versions")
+    baseline = session.get("baseline")
+    meta = outcome.get("meta")
+    if meta is not None:
+        if baseline is not None:
+            for key in _META_KEYS:
+                baseline[key] = state[key]
+        if versions is not None:
+            versions.setdefault("__meta__", {})["__meta__"] = meta
+    for section, writes in (outcome.get("sections") or {}).items():
+        if baseline is not None:
+            baseline_section = baseline.setdefault(section, {})
+            desired_section = state.get(section, {})
+        else:
+            baseline_section = None
+            desired_section = {}
+        versions_section = versions.setdefault(section, {}) if versions is not None else None
+        for key, entry in writes.items():
+            if baseline_section is not None:
+                # A deep copy keeps later caller mutations of ``state`` from
+                # silently editing the committed baseline.
+                baseline_section[key] = copy.deepcopy(desired_section.get(key))
+            if versions_section is not None:
+                versions_section[key] = entry
+    for section, deleted in (outcome.get("deleted") or {}).items():
+        if not deleted:
+            continue
+        if baseline is not None:
+            baseline_section = baseline.setdefault(section, {})
+            for key in deleted:
+                baseline_section.pop(key, None)
+        if versions is not None:
+            versions_section = versions.setdefault(section, {})
+            for key in deleted:
+                versions_section.pop(key, None)
+
+
 def save_state(root: Path, state: dict) -> None:
     session = _session_for(root)
     if session is not None:
         leases = [(scope, session["owner"]) for scope in session["scopes"]]
-        session["store"].save_document(
+        outcome = session["store"].save_document(
             state,
             leases,
             root,
             baseline=session.get("baseline"),
             baseline_versions=session.get("baseline_versions"),
         )
+        _refresh_session_baseline(session, state, outcome)
         return
     store = open_store(root)
     try:
@@ -269,9 +364,13 @@ def locked(
         except AttributeError:
             state = store.load_document()
             versions = None
-        recoverer(root, state)
-        session["baseline"] = copy.deepcopy(state)
+        # The version map is the session's rolling ABA baseline. Recovery
+        # may commit writes immediately; each successful save refreshes the
+        # map with the exact committed versions, so a later write in this
+        # session never conflicts with the session's own first write.
         session["baseline_versions"] = copy.deepcopy(versions) if versions is not None else None
+        recoverer(root, state)                           # recovery runs in-session
+        session["baseline"] = copy.deepcopy(state)
         yield state
     finally:
         _sessions.active.pop(resolved, None)
