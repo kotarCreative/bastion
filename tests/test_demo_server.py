@@ -97,6 +97,8 @@ class DemoServerTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn(b"/assets/app.js", response.data)
         self.assertIn(b"/assets/app.css", response.data)
+        self.assertIn(b'id="account-login-form"', response.data)
+        self.assertIn(b'id="tab-permissions"', response.data)
         self.assertNotIn(b"<script>", response.data)  # external script only
 
     def test_assets_are_served(self) -> None:
@@ -177,6 +179,130 @@ class DemoServerTest(unittest.TestCase):
         self.assertIn("restrictions", body["descriptor"])
         self.assertNotIn("canonical_frontier", body)
         self.assertEqual(response.headers.get("Cache-Control"), "no-store")
+
+    def test_account_login_issues_and_logout_revokes_memory_session(self) -> None:
+        from accounts import set_password
+
+        set_password(self.forge, "alice", "correct horse battery staple")
+        rejected = self.client.post(
+            "/api/v1/login",
+            json={"username": "alice", "password": "wrong password"},
+        )
+        self.assertEqual(rejected.status_code, 401)
+        self.assertEqual(rejected.get_json(), {"error": "invalid-credentials"})
+        unknown = self.client.post(
+            "/api/v1/login",
+            json={"username": "unknown", "password": "wrong password"},
+        )
+        self.assertEqual(unknown.status_code, 401)
+        self.assertEqual(unknown.get_json(), rejected.get_json())
+
+        accepted = self.client.post(
+            "/api/v1/login",
+            json={"username": "alice", "password": "correct horse battery staple"},
+        )
+        self.assertEqual(accepted.status_code, 200)
+        body = accepted.get_json()
+        self.assertEqual(body["session"]["principal"]["id"], "alice")
+        self.assertEqual(body["session"]["view_id"], "alice")
+        self.assertTrue(body["access_token"].startswith("bst1."))
+        self.assertIsNone(accepted.headers.get("Set-Cookie"))
+
+        bearer = _bearer_header(body["access_token"])
+        self.assertEqual(
+            self.client.get("/api/v1/session", headers=bearer).status_code, 200
+        )
+        signed_out = self.client.post("/api/v1/logout", headers=bearer)
+        self.assertEqual(signed_out.status_code, 200)
+        self.assertEqual(
+            self.client.get("/api/v1/session", headers=bearer).status_code, 401
+        )
+        # Signing out of the compatibility token flow clears the browser but
+        # does not revoke an operator-issued Git/UI credential.
+        legacy_bearer = _bearer_header(self.alice_token)
+        self.assertEqual(
+            self.client.post("/api/v1/logout", headers=legacy_bearer).status_code,
+            200,
+        )
+        self.assertEqual(
+            self.client.get("/api/v1/session", headers=legacy_bearer).status_code,
+            200,
+        )
+
+    def test_permissions_require_repository_owner(self) -> None:
+        self.assertEqual(self.client.get("/api/v1/permissions").status_code, 401)
+        self.assertEqual(self.client.post("/api/v1/permissions").status_code, 401)
+        fetch_only = add_token(self.forge, "alice", ["fetch"])
+        self.assertEqual(
+            self.client.get(
+                "/api/v1/permissions", headers=_bearer_header(fetch_only)
+            ).status_code,
+            403,
+        )
+        response = self.client.get(
+            "/api/v1/permissions", headers=_bearer_header(self.alice_token)
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_owner_can_make_file_private_and_restore_visibility(self) -> None:
+        from identity import CAPABILITIES
+        from service import add_role, bind_role, transition_principal
+
+        allow = {capability: [] for capability in CAPABILITIES}
+        deny = {capability: [] for capability in CAPABILITIES}
+        allow["admin"] = [""]
+        add_role(self.forge, "alice-owner", allow, deny)
+        bind_role(self.forge, "alice-owner", "principal", "alice")
+        transition_principal(self.forge, "alice")
+
+        permissions = self.client.get(
+            "/api/v1/permissions", headers=_bearer_header(self.alice_token)
+        )
+        self.assertEqual(permissions.status_code, 200)
+        self.assertIn("bob", {item["view_id"] for item in permissions.get_json()["targets"]})
+
+        request_body = {
+            "view_id": "bob",
+            "path_b64": self._b64(b"visible/file.txt"),
+            "private": True,
+        }
+        hidden = self.client.post(
+            "/api/v1/permissions",
+            headers={**_bearer_header(self.alice_token), "Content-Type": "application/json"},
+            json=request_body,
+        )
+        self.assertEqual(hidden.status_code, 200, hidden.get_data(as_text=True))
+        self.assertEqual(
+            [item["prefix_display"] for item in hidden.get_json()["private_paths"]],
+            ["visible/file.txt"],
+        )
+        bob_tree = self.client.get(
+            "/api/v1/tree",
+            query_string={"path_b64": self._b64(b"visible")},
+            headers=_bearer_header(self.bob_token),
+        )
+        self.assertEqual(bob_tree.status_code, 200)
+        self.assertNotIn(
+            "visible/file.txt",
+            {item["path_display"] for item in bob_tree.get_json()["entries"]},
+        )
+
+        request_body["private"] = False
+        restored = self.client.post(
+            "/api/v1/permissions",
+            headers={**_bearer_header(self.alice_token), "Content-Type": "application/json"},
+            json=request_body,
+        )
+        self.assertEqual(restored.status_code, 200)
+        bob_tree = self.client.get(
+            "/api/v1/tree",
+            query_string={"path_b64": self._b64(b"visible")},
+            headers=_bearer_header(self.bob_token),
+        )
+        self.assertIn(
+            "visible/file.txt",
+            {item["path_display"] for item in bob_tree.get_json()["entries"]},
+        )
 
     def test_tree_scopes_to_visible_paths(self) -> None:
         response = self.client.get(

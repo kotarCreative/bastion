@@ -16,6 +16,8 @@ import uuid
 from pathlib import Path
 
 from errors import ForgeError
+from object_store_s3 import MAX_OBJECT_SIZE
+from object_store import ObjectStoreError
 
 LEASE_TTL_SECONDS = 60.0
 LEASE_WAIT_SECONDS = 30.0
@@ -2431,6 +2433,9 @@ def restore_forge(
     *,
     admin_database: str | None = None,
     repair_derived: bool = False,
+    object_store: str | None = None,
+    s3_region: str | None = None,
+    s3_expected_bucket_owner: str | None = None,
 ) -> Path:
     """Reconstruct a forge from a backup directory into ``new_root``.
 
@@ -2451,7 +2456,15 @@ def restore_forge(
     if new_root.exists() and any(new_root.iterdir()):
         raise ForgeError(f"restore target is not empty: {new_root}")
     return _restore_repository(
-        backup, new_root, database, manifest, admin_database, repair_derived
+        backup,
+        new_root,
+        database,
+        manifest,
+        admin_database,
+        repair_derived,
+        object_store,
+        s3_region,
+        s3_expected_bucket_owner,
     )
 
 
@@ -2516,7 +2529,15 @@ def _backup_repository(
     artifacts: list[dict] = []
     try:
         for key in sorted(keys):
-            body = manifest_body if key == "manifest.json" else repository.get(key).body
+            if key == "manifest.json":
+                body = manifest_body
+            else:
+                object_meta = repository.head(key)
+                if object_meta is None:
+                    raise ForgeError("backup references a missing object", "integrity")
+                if object_meta.size > MAX_OBJECT_SIZE:
+                    raise ForgeError("backup object exceeds the qualified size limit", "integrity")
+                body = repository.get(key).body
             target = destination / "objects" / key
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(body)
@@ -2607,12 +2628,17 @@ def _backup_repository(
                     "sha256": entry["sha256"],
                 }
             )
+        source_config = json.loads(config_body)
+        source_kind = source_config.get("object_store", {}).get("kind")
+        if source_kind not in {"filesystem", "s3"}:
+            raise ForgeError("repository configuration has an unsupported object store", "integrity")
         metadata = {
             "format": "bastion-wal-backup",
-            "backup_format_version": 2,
+            "backup_format_version": 3,
             "created_at": time.time(),
             "repository_id": repository.repository_id,
             "backend": backend_kind,
+            "source_object_store_kind": source_kind,
             "head_seq": manifest.head_seq,
             "wal_head": manifest.wal_head.to_dict(),
             "last_indexed_seq": fence["last_indexed_seq"],
@@ -2629,7 +2655,12 @@ def _backup_repository(
 
 
 def _read_backup_object(root: Path, key: str, expected_size: object) -> bytes:
-    if not isinstance(expected_size, int) or isinstance(expected_size, bool) or expected_size < 0:
+    if (
+        not isinstance(expected_size, int)
+        or isinstance(expected_size, bool)
+        or expected_size < 0
+        or expected_size > MAX_OBJECT_SIZE
+    ):
         raise ForgeError("WAL backup object has an invalid size", "integrity")
     directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
@@ -2744,6 +2775,10 @@ def _validated_backup_manifest(metadata: dict) -> dict:
         is_legacy = False
         if not has_artifacts_key:
             raise ForgeError("WAL backup manifest has an invalid shape", "integrity")
+    elif raw_version == 3:
+        is_legacy = False
+        if not has_artifacts_key or metadata.get("source_object_store_kind") not in {"filesystem", "s3"}:
+            raise ForgeError("WAL backup manifest has an invalid shape", "integrity")
     else:
         raise ForgeError("backup format is unsupported")
     backend = metadata.get("backend", "sqlite")
@@ -2771,6 +2806,12 @@ def _validated_backup_manifest(metadata: dict) -> dict:
             or ".." in entry["path"].split("/")
         ):
             raise ForgeError("WAL backup manifest has an invalid shape", "integrity")
+    if raw_version == 3 and set(metadata) - {
+        "format", "backup_format_version", "created_at", "repository_id", "backend",
+        "source_object_store_kind", "head_seq", "wal_head", "last_indexed_seq", "quiesced",
+        "manifest_sha256", "objects", "artifacts",
+    }:
+        raise ForgeError("WAL backup manifest has an invalid shape", "integrity")
     return {**metadata, "backend": backend, "_legacy_backup": is_legacy}
 
 
@@ -2866,11 +2907,16 @@ def _restore_repository(
     metadata: dict,
     admin_database: str | None = None,
     repair_derived: bool = False,
+    object_store: str | None = None,
+    s3_region: str | None = None,
+    s3_expected_bucket_owner: str | None = None,
 ) -> Path:
     from object_store_fs import FilesystemObjectStore
     from object_store import Create, validate_key
+    from object_store_s3 import S3ObjectStore, S3ObjectStoreConfig, parse_s3_uri
     from repository import Repository
     from materialization import ensure_canonical_materialized, ensure_intake_materialized, ensure_view_materialized
+    from wal import canonical_json
 
     if new_root.exists() and any(new_root.iterdir()):
         raise ForgeError(f"restore target is not empty: {new_root}")
@@ -2925,8 +2971,63 @@ def _restore_repository(
         config = json.loads(config_body)
     except json.JSONDecodeError as error:
         raise ForgeError("WAL backup configuration is malformed", "integrity") from error
+    if not isinstance(config, dict) or not {
+        "repository_id", "canonical_branch", "object_store"
+    }.issubset(config):
+        raise ForgeError("WAL backup configuration has an invalid shape", "integrity")
+    if config.get("repository_config_version") not in {None, 2}:
+        raise ForgeError("WAL backup configuration version is unsupported", "integrity")
+    if not isinstance(config.get("canonical_branch"), str) or not config["canonical_branch"]:
+        raise ForgeError("WAL backup configuration has an invalid branch", "integrity")
+    if not isinstance(config.get("object_store"), dict):
+        raise ForgeError("WAL backup configuration has an invalid object store", "integrity")
+    if canonical_json(config) != config_body:
+        raise ForgeError("WAL backup configuration is not canonical JSON", "integrity")
     if config.get("repository_id") != manifest.get("repository_id"):
         raise ForgeError("WAL backup repository ID is inconsistent", "integrity")
+    source_kind = config.get("object_store", {}).get("kind")
+    if source_kind not in {"filesystem", "s3"}:
+        raise ForgeError("WAL backup source object store is invalid", "integrity")
+    source_store = config["object_store"]
+    if config.get("repository_config_version") is None:
+        if (
+            source_kind != "filesystem"
+            or set(config) != {"repository_id", "canonical_branch", "object_store"}
+            or set(source_store) != {"kind", "path"}
+            or not isinstance(source_store.get("path"), str)
+            or not source_store.get("path")
+        ):
+            raise ForgeError("WAL backup configuration has an invalid shape", "integrity")
+    elif config.get("repository_config_version") == 2:
+        if set(config) != {
+            "canonical_branch", "object_store", "repository_config_version", "repository_id"
+        }:
+            raise ForgeError("WAL backup configuration has an invalid shape", "integrity")
+        if source_kind == "filesystem":
+            if (
+                set(source_store) != {"kind", "path"}
+                or not isinstance(source_store.get("path"), str)
+                or not source_store.get("path")
+            ):
+                raise ForgeError("WAL backup configuration has an invalid object store", "integrity")
+        else:
+            if set(source_store) != {
+                "bucket", "expected_bucket_owner", "kind", "prefix", "region",
+                "server_side_encryption",
+            }:
+                raise ForgeError("WAL backup configuration has an invalid object store", "integrity")
+            try:
+                S3ObjectStoreConfig(
+                    bucket=source_store["bucket"],
+                    expected_bucket_owner=source_store["expected_bucket_owner"],
+                    region=source_store["region"],
+                    prefix=source_store["prefix"],
+                    server_side_encryption=source_store["server_side_encryption"],
+                )
+            except (KeyError, TypeError, ValueError) as error:
+                raise ForgeError("WAL backup configuration has an invalid object store", "integrity") from error
+    if manifest.get("backup_format_version") == 3 and manifest.get("source_object_store_kind") != source_kind:
+        raise ForgeError("WAL backup source object store is inconsistent", "integrity")
     if is_legacy:
         if "backend-kind.json" in artifacts:
             kind_body = _read_backup_file(backup, "backend-kind.json", artifacts["backend-kind.json"])
@@ -2965,6 +3066,55 @@ def _restore_repository(
         if hashlib.sha256(body).hexdigest() != entry.get("sha256"):
             raise ForgeError("WAL backup object hash differs", "integrity")
     _reject_unlisted_object_files(backup_objects, object_entries)
+    target_s3_config = None
+    if object_store is None:
+        if s3_region is not None or s3_expected_bucket_owner is not None:
+            raise ForgeError("S3 options require an explicit S3 object store")
+        target_object_store_path = new_root / "object-store"
+    elif object_store.startswith("s3://"):
+        if not s3_region or not s3_expected_bucket_owner:
+            raise ForgeError("S3 region and expected bucket owner are required")
+        try:
+            target_s3_config = parse_s3_uri(
+                object_store,
+                region=s3_region,
+                expected_bucket_owner=s3_expected_bucket_owner,
+            )
+        except ValueError as error:
+            raise ForgeError(str(error)) from error
+        target_object_store_path = None
+    else:
+        if s3_region is not None or s3_expected_bucket_owner is not None:
+            raise ForgeError("S3 options are invalid for filesystem storage")
+        if object_store == "filesystem":
+            target_object_store_path = new_root / "object-store"
+        elif object_store.startswith("filesystem:") and object_store[len("filesystem:") :]:
+            raw = object_store[len("filesystem:") :]
+            candidate = Path(raw)
+            if not candidate.is_absolute():
+                if (
+                    not raw.isascii()
+                    or "\\" in raw
+                    or "\x00" in raw
+                    or any(part in {"", ".", ".."} for part in raw.split("/"))
+                ):
+                    raise ForgeError("object store path has an unsafe component")
+            target_object_store_path = candidate if candidate.is_absolute() else new_root / candidate
+        else:
+            raise ForgeError("object store must be filesystem, filesystem:PATH, or an s3:// URI")
+    target_store = None
+    if target_s3_config is not None:
+        try:
+            target_store = S3ObjectStore.from_config(target_s3_config)
+            target_store.verify_bucket()
+            if target_store.head(f"repos/{config['repository_id']}/manifest.json") is not None:
+                raise ForgeError("restore target manifest already exists", "conflict")
+            if target_store.list_prefix(f"repos/{config['repository_id']}/"):
+                raise ForgeError("restore target S3 prefix is not unused", "conflict")
+        except ForgeError:
+            raise
+        except ObjectStoreError as error:
+            raise ForgeError("object storage is unavailable", "storage") from error
     tables_dir = backup / "tables"
     if target_kind == "sqlite":
         if is_legacy:
@@ -3037,7 +3187,8 @@ def _restore_repository(
             new_root,
             config["repository_id"],
             config["canonical_branch"],
-            new_root / "object-store",
+            target_object_store_path,
+            s3_config=target_s3_config,
         )
         # Spec 013: raw tokens.json is never restored. Legacy backups may
         # still ship the file; verify it when listed, then drop it so the
@@ -3045,14 +3196,19 @@ def _restore_repository(
         # live in the database).
         if "tokens.json" in artifacts:
             _read_backup_file(backup, "tokens.json", artifacts["tokens.json"])
-        object_root = new_root / "object-store"
-        filesystem = FilesystemObjectStore(object_root)
-        for entry in object_entries:
+        if target_store is None:
+            assert target_object_store_path is not None
+            target_store = FilesystemObjectStore(target_object_store_path)
+        ordered_entries = sorted(object_entries, key=lambda entry: entry["key"] == "manifest.json")
+        for entry in ordered_entries:
             key = entry["key"]
             body = _read_backup_object(backup_objects, key, entry.get("size"))
             if hashlib.sha256(body).hexdigest() != entry.get("sha256"):
                 raise ForgeError("WAL backup object hash differs", "integrity")
-            filesystem.put(f"repos/{config['repository_id']}/{key}", body, mode=Create())
+            try:
+                target_store.put(f"repos/{config['repository_id']}/{key}", body, mode=Create())
+            except ObjectStoreError as error:
+                raise ForgeError("object storage is unavailable", "storage") from error
         if target_kind == "sqlite":
             write_backend_record(new_root, record)
             try:
@@ -3066,7 +3222,7 @@ def _restore_repository(
             backend = _PostgresBackend(record["dsn"], new_root, pooled=False)
             backend.restore(tables_dir)
             write_backend_record(new_root, record)
-        repository = Repository.open(new_root)
+        repository = Repository.open(new_root, store=target_store)
         loaded, _version, replay = repository.load()
         if loaded.head_seq != manifest.get("head_seq"):
             raise ForgeError("WAL backup manifest head differs", "integrity")

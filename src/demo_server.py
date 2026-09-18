@@ -205,6 +205,11 @@ def create_app(root: Path) -> Flask:
 
     app.config["ADMIT"] = admit
     app.config["RELEASE_ADMISSION"] = release_admission
+    # Online password guessing / scrypt CPU-DoS guard for the demo login.
+    # The demo has no lockout; bound attempts per IP in a sliding window.
+    # This is not a substitute for TLS + external rate limiting if exposed.
+    app.config["LOGIN_ATTEMPTS"] = {}
+    app.config["LOGIN_LOCK"] = threading.Lock()
     # Pagination cursors are HMAC'd with an ephemeral server-side key: a
     # process restart invalidates them, and no client ever sees the key.
     app.config["CURSOR_SECRET"] = secrets.token_hex(32)
@@ -213,6 +218,8 @@ def create_app(root: Path) -> Flask:
     def _apply_security_headers(response):
         for key, value in SECURITY_HEADERS.items():
             response.headers.setdefault(key, value)
+        if request.path.startswith("/api/"):
+            response.headers.setdefault("Cache-Control", "no-store")
         return response
 
     @app.errorhandler(HttpError)
@@ -331,6 +338,101 @@ def create_app(root: Path) -> Flask:
                 "restrictions": _api.capability_map_object(descriptor["restrictions"]),
             },
         }
+
+    @app.route("/api/v1/login", methods=["POST"])
+    def api_login():
+        """Exchange an account password for a short-lived, scoped bearer token."""
+        import accounts
+        from http_server import add_token
+        from repository import Repository
+
+        # Bound scrypt work per IP: 20 attempts per 60s sliding window.
+        client_ip = request.remote_addr or ""
+        now = time.monotonic()
+        with app.config["LOGIN_LOCK"]:
+            attempts = app.config["LOGIN_ATTEMPTS"].get(client_ip, [])
+            attempts = [at for at in attempts if now - at < 60.0]
+            if len(attempts) >= 20:
+                app.config["LOGIN_ATTEMPTS"][client_ip] = attempts
+                response = make_response(jsonify({"error": "throttled"}), 429)
+                response.headers["Cache-Control"] = "no-store"
+                return response
+            attempts.append(now)
+            app.config["LOGIN_ATTEMPTS"][client_ip] = attempts
+        try:
+            raw_body = request.get_data(cache=False)
+        except RequestEntityTooLarge:
+            return jsonify({"error": "bad-request"}), 400
+        if len(raw_body) > 4096:
+            return jsonify({"error": "bad-request"}), 400
+        try:
+            payload = json.loads(raw_body.decode("utf-8")) if raw_body else None
+        except (UnicodeDecodeError, ValueError):
+            return jsonify({"error": "bad-request"}), 400
+        if not isinstance(payload, dict) or set(payload) not in (
+            {"username", "password"},
+            {"username", "password", "view_id"},
+        ):
+            return jsonify({"error": "bad-request"}), 400
+        username = payload.get("username")
+        password = payload.get("password")
+        requested_view = payload.get("view_id")
+        if (
+            not isinstance(username, str)
+            or not isinstance(password, str)
+            or (requested_view is not None and not isinstance(requested_view, str))
+        ):
+            return jsonify({"error": "bad-request"}), 400
+        if not accounts.verify_password(_forge_root(app), username, password):
+            response = make_response(jsonify({"error": "invalid-credentials"}), 401)
+            response.headers["Cache-Control"] = "no-store"
+            return response
+        try:
+            _manifest, _version, replay = Repository.open(_forge_root(app)).load()
+        except ForgeError:
+            return jsonify({"error": "service-unavailable"}), 503
+        views = sorted(
+            view_id
+            for view_id, active in replay.active_views.items()
+            if active["principal_id"] == username
+        )
+        if not views:
+            return jsonify({"error": "no-repositories"}), 403
+        if requested_view is None and len(views) > 1:
+            response = make_response(
+                jsonify({"error": "view-required", "view_ids": views}), 409
+            )
+            response.headers["Cache-Control"] = "no-store"
+            return response
+        selected = requested_view or views[0]
+        if selected not in views:
+            return jsonify({"error": "forbidden"}), 403
+        try:
+            credential = add_token(
+                _forge_root(app), selected, scopes=["ui"], expires_in="12h"
+            )
+            envelope = _api_session_envelope(selected)
+        except ForgeError:
+            return jsonify({"error": "service-unavailable"}), 503
+        response = make_response(
+            jsonify({"access_token": credential, "session": envelope}), 200
+        )
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.route("/api/v1/logout", methods=["POST"])
+    def api_logout():
+        from http_server import revoke_token
+
+        record, _view = _api_auth()
+        # Account sessions are UI-only. Operator-issued Git/UI credentials
+        # may also sign in through the compatibility form and must not be
+        # destroyed merely by closing the browser workspace.
+        if set(record.get("scopes", [])) == {"ui"}:
+            revoke_token(_forge_root(app), record["token_id"])
+        response = make_response(jsonify({"signed_out": True}), 200)
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
     @app.route("/api/v1/session", methods=["GET"])
     def api_session():
@@ -533,6 +635,100 @@ def create_app(root: Path) -> Flask:
             ),
         }
         response = make_response(jsonify(body), 200)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    def _require_repository_owner(view: str) -> tuple[dict, dict]:
+        view_state, descriptor = _active_descriptor(_forge_root(app), view)
+        if not capability_allowed(
+            descriptor["capabilities"]["admin"],
+            descriptor["restrictions"]["admin"],
+            b"",
+        ):
+            response = make_response(jsonify({"error": "forbidden"}), 403)
+            response.headers["Cache-Control"] = "no-store"
+            abort(response)
+        return view_state, descriptor
+
+    @app.route("/api/v1/permissions", methods=["GET"])
+    def api_permissions():
+        import api_v1 as _api
+        from repository import Repository
+        from service import managed_private_paths
+
+        _record, view = _api_auth()
+        actor, _descriptor = _require_repository_owner(view)
+        try:
+            _manifest, _version, replay = Repository.open(_forge_root(app)).load()
+            state = load_state_sections(
+                _forge_root(app), ["roles", "role_bindings"]
+            )
+            targets = []
+            for view_id, active in sorted(replay.active_views.items()):
+                if active["principal_id"] == actor["principal_id"]:
+                    continue
+                targets.append(
+                    {
+                        "view_id": view_id,
+                        "principal_id": active["principal_id"],
+                        "private_paths": [
+                            _api.prefix_object(path)
+                            for path in managed_private_paths(
+                                state, active["principal_id"]
+                            )
+                        ],
+                    }
+                )
+        except ForgeError:
+            return jsonify({"error": "service-unavailable"}), 503
+        response = make_response(jsonify({"targets": targets}), 200)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.route("/api/v1/permissions", methods=["POST"])
+    def api_update_permissions():
+        import api_v1 as _api
+        from service import set_path_privacy
+
+        _record, view = _api_auth()
+        _require_repository_owner(view)
+        try:
+            raw_body = request.get_data(cache=False)
+        except RequestEntityTooLarge:
+            return jsonify({"error": "bad-request"}), 400
+        if len(raw_body) > _api.MAX_JSON_BODY_BYTES:
+            return jsonify({"error": "bad-request"}), 400
+        try:
+            payload = json.loads(raw_body.decode("utf-8")) if raw_body else None
+        except (UnicodeDecodeError, ValueError):
+            return jsonify({"error": "bad-request"}), 400
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"view_id", "path_b64", "private"}
+            or not isinstance(payload.get("view_id"), str)
+            or not isinstance(payload.get("path_b64"), str)
+            or not isinstance(payload.get("private"), bool)
+        ):
+            return jsonify({"error": "bad-request"}), 400
+        try:
+            raw_path = _api.b64decode_field(payload["path_b64"])
+            normalized = _api.normalize_api_path(raw_path)
+            paths = set_path_privacy(
+                _forge_root(app), view, payload["view_id"], normalized, payload["private"]
+            )
+        except ForgeError:
+            response = make_response(jsonify({"error": "bad-request"}), 400)
+            response.headers["Cache-Control"] = "no-store"
+            return response
+        response = make_response(
+            jsonify(
+                {
+                    "view_id": payload["view_id"],
+                    "private_paths": [_api.prefix_object(path) for path in paths],
+                }
+            ),
+            200,
+        )
         response.headers["Cache-Control"] = "no-store"
         return response
 

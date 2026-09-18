@@ -12,6 +12,7 @@ from pathlib import Path
 from errors import ForgeError
 from git import git, run
 from object_store import AmbiguousWrite, Create, ObjectNotFound, PreconditionFailed
+from object_store_s3 import MAX_OBJECT_SIZE
 from wal import _pack_ref, sha256
 
 
@@ -75,6 +76,8 @@ def _build(repo: Path, revisions: bytes, env: dict[str, str] | None) -> BuiltPac
         idx_path = directory / f"pack-{produced}.idx"
         if not idx_path.is_file():
             raise ForgeError("git index-pack did not create an index", "integrity")
+        if pack_path.stat().st_size > MAX_OBJECT_SIZE or idx_path.stat().st_size > MAX_OBJECT_SIZE:
+            raise ForgeError("immutable pack exceeds the qualified object size limit", "integrity")
         pack_bytes = pack_path.read_bytes()
         idx_bytes = idx_path.read_bytes()
         if len(pack_bytes) < 20 or pack_bytes[-20:].hex() != produced:

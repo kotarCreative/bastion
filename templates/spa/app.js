@@ -18,6 +18,10 @@
     identity: document.getElementById("identity"),
     logout: document.getElementById("logout"),
     login: document.getElementById("login"),
+    accountLoginForm: document.getElementById("account-login-form"),
+    usernameInput: document.getElementById("username"),
+    passwordInput: document.getElementById("password"),
+    viewInput: document.getElementById("login-view"),
     loginForm: document.getElementById("login-form"),
     tokenInput: document.getElementById("token"),
     loginError: document.getElementById("login-error"),
@@ -72,7 +76,7 @@
   }
 
   function showPanel(name) {
-    var panels = ["summary", "decision", "tree", "history", "clone"];
+    var panels = ["summary", "decision", "tree", "history", "permissions", "clone"];
     panels.forEach(function (panel) {
       document.getElementById("panel-" + panel).hidden = panel !== name;
       var tab = document.getElementById("tab-" + panel);
@@ -84,7 +88,11 @@
     credential = null;
     session = null;
     ELEMENTS.tokenInput.value = "";
+    ELEMENTS.passwordInput.value = "";
+    ELEMENTS.usernameInput.value = "";
     ELEMENTS.login.hidden = false;
+    document.getElementById("homepage").hidden = false;
+    document.getElementById("home-nav").hidden = false;
     ELEMENTS.workspace.hidden = true;
     ELEMENTS.identity.hidden = true;
     ELEMENTS.identity.textContent = "";
@@ -93,7 +101,9 @@
     clearChildren(document.getElementById("panel-decision"));
     clearChildren(document.getElementById("panel-tree"));
     clearChildren(document.getElementById("panel-history"));
+    clearChildren(document.getElementById("panel-permissions"));
     clearChildren(document.getElementById("panel-clone"));
+    document.getElementById("tab-permissions").hidden = true;
   }
 
   function prefixList(prefixes) {
@@ -357,6 +367,165 @@
       + "the same host use different credentials; useHttpPath keeps them apart."));
   }
 
+  function encodePath(text) {
+    var raw = new TextEncoder().encode(text);
+    var binary = "";
+    raw.forEach(function (byte) {
+      binary += String.fromCharCode(byte);
+    });
+    return btoa(binary).replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_");
+  }
+
+  function renderPermissions(initialBody) {
+    var panel = document.getElementById("panel-permissions");
+    clearChildren(panel);
+    panel.appendChild(element("h2", null, "Repository permissions"));
+    panel.appendChild(element("p", "hint",
+      "Choose a collaborator and a repository-relative file or folder. Private paths "
+      + "are removed from that collaborator's next projected repository epoch."));
+    var content = element("div");
+    panel.appendChild(content);
+
+    function populate(body) {
+      if (body.targets.length === 0) {
+        content.appendChild(element("p", "hint", "This repository has no other collaborators."));
+        return;
+      }
+      var form = element("form");
+      var targetLabel = element("label", null, "Collaborator view");
+      var target = element("select");
+      target.id = "permission-target";
+      targetLabel.setAttribute("for", target.id);
+      body.targets.forEach(function (item) {
+        var option = element("option", null,
+          item.principal_id + " / " + item.view_id);
+        option.value = item.view_id;
+        target.appendChild(option);
+      });
+      var pathLabel = element("label", null, "File or folder path");
+      var path = element("input");
+      path.id = "permission-path";
+      path.type = "text";
+      path.placeholder = "docs/private or secrets.txt";
+      path.required = true;
+      pathLabel.setAttribute("for", path.id);
+      var actionLabel = element("label", null, "Visibility");
+      var action = element("select");
+      action.id = "permission-action";
+      actionLabel.setAttribute("for", action.id);
+      var makePrivate = element("option", null, "Private for this collaborator");
+      makePrivate.value = "private";
+      action.appendChild(makePrivate);
+      var makeVisible = element("option", null, "Restore inherited visibility");
+      makeVisible.value = "visible";
+      action.appendChild(makeVisible);
+      var submit = element("button", null, "Update permissions");
+      submit.type = "submit";
+      var outcome = element("p");
+      var current = element("div");
+
+      function showCurrent() {
+        clearChildren(current);
+        var selected = body.targets.filter(function (item) {
+          return item.view_id === target.value;
+        })[0];
+        current.appendChild(element("h3", null, "Private paths"));
+        if (!selected || selected.private_paths.length === 0) {
+          current.appendChild(element("p", "hint", "No UI-managed private paths."));
+          return;
+        }
+        current.appendChild(prefixList(selected.private_paths));
+      }
+
+      target.addEventListener("change", showCurrent);
+      form.addEventListener("submit", function (event) {
+        event.preventDefault();
+        outcome.className = "hint";
+        var trimmed = path.value.replace(/^\/+|\/+$/g, "");
+        if (!trimmed) {
+          outcome.className = "error";
+          outcome.textContent = "Enter a file or folder path (the repository root cannot be made private).";
+          return;
+        }
+        outcome.textContent = "Applying permission change…";
+        request("/api/v1/permissions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            view_id: target.value,
+            path_b64: encodePath(trimmed),
+            private: action.value === "private",
+          }),
+        }).then(function (update) {
+          if (update.status !== 200) {
+            outcome.className = "error";
+            outcome.textContent = update.status === 403
+              ? "You no longer have permission to manage this repository."
+              : "The permission change could not be applied. Check the path and try again.";
+            return;
+          }
+          outcome.className = "ok";
+          outcome.textContent = "Permissions updated.";
+          renderPermissions();
+        }).catch(function () {
+          outcome.className = "error";
+          outcome.textContent = "The permission change could not be applied.";
+        });
+      });
+      form.appendChild(targetLabel);
+      form.appendChild(target);
+      form.appendChild(pathLabel);
+      form.appendChild(path);
+      form.appendChild(actionLabel);
+      form.appendChild(action);
+      form.appendChild(submit);
+      form.appendChild(outcome);
+      content.appendChild(form);
+      content.appendChild(current);
+      showCurrent();
+    }
+
+    if (initialBody) {
+      populate(initialBody);
+    } else {
+      request("/api/v1/permissions").then(function (result) {
+        if (result.status !== 200) {
+          content.appendChild(element("p", "error", "Permissions are unavailable."));
+          return;
+        }
+        populate(result.body);
+      }).catch(function () {
+        content.appendChild(element("p", "error", "Permissions are unavailable."));
+      });
+    }
+  }
+
+  function openSession(token, envelope) {
+    credential = token;
+    session = envelope;
+    ELEMENTS.loginError.hidden = true;
+    ELEMENTS.login.hidden = true;
+    document.getElementById("homepage").hidden = true;
+    document.getElementById("home-nav").hidden = true;
+    ELEMENTS.workspace.hidden = false;
+    ELEMENTS.identity.hidden = false;
+    ELEMENTS.identity.textContent = session.principal.id + " / " + session.view_id;
+    ELEMENTS.logout.hidden = false;
+    document.getElementById("tab-permissions").hidden = true;
+    renderSummary();
+    renderDecision();
+    renderTree();
+    renderHistory();
+    request("/api/v1/permissions").then(function (result) {
+      if (result.status === 200) {
+        document.getElementById("tab-permissions").hidden = false;
+        renderPermissions(result.body);
+      }
+    });
+    renderClone();
+    showPanel("summary");
+  }
+
   function authenticate(token) {
     request("/api/v1/session", { headers: { Authorization: "Bearer " + token } })
       .then(function (result) {
@@ -367,20 +536,7 @@
             result.status === 403 ? "This token cannot open the demo interface." : "Sign-in failed.";
           return;
         }
-        credential = token;
-        session = result.body;
-        ELEMENTS.loginError.hidden = true;
-        ELEMENTS.login.hidden = true;
-        ELEMENTS.workspace.hidden = false;
-        ELEMENTS.identity.hidden = false;
-        ELEMENTS.identity.textContent = session.principal.id + " / " + session.view_id;
-        ELEMENTS.logout.hidden = false;
-        renderSummary();
-        renderDecision();
-        renderTree();
-        renderHistory();
-        renderClone();
-        showPanel("summary");
+        openSession(token, result.body);
       })
       .catch(function (error) {
         ELEMENTS.tokenInput.value = "";
@@ -403,7 +559,41 @@
     authenticate(token);
   });
 
-  ELEMENTS.logout.addEventListener("click", signOut);
+  ELEMENTS.accountLoginForm.addEventListener("submit", function (event) {
+    event.preventDefault();
+    var username = ELEMENTS.usernameInput.value.trim();
+    var password = ELEMENTS.passwordInput.value;
+    var view = ELEMENTS.viewInput.value.trim();
+    ELEMENTS.passwordInput.value = "";
+    ELEMENTS.loginError.hidden = true;
+    var payload = { username: username, password: password };
+    if (view) {
+      payload.view_id = view;
+    }
+    request("/api/v1/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      optionalAuth: true,
+    }).then(function (result) {
+      if (result.status !== 200) {
+        ELEMENTS.loginError.hidden = false;
+        ELEMENTS.loginError.textContent = result.status === 409
+          ? "This account has multiple repository views. Enter one and sign in again."
+          : "Username or password is incorrect.";
+        return;
+      }
+      openSession(result.body.access_token, result.body.session);
+    }).catch(function () {
+      ELEMENTS.loginError.hidden = false;
+      ELEMENTS.loginError.textContent = "Sign-in failed.";
+    });
+  });
+
+  ELEMENTS.logout.addEventListener("click", function () {
+    request("/api/v1/logout", { method: "POST", optionalAuth: true })
+      .then(signOut, signOut);
+  });
 
   document.querySelectorAll(".tab").forEach(function (tab) {
     tab.addEventListener("click", function () {

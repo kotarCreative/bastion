@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import copy
+import hashlib
+import json
 import os
 import re
 import shutil
@@ -21,13 +24,16 @@ from materialization import (
     ensure_view_materialized,
 )
 from repository import AlreadyCommitted, Candidate, Repository, write_repository_config
+from object_store_s3 import S3ObjectStore, parse_s3_uri
+from object_store import ObjectStoreError
 from state import (
+    audit_event,
     is_ancestor,
     load_state,
     locked,
     save_state,
 )
-from validation import capability_allowed, validate_view_name
+from validation import capability_allowed, normalize_prefix, validate_view_name
 from validation import parse_change_id
 from wal import event_id, record_fingerprint
 
@@ -37,7 +43,16 @@ def _object_store_path(root: Path, value: str) -> Path:
         return root / "object-store"
     if not value.startswith("filesystem:") or not value[len("filesystem:") :]:
         raise ForgeError("object store must be filesystem or filesystem:PATH")
-    path = Path(value[len("filesystem:") :])
+    raw = value[len("filesystem:") :]
+    path = Path(raw)
+    if not path.is_absolute():
+        if (
+            not raw.isascii()
+            or "\\" in raw
+            or "\x00" in raw
+            or any(part in {"", ".", ".."} for part in raw.split("/"))
+        ):
+            raise ForgeError("object store path has an unsafe component")
     return path if path.is_absolute() else root / path
 
 
@@ -49,6 +64,8 @@ def init_forge(
     object_store: str = "filesystem",
     *,
     admin_database: str | None = None,
+    s3_region: str | None = None,
+    s3_expected_bucket_owner: str | None = None,
 ) -> None:
     if run("git", "check-ref-format", "--branch", branch, check=False).returncode:
         raise ForgeError(f"invalid branch name: {branch}")
@@ -96,12 +113,42 @@ def init_forge(
     persisted_branch = state.get("canonical_branch")
     if persisted_branch not in {None, branch}:
         raise ForgeError("initialization branch differs from the persisted branch")
-    object_store_path = _object_store_path(root, object_store)
+    requested_object_store = object_store
+    if requested_object_store == "filesystem":
+        requested_object_store = os.environ.get("BASTION_OBJECT_STORE", requested_object_store)
+    resolved_region = s3_region or os.environ.get("BASTION_S3_REGION")
+    resolved_owner = s3_expected_bucket_owner or os.environ.get("BASTION_S3_EXPECTED_BUCKET_OWNER")
+    s3_config = None
+    object_store_path = None
+    if requested_object_store.startswith("s3://"):
+        if not resolved_region or not resolved_owner:
+            raise ForgeError("S3 region and expected bucket owner are required")
+        try:
+            s3_config = parse_s3_uri(
+                requested_object_store,
+                region=resolved_region,
+                expected_bucket_owner=resolved_owner,
+            )
+        except ValueError as error:
+            raise ForgeError(str(error)) from error
+    else:
+        if s3_region is not None or s3_expected_bucket_owner is not None:
+            raise ForgeError("S3 options are invalid for filesystem storage")
+        object_store_path = _object_store_path(root, requested_object_store)
     if (root / "repository.json").exists():
-        repository_id = Repository.open(root).repository_id
+        try:
+            repository_id = Repository.open(root).repository_id
+        except ObjectStoreError as error:
+            raise ForgeError("object storage is unavailable", "storage") from error
     else:
         repository_id = state.get("repository_id") or uuid.uuid4().hex
-    write_repository_config(root, repository_id, branch, object_store_path)
+    write_repository_config(
+        root,
+        repository_id,
+        branch,
+        object_store_path,
+        s3_config=s3_config,
+    )
     state.update(
         {
             "canonical_branch": branch,
@@ -116,7 +163,15 @@ def init_forge(
     ):
         state.setdefault(section, {})
     save_state(root, state)
-    repository = Repository.open(root)
+    try:
+        repository = Repository.open(root)
+    except ObjectStoreError as error:
+        raise ForgeError("object storage is unavailable", "storage") from error
+    if isinstance(repository.store, S3ObjectStore):
+        try:
+            repository.store.verify_bucket()
+        except ObjectStoreError as error:
+            raise ForgeError("object storage is unavailable", "storage") from error
     bootstrap = root / "materializations" / "bootstrap-source.git"
     canonical_ref = f"refs/heads/{branch}"
     try:
@@ -504,3 +559,202 @@ def transition_principal(root: Path, principal_id: str) -> None:
         if view["principal_id"] == principal_id:
             materialized = ensure_view_materialized(root, name, manifest, replay, repository)
             ensure_intake_materialized(root, materialized, manifest)
+
+
+def _privacy_role_prefix(principal_id: str) -> str:
+    principal_hash = hashlib.sha256(principal_id.encode()).hexdigest()[:12]
+    return f"privacy-{principal_hash}-"
+
+
+def managed_private_paths(state: dict, principal_id: str) -> list[str]:
+    """Return paths hidden by the UI-managed direct role for a principal."""
+    prefix = _privacy_role_prefix(principal_id)
+    result: set[str] = set()
+    for binding in state.get("role_bindings", {}).values():
+        if (
+            binding.get("subject_kind") != "principal"
+            or binding.get("subject_id") != principal_id
+            or not str(binding.get("role_id", "")).startswith(prefix)
+        ):
+            continue
+        role = state.get("roles", {}).get(binding["role_id"])
+        if role is None:
+            raise ForgeError("privacy binding references an unknown role", "integrity")
+        result.update(role.get("managed_private_paths", role["deny"]["read"]))
+    return sorted(result)
+
+
+def _replace_privacy_role(state: dict, principal_id: str, paths: list[str]) -> None:
+    prefix = _privacy_role_prefix(principal_id)
+    bindings = state["role_bindings"]
+    removed_role_ids: set[str] = set()
+    for binding_id, binding in list(bindings.items()):
+        if (
+            binding.get("subject_kind") == "principal"
+            and binding.get("subject_id") == principal_id
+            and str(binding.get("role_id", "")).startswith(prefix)
+        ):
+            removed_role_ids.add(str(binding.get("role_id", "")))
+            del bindings[binding_id]
+    # Drop superseded privacy roles that are no longer referenced, so
+    # repeated edits do not accumulate orphans in state["roles"].
+    if removed_role_ids:
+        still_referenced = {
+            str(binding.get("role_id", "")) for binding in bindings.values()
+        }
+        for role_id in removed_role_ids:
+            if role_id not in still_referenced:
+                state.get("roles", {}).pop(role_id, None)
+    if not paths:
+        return
+    encoded = json.dumps(paths, separators=(",", ":"), ensure_ascii=True).encode()
+    role_id = prefix + hashlib.sha256(encoded).hexdigest()[:32]
+    if role_id not in state["roles"]:
+        allow = identity.empty_capability_map()
+        deny = identity.empty_capability_map()
+        # Equal-specificity denial wins. Mirroring the path in allow keeps this
+        # a valid role while ensuring it can never expand the target's access.
+        allow["read"] = list(paths)
+        deny["read"] = list(paths)
+        identity.add_role(state, role_id, allow, deny)
+        state["roles"][role_id]["managed_private_paths"] = list(paths)
+    identity.bind_role(state, role_id, "principal", principal_id)
+
+
+def set_path_privacy(
+    root: Path,
+    actor_view_id: str,
+    target_view_id: str,
+    path: str,
+    private: bool,
+) -> list[str]:
+    """Apply one owner-authorized visibility edit and transition target views.
+
+    A root-admin descriptor is the repository ownership proof. The catalog
+    edit is rolled back if the WAL authorization fence rejects publication,
+    so an authorization race cannot leave a dormant unauthorized policy.
+    """
+    if not isinstance(private, bool):
+        raise ForgeError("private must be a boolean")
+    normalized = normalize_prefix(path)
+    if not normalized:
+        raise ForgeError("repository path must be a file or folder")
+    repository = Repository.open(root)
+    materialize: list[str] = []
+    with locked(root) as state:
+        manifest, _version, replay = repository.load()
+        actor = replay.active_views.get(actor_view_id)
+        target = replay.active_views.get(target_view_id)
+        if actor is None or target is None:
+            raise ForgeError("unknown view")
+        if actor["principal_id"] == target["principal_id"]:
+            raise ForgeError("owners cannot hide repository paths from themselves")
+        actor_descriptor = repository._descriptor(actor["descriptor_id"])
+        if not capability_allowed(
+            actor_descriptor["capabilities"]["admin"],
+            actor_descriptor["restrictions"]["admin"],
+            b"",
+        ):
+            raise ForgeError("repository owner permission is required", "policy")
+
+        canonical = ensure_canonical_materialized(root, manifest, repository)
+        treeish = f"{manifest.canonical_tip}:{normalized}"
+        if git(canonical, "cat-file", "-e", treeish, check=False).returncode:
+            raise ForgeError("repository path does not exist")
+
+        principal_id = target["principal_id"]
+        paths = set(managed_private_paths(state, principal_id))
+        if private:
+            paths.add(normalized)
+        else:
+            paths.discard(normalized)
+        desired_paths = sorted(paths)
+        if desired_paths == managed_private_paths(state, principal_id):
+            return desired_paths
+
+        old_roles = copy.deepcopy(state["roles"])
+        old_bindings = copy.deepcopy(state["role_bindings"])
+        old_descriptor_ids = set(state["view_descriptors"])
+        _replace_privacy_role(state, principal_id, desired_paths)
+        fresh = identity.effective_descriptor(
+            state, principal_id, f"refs/heads/{state['canonical_branch']}"
+        )
+        save_state(root, state)
+        actor_descriptor_id = actor["descriptor_id"]
+
+        def build(current_manifest, current_replay):
+            current_actor = current_replay.active_views.get(actor_view_id)
+            active = sorted(
+                (view_id, view)
+                for view_id, view in current_replay.active_views.items()
+                if view["principal_id"] == principal_id
+            )
+            if (
+                current_actor is None
+                or current_actor["principal_id"] != actor["principal_id"]
+                or current_actor["descriptor_id"] != actor_descriptor_id
+            ):
+                raise ForgeError("repository ownership changed during permission update", "conflict")
+            if current_manifest.canonical_tip != manifest.canonical_tip:
+                raise ForgeError("repository changed during permission update", "conflict")
+            if not active:
+                raise ForgeError("target principal has no active views")
+            if all(view["descriptor_id"] == fresh["id"] for _name, view in active):
+                return AlreadyCommitted(current_manifest.head_seq)
+            payload = {
+                "principal_id": principal_id,
+                "canonical_frontier": current_manifest.canonical_tip,
+                "views": [
+                    {
+                        "view_id": name,
+                        "old_descriptor_id": view["descriptor_id"],
+                        "old_generation": view["descriptor_generation"],
+                        "old_projection_epoch": view["projection_epoch"],
+                        "new_descriptor_id": fresh["id"],
+                        "new_generation": view["descriptor_generation"] + 1,
+                        "new_projection_epoch": view["projection_epoch"] + 1,
+                    }
+                    for name, view in active
+                ],
+            }
+            return Candidate(
+                record_fingerprint(repository.repository_id, "policy_transition", payload),
+                payload,
+            )
+
+        try:
+            repository.put_descriptor(fresh)
+            repository.publish(build)
+        except ForgeError as error:
+            # Only definitive pre-publication policy/conflict failures are
+            # safe to roll back. A storage error can have an ambiguous commit
+            # outcome, in which case retaining the desired catalog is safer.
+            if error.category in {"policy", "conflict"}:
+                state["roles"] = old_roles
+                state["role_bindings"] = old_bindings
+                if fresh["id"] not in old_descriptor_ids:
+                    state["view_descriptors"].pop(fresh["id"], None)
+                save_state(root, state)
+            raise
+        manifest, _version, replay = repository.load()
+        from state import recover
+
+        recover(root, state, pinned=(manifest, _version, replay), repository=repository)
+        save_state(root, state)
+        audit_event(
+            root,
+            "permission.update",
+            f"{actor['principal_id']}/{principal_id}",
+            "private=" + str(private).lower()
+            + ";path_sha256=" + hashlib.sha256(os.fsencode(normalized)).hexdigest(),
+        )
+        materialize = [
+            name
+            for name, view in sorted(replay.active_views.items())
+            if view["principal_id"] == principal_id
+        ]
+
+    for name in materialize:
+        materialized = ensure_view_materialized(root, name, manifest, replay, repository)
+        ensure_intake_materialized(root, materialized, manifest)
+    return desired_paths

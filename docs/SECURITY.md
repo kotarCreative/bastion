@@ -56,7 +56,17 @@ with a stable message. Same-user local processes remain trusted operators of
 the filesystem itself; the enforced boundary is the network surface.
 
 Production must add TLS, real sshd integration calling a forge entry point,
-protected service storage, database authorization, and rate limiting.
+protected service storage, account recovery/MFA, database authorization, and
+login rate limiting.
+
+Browser accounts are attached only to `user` principals. The server stores
+only salted scrypt password digests (`N=16384`, `r=8`, `p=1`); the application
+never puts raw passwords in view descriptors, WAL records, responses, logs,
+cookies, URLs, or Web Storage.
+A successful login issues a random, digest-only bearer token scoped only to
+`ui` for 12 hours; logout revokes it. The browser retains the token only in
+page memory. Account authentication is still experimental and must be served
+behind TLS.
 
 ## Hard Invariants
 
@@ -115,6 +125,15 @@ global checker verify every historical decision without trusting the runtime.
 Catalog additions are dormant until a quiescent policy transition; revocation
 then applies to future projections and pushes, while data already projected or
 downloaded is explicitly non-revocable.
+
+The browser permission editor requires the authenticated view's active
+descriptor to grant root `admin`. It can only edit another active principal's
+visibility and only for a path that exists at the current canonical tip. The
+edit creates a new immutable managed role and publishes a policy transition
+for every active view of the target principal. Managed folder privacy mirrors
+every nested read grant as an equal-specificity denial, preserving privacy
+even when another role grants a narrower descendant. If the WAL ownership
+fence rejects publication, the catalog edit is rolled back before returning.
 
 ## Write Authorization
 

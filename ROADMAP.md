@@ -33,7 +33,8 @@ Bastion currently provides:
 
 ## Server Boundary
 
-- Add production HTTP identity, TLS, rate limiting, quotas, and streaming request handling.
+- Promote the experimental password login to production identity with TLS,
+  MFA/recovery, rate limiting, quotas, and full account lifecycle management.
 - Add a production SSH entry point.
 - Re-run hidden-object and thin-pack tests against both transports.
 - Add monitoring, tracing, alerting, and service-level objectives.

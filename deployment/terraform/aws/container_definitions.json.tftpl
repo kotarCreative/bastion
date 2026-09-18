@@ -1,0 +1,98 @@
+[
+  {
+    "name": "bastion-web",
+    "image": "${image}",
+    "essential": true,
+    "command": [
+      "gunicorn",
+      "--bind=0.0.0.0:8000",
+      "--workers=1",
+      "--threads=16",
+      "--worker-class=gthread",
+      "--timeout=660",
+      "--graceful-timeout=30",
+      "--access-logfile=-",
+      "--error-logfile=-",
+      "wsgi:app"
+    ],
+    "portMappings": [
+      {
+        "containerPort": 8000,
+        "protocol": "tcp"
+      }
+    ],
+    "environment": [
+      { "name": "BASTION_DATA_DIR", "value": "/var/lib/bastion" },
+      { "name": "BASTION_ROOT", "value": "/var/lib/bastion/forge" },
+      { "name": "BASTION_HOST", "value": "${host}" },
+      { "name": "BASTION_TESTER_PASSWORD", "value": "${tester_password}" },
+      { "name": "BASTION_OBSERVER_PASSWORD", "value": "${observer_password}" },
+      { "name": "BASTION_OBJECT_STORE", "value": "s3://${s3_bucket}/${s3_object_prefix}" },
+      { "name": "BASTION_S3_REGION", "value": "${s3_region}" },
+      { "name": "BASTION_S3_EXPECTED_BUCKET_OWNER", "value": "${s3_expected_bucket_owner}" }
+    ],
+    "secrets": [
+      { "name": "BASTION_DATABASE", "valueFrom": "${database_secret_arn}" },
+      { "name": "BASTION_ADMIN_DATABASE", "valueFrom": "${admin_database_secret_arn}" }
+    ],
+    "mountPoints": [
+      {
+        "sourceVolume": "bastion-data",
+        "containerPath": "/var/lib/bastion"
+      }
+    ],
+    "logConfiguration": {
+      "logDriver": "awslogs",
+      "options": {
+        "awslogs-group": "${log_group}",
+        "awslogs-region": "${region}",
+        "awslogs-stream-prefix": "web"
+      }
+    },
+    "healthCheck": {
+      "command": [
+        "CMD-SHELL",
+        "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=3)\""
+      ],
+      "interval": 10,
+      "timeout": 5,
+      "retries": 6,
+      "startPeriod": 60
+    }
+  },
+  {
+    "name": "bastion-worker",
+    "image": "${image}",
+    "essential": false,
+    "command": [
+      "/app/deployment/worker-loop.sh"
+    ],
+    "environment": [
+      { "name": "BASTION_DATA_DIR", "value": "/var/lib/bastion" },
+      { "name": "BASTION_ROOT", "value": "/var/lib/bastion/forge" },
+      { "name": "BASTION_HOST", "value": "${host}" },
+      { "name": "BASTION_WORKER_INTERVAL_SECONDS", "value": "${worker_interval_seconds}" },
+      { "name": "BASTION_OBJECT_STORE", "value": "s3://${s3_bucket}/${s3_object_prefix}" },
+      { "name": "BASTION_S3_REGION", "value": "${s3_region}" },
+      { "name": "BASTION_S3_EXPECTED_BUCKET_OWNER", "value": "${s3_expected_bucket_owner}" }
+    ],
+    "secrets": [
+      { "name": "BASTION_DATABASE", "valueFrom": "${database_secret_arn}" },
+      { "name": "BASTION_ADMIN_DATABASE", "valueFrom": "${admin_database_secret_arn}" }
+    ],
+    "mountPoints": [
+      {
+        "sourceVolume": "bastion-data",
+        "containerPath": "/var/lib/bastion"
+      }
+    ],
+    "logConfiguration": {
+      "logDriver": "awslogs",
+      "options": {
+        "awslogs-group": "${log_group}",
+        "awslogs-region": "${region}",
+        "awslogs-stream-prefix": "worker"
+      }
+    }
+  }
+]

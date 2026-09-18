@@ -54,6 +54,10 @@ class AmbiguousWrite(ObjectStoreError):
     """The write might have completed, but the caller cannot know."""
 
 
+class StorageFailure(ObjectStoreError):
+    """A definite storage failure that is not a repository precondition."""
+
+
 class ObjectStore(Protocol):
     def get(
         self,

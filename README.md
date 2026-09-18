@@ -28,7 +28,8 @@ restrictions:
   versioned, checksummed document rows guarded by lease-based sessions.
 
 This is a local architecture experiment, not a production security boundary.
-Authentication, network transports, and the wider forge surface remain
+The browser has password-backed user accounts and scoped in-memory sessions,
+but TLS, account recovery, and the wider production identity surface remain
 roadmap work.
 
 ## Documentation
@@ -99,6 +100,24 @@ BASTION_DEMO_SECRET=$(openssl rand -hex 32) .poetry/bin/poetry run python forge.
 Then open `http://127.0.0.1:8000/`, enter the token, and browse the effective
 permissions, evaluate path decisions, view the projected tree and visible
 history, and clone the same view with an unmodified Git client.
+
+For account sign-in, set a password on an existing user principal. Passwords
+are read interactively by default so they do not appear in shell history:
+
+```bash
+python3 forge.py set-password /tmp/bastion-forge alice
+python3 forge.py add-role /tmp/bastion-forge alice-owner --allow admin=
+python3 forge.py bind-role /tmp/bastion-forge alice-owner --principal alice
+python3 forge.py transition-principal /tmp/bastion-forge alice
+```
+
+An account whose active descriptor grants root `admin` capability is treated
+as a repository owner. Owners get a **Permissions** tab where they can make an
+existing file or folder private for another principal's view, or restore its
+inherited visibility. Each edit publishes a new immutable descriptor and
+projection epoch before the UI reports success. Within the current prototype,
+one forge root is one uploaded/imported repository; start the demo server for
+that root to manage it.
 
 Use normal Git inside `alice`:
 

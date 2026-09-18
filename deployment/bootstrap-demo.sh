@@ -20,7 +20,15 @@ if [ ! -d "$source_repo/.git" ]; then
 fi
 
 if ! python -c 'import sys; from pathlib import Path; from state import load_state_meta; sys.exit(0 if load_state_meta(Path(sys.argv[1])).get("repository_state") == "ready" else 1)' "$root" 2>/dev/null; then
-    python forge.py init "$root" "$source_repo" --branch main --object-store filesystem
+    # shellcheck disable=SC2086
+    set -- "$root" "$source_repo" --branch main --object-store "${BASTION_OBJECT_STORE:-filesystem}"
+    if [ -n "${BASTION_DATABASE:-}" ]; then
+        set -- "$@" --database "${BASTION_DATABASE}"
+        if [ -n "${BASTION_ADMIN_DATABASE:-}" ]; then
+            set -- "$@" --admin-database "${BASTION_ADMIN_DATABASE}"
+        fi
+    fi
+    python forge.py init "$@"
 fi
 
 python deployment/bootstrap_demo.py "$root"

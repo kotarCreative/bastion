@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import hashlib
 import os
 import sys
@@ -78,12 +79,30 @@ def parser() -> argparse.ArgumentParser:
     init.add_argument(
         "--object-store",
         default="filesystem",
-        help="object store: filesystem (default) or filesystem:PATH",
+        help="object store: filesystem, filesystem:PATH, or s3://BUCKET/PREFIX",
+    )
+    init.add_argument(
+        "--s3-region",
+        default=None,
+        help="AWS region for an S3 object store",
+    )
+    init.add_argument(
+        "--s3-expected-bucket-owner",
+        default=None,
+        help="12-digit AWS account ID owning the S3 bucket",
     )
     principal = commands.add_parser("add-principal")
     principal.add_argument("root", type=Path)
     principal.add_argument("principal")
     principal.add_argument("--email", action="append", default=[])
+    password = commands.add_parser("set-password")
+    password.add_argument("root", type=Path)
+    password.add_argument("principal")
+    password.add_argument(
+        "--password-stdin",
+        action="store_true",
+        help="read the password from one stdin line instead of prompting",
+    )
     service = commands.add_parser("add-service-account")
     service.add_argument("root", type=Path)
     service.add_argument("service")
@@ -176,6 +195,13 @@ def parser() -> argparse.ArgumentParser:
         default=None,
         help="one-shot administrative DSN used only to provision the restore target",
     )
+    restore.add_argument(
+        "--object-store",
+        default=None,
+        help="target object store: filesystem[:PATH] or s3://BUCKET/PREFIX",
+    )
+    restore.add_argument("--s3-region", default=None)
+    restore.add_argument("--s3-expected-bucket-owner", default=None)
     cancel_job = commands.add_parser("cancel-job")
     cancel_job.add_argument("root", type=Path)
     cancel_job.add_argument("job_id")
@@ -203,9 +229,20 @@ def main() -> int:
                 args.database,
                 args.object_store,
                 admin_database=args.admin_database,
+                s3_region=args.s3_region,
+                s3_expected_bucket_owner=args.s3_expected_bucket_owner,
             )
         elif args.command == "add-principal":
             _add_principal(args.root, args.principal, args.email)
+        elif args.command == "set-password":
+            from accounts import set_password
+
+            password = (
+                sys.stdin.readline().rstrip("\r\n")
+                if args.password_stdin
+                else getpass.getpass("New Bastion password: ")
+            )
+            set_password(args.root, args.principal, password)
         elif args.command == "add-service-account":
             _add_service_account(args.root, args.service, args.owner, args.email)
         elif args.command == "add-team":
@@ -292,7 +329,13 @@ def main() -> int:
 
             print(
                 restore_forge(
-                    args.backup, args.root, args.database, admin_database=args.admin_database
+                    args.backup,
+                    args.root,
+                    args.database,
+                    admin_database=args.admin_database,
+                    object_store=args.object_store,
+                    s3_region=args.s3_region,
+                    s3_expected_bucket_owner=args.s3_expected_bucket_owner,
                 )
             )
         elif args.command == "cancel-job":

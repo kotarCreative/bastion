@@ -23,10 +23,12 @@ from object_store import (
     ObjectNotFound,
     ObjectStore,
     PreconditionFailed,
+    StorageFailure,
     Update,
     Version,
 )
 from object_store_fs import FilesystemObjectStore
+from object_store_s3 import S3ObjectStore, S3ObjectStoreConfig
 from wal import (
     Manifest,
     ReplayState,
@@ -96,13 +98,18 @@ def _evict_identity(identity: str) -> None:
 
 def _snapshot_identity(repository: "Repository") -> str:
     store = repository.store
+    configured_identity = getattr(store, "identity", None)
+    if configured_identity is not None:
+        store_id = str(configured_identity)
+    else:
+        store_id = ""
     backing = getattr(store, "root", None)
-    if backing is not None:
+    if not store_id and backing is not None:
         try:
             store_id = str(Path(backing).resolve())
         except OSError:
             store_id = str(backing)
-    else:
+    elif not store_id:
         store_id = f"memory:{id(store)}"
     try:
         root_id = str(repository.root.resolve())
@@ -136,8 +143,9 @@ def _config(root: Path) -> dict:
         value = json.loads(raw)
     except (OSError, json.JSONDecodeError) as error:
         raise ForgeError(f"cannot read repository configuration: {error}") from error
-    expected = {"repository_id", "canonical_branch", "object_store"}
-    if not isinstance(value, dict) or set(value) != expected:
+    if not isinstance(value, dict) or not {
+        "repository_id", "canonical_branch", "object_store"
+    }.issubset(value):
         raise ForgeError("repository configuration has an invalid shape", "integrity")
     if (
         not isinstance(value["repository_id"], str)
@@ -148,30 +156,94 @@ def _config(root: Path) -> dict:
     if not isinstance(value["canonical_branch"], str) or not value["canonical_branch"]:
         raise ForgeError("repository configuration has an invalid branch", "integrity")
     store = value["object_store"]
-    if not isinstance(store, dict) or set(store) != {"kind", "path"}:
+    raw_version = value.get("repository_config_version")
+    if not isinstance(store, dict) or (
+        raw_version is not None
+        and (not isinstance(raw_version, int) or isinstance(raw_version, bool))
+    ):
         raise ForgeError("repository configuration has an invalid object store", "integrity")
-    if store["kind"] != "filesystem" or not isinstance(store["path"], str) or not store["path"]:
-        raise ForgeError("repository configuration has an unsupported object store", "integrity")
+    version = raw_version
+    if version is None:
+        if set(value) != {"repository_id", "canonical_branch", "object_store"}:
+            raise ForgeError("repository configuration has an invalid shape", "integrity")
+        if set(store) != {"kind", "path"} or store.get("kind") != "filesystem":
+            raise ForgeError("repository configuration has an unsupported object store", "integrity")
+        if not isinstance(store.get("path"), str) or not store["path"]:
+            raise ForgeError("repository configuration has an invalid object store", "integrity")
+    elif version == 2:
+        if set(value) != {
+            "canonical_branch", "object_store", "repository_config_version", "repository_id"
+        }:
+            raise ForgeError("repository configuration has an invalid shape", "integrity")
+        if store.get("kind") == "filesystem":
+            if set(store) != {"kind", "path"} or not isinstance(store.get("path"), str) or not store["path"]:
+                raise ForgeError("repository configuration has an invalid object store", "integrity")
+        elif store.get("kind") == "s3":
+            if set(store) != {
+                "bucket", "expected_bucket_owner", "kind", "prefix", "region",
+                "server_side_encryption",
+            }:
+                raise ForgeError("repository configuration has an invalid object store", "integrity")
+            try:
+                S3ObjectStoreConfig(
+                    bucket=store["bucket"],
+                    expected_bucket_owner=store["expected_bucket_owner"],
+                    region=store["region"],
+                    prefix=store["prefix"],
+                    server_side_encryption=store["server_side_encryption"],
+                )
+            except (KeyError, TypeError, ValueError) as error:
+                raise ForgeError("repository configuration has an invalid object store", "integrity") from error
+        else:
+            raise ForgeError("repository configuration has an unsupported object store", "integrity")
+    else:
+        raise ForgeError("repository configuration version is unsupported", "integrity")
     if canonical_json(value) != raw:
         raise ForgeError("repository configuration is not canonical JSON", "integrity")
     return value
 
 
 def write_repository_config(
-    root: Path, repository_id: str, canonical_branch: str, object_store_path: Path
+    root: Path,
+    repository_id: str,
+    canonical_branch: str,
+    object_store_path: Path | None = None,
+    *,
+    s3_config: S3ObjectStoreConfig | None = None,
 ) -> dict:
-    try:
-        rendered = object_store_path.relative_to(root).as_posix()
-    except ValueError:
-        rendered = str(object_store_path)
-    value = {
-        "repository_id": repository_id,
-        "canonical_branch": canonical_branch,
-        "object_store": {"kind": "filesystem", "path": rendered},
-    }
+    if object_store_path is not None and s3_config is not None:
+        raise ForgeError("repository configuration has multiple object stores")
+    if object_store_path is None and s3_config is None:
+        object_store_path = root / "object-store"
     target = repository_config(root)
+    if s3_config is not None:
+        object_store = {
+            "bucket": s3_config.bucket,
+            "expected_bucket_owner": s3_config.expected_bucket_owner,
+            "kind": "s3",
+            "prefix": s3_config.prefix,
+            "region": s3_config.region,
+            "server_side_encryption": s3_config.server_side_encryption,
+        }
+    else:
+        assert object_store_path is not None
+        try:
+            rendered = object_store_path.relative_to(root).as_posix()
+        except ValueError:
+            rendered = str(object_store_path)
+        object_store = {"kind": "filesystem", "path": rendered}
+    value = {
+        "canonical_branch": canonical_branch,
+        "object_store": object_store,
+        "repository_config_version": 2,
+        "repository_id": repository_id,
+    }
     encoded = canonical_json(value)
     if target.exists():
+        # Validate shape first so corruption reports integrity, then fail
+        # closed on any requested-config mismatch instead of silently
+        # keeping the old bucket/path.
+        _config(root)
         if target.read_bytes() != encoded:
             raise ForgeError("repository configuration conflicts with existing root")
         return value
@@ -202,32 +274,55 @@ class Repository:
     def open(cls, root: Path, store: ObjectStore | None = None) -> "Repository":
         config = _config(root)
         if store is None:
-            configured = Path(config["object_store"]["path"])
-            if not configured.is_absolute():
-                configured = root / configured
-            store = FilesystemObjectStore(configured)
+            if config["object_store"]["kind"] == "filesystem":
+                configured = Path(config["object_store"]["path"])
+                if not configured.is_absolute():
+                    configured = root / configured
+                store = FilesystemObjectStore(configured)
+            else:
+                store = S3ObjectStore.from_config(
+                    S3ObjectStoreConfig(
+                        bucket=config["object_store"]["bucket"],
+                        expected_bucket_owner=config["object_store"]["expected_bucket_owner"],
+                        region=config["object_store"]["region"],
+                        prefix=config["object_store"]["prefix"],
+                        server_side_encryption=config["object_store"]["server_side_encryption"],
+                    )
+                )
         return cls(root, store, config["repository_id"])
 
     def _key(self, key: str) -> str:
         return f"{self.prefix}/{key}"
 
     def get(self, key: str, **kwargs) -> GetResult:
-        result = self.store.get(self._key(key), **kwargs)
+        try:
+            result = self.store.get(self._key(key), **kwargs)
+        except StorageFailure as error:
+            raise ForgeError("object storage is unavailable", "storage") from error
         return GetResult(result.body, ObjectMeta(key, result.meta.size, result.meta.version))
 
     def head(self, key: str) -> ObjectMeta | None:
-        result = self.store.head(self._key(key))
+        try:
+            result = self.store.head(self._key(key))
+        except StorageFailure as error:
+            raise ForgeError("object storage is unavailable", "storage") from error
         if result is None:
             return None
         return ObjectMeta(key, result.size, result.version)
 
     def put(self, key: str, body: bytes, *, mode: Create | Update) -> ObjectMeta:
-        result = self.store.put(self._key(key), body, mode=mode)
+        try:
+            result = self.store.put(self._key(key), body, mode=mode)
+        except StorageFailure as error:
+            raise ForgeError("object storage is unavailable", "storage") from error
         _evict_identity(_snapshot_identity(self))
         return ObjectMeta(key, result.size, result.version)
 
     def delete(self, key: str, *, if_version: Version | None = None) -> None:
-        self.store.delete(self._key(key), if_version=if_version)
+        try:
+            self.store.delete(self._key(key), if_version=if_version)
+        except StorageFailure as error:
+            raise ForgeError("object storage is unavailable", "storage") from error
         _evict_identity(_snapshot_identity(self))
 
     def put_immutable(self, key: str, body: bytes) -> ObjectMeta:
@@ -631,6 +726,11 @@ class Repository:
                 try:
                     checkpoint(self.root, "wal.manifest_cas_sending")
                     meta = self.put("manifest.json", canonical_json(next_manifest.to_dict()), mode=Update(version))
+                    if meta.version == version:
+                        raise ForgeError(
+                            "manifest validator did not advance after publication",
+                            "integrity",
+                        )
                     checkpoint(self.root, "wal.manifest_cas_committed")
                     self._install_snapshot(next_manifest, meta.version, next_state)
                     return record["seq"]

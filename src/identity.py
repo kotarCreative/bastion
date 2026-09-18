@@ -250,10 +250,17 @@ def effective_grants(
     """Union role grants additively per capability, separately for allow and deny."""
     allow_union = empty_capability_map()
     deny_union = empty_capability_map()
+    managed_private: list[str] = []
     for role_id in role_ids:
         role = state["roles"].get(role_id)
         if role is None:
             raise ForgeError(f"unknown role: {role_id}")
+        raw_private = role.get("managed_private_paths", [])
+        if not isinstance(raw_private, list) or not all(
+            isinstance(path, str) for path in raw_private
+        ):
+            raise ForgeError("managed privacy role has an invalid shape")
+        managed_private.extend(normalize_prefix(path) for path in raw_private)
         for capability in CAPABILITIES:
             allow_union[capability].extend(role["allow"][capability])
             deny_union[capability].extend(role["deny"][capability])
@@ -262,6 +269,20 @@ def effective_grants(
     for capability in CAPABILITIES:
         effective_allow[capability] = normalize_prefixes(allow_union[capability])
         effective_deny[capability] = normalize_prefixes(deny_union[capability])
+    # A user-facing "private folder" must remain private even when another
+    # role contains a narrower allow below it. Capabilities-v3 normally lets
+    # narrower grants override an ancestor deny, so mirror every nested read
+    # grant as an equal-specificity deny. Equal specificity is denied.
+    if managed_private:
+        absolute_denies = set(effective_deny["read"])
+        for private_path in normalize_prefixes(managed_private):
+            absolute_denies.add(private_path)
+            absolute_denies.update(
+                allow_path
+                for allow_path in effective_allow["read"]
+                if prefix_covers(private_path, allow_path)
+            )
+        effective_deny["read"] = normalize_prefixes(list(absolute_denies))
     return effective_allow, effective_deny
 
 
