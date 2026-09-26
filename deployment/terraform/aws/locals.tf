@@ -7,5 +7,8 @@ locals {
   }
 
   public_host = var.bastion_host != "" ? var.bastion_host : (var.domain_name != "" ? var.domain_name : aws_lb.main.dns_name)
-  image       = var.container_image != "" ? var.container_image : "${aws_ecr_repository.main.repository_url}:latest"
+  image       = var.container_image
+  bootstrap_image = (
+    var.bootstrap_container_image != "" ? var.bootstrap_container_image : var.container_image
+  )
 }

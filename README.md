@@ -39,6 +39,8 @@ roadmap work.
 - [Security model](docs/SECURITY.md)
 - [Testing and local operation](docs/TESTING.md)
 - [Test deployment](docs/DEPLOYMENT.md)
+- [AWS dev deployment](deployment/terraform/aws/README.md)
+- [Alchemy deployment evaluation](docs/ALCHEMY_EVALUATION.md)
 - [Roadmap](ROADMAP.md)
 
 ## Quick Start

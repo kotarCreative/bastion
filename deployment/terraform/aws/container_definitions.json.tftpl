@@ -25,15 +25,12 @@
       { "name": "BASTION_DATA_DIR", "value": "/var/lib/bastion" },
       { "name": "BASTION_ROOT", "value": "/var/lib/bastion/forge" },
       { "name": "BASTION_HOST", "value": "${host}" },
-      { "name": "BASTION_TESTER_PASSWORD", "value": "${tester_password}" },
-      { "name": "BASTION_OBSERVER_PASSWORD", "value": "${observer_password}" },
       { "name": "BASTION_OBJECT_STORE", "value": "s3://${s3_bucket}/${s3_object_prefix}" },
       { "name": "BASTION_S3_REGION", "value": "${s3_region}" },
       { "name": "BASTION_S3_EXPECTED_BUCKET_OWNER", "value": "${s3_expected_bucket_owner}" }
     ],
     "secrets": [
-      { "name": "BASTION_DATABASE", "valueFrom": "${database_secret_arn}" },
-      { "name": "BASTION_ADMIN_DATABASE", "valueFrom": "${admin_database_secret_arn}" }
+      { "name": "BASTION_DATABASE", "valueFrom": "${runtime_database_secret_arn}" }
     ],
     "mountPoints": [
       {
@@ -77,8 +74,7 @@
       { "name": "BASTION_S3_EXPECTED_BUCKET_OWNER", "value": "${s3_expected_bucket_owner}" }
     ],
     "secrets": [
-      { "name": "BASTION_DATABASE", "valueFrom": "${database_secret_arn}" },
-      { "name": "BASTION_ADMIN_DATABASE", "valueFrom": "${admin_database_secret_arn}" }
+      { "name": "BASTION_DATABASE", "valueFrom": "${runtime_database_secret_arn}" }
     ],
     "mountPoints": [
       {

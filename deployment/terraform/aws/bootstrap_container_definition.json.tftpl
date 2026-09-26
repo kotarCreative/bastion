@@ -1,0 +1,37 @@
+[
+  {
+    "name": "bastion-bootstrap",
+    "image": "${image}",
+    "essential": true,
+    "command": ["/app/deployment/bootstrap-demo.sh"],
+    "environment": [
+      { "name": "BASTION_DATA_DIR", "value": "/var/lib/bastion" },
+      { "name": "BASTION_ROOT", "value": "/var/lib/bastion/forge" },
+      { "name": "BASTION_HOST", "value": "${host}" },
+      { "name": "BASTION_OBJECT_STORE", "value": "s3://${s3_bucket}/${s3_object_prefix}" },
+      { "name": "BASTION_S3_REGION", "value": "${s3_region}" },
+      { "name": "BASTION_S3_EXPECTED_BUCKET_OWNER", "value": "${s3_expected_bucket_owner}" },
+      { "name": "BASTION_BOOTSTRAP_TOKENS_SECRET_ARN", "value": "${bootstrap_tokens_secret_arn}" }
+    ],
+    "secrets": [
+      { "name": "BASTION_DATABASE", "valueFrom": "${runtime_database_secret_arn}" },
+      { "name": "BASTION_ADMIN_DATABASE", "valueFrom": "${admin_database_secret_arn}" },
+      { "name": "BASTION_TESTER_PASSWORD", "valueFrom": "${demo_accounts_secret_arn}:tester_password::" },
+      { "name": "BASTION_OBSERVER_PASSWORD", "valueFrom": "${demo_accounts_secret_arn}:observer_password::" }
+    ],
+    "mountPoints": [
+      {
+        "sourceVolume": "bastion-data",
+        "containerPath": "/var/lib/bastion"
+      }
+    ],
+    "logConfiguration": {
+      "logDriver": "awslogs",
+      "options": {
+        "awslogs-group": "${log_group}",
+        "awslogs-region": "${region}",
+        "awslogs-stream-prefix": "bootstrap"
+      }
+    }
+  }
+]

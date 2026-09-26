@@ -5,8 +5,9 @@ resource "random_id" "s3_bucket" {
 }
 
 resource "aws_s3_bucket" "repository" {
-  bucket = "${local.name}-${data.aws_caller_identity.current.account_id}-${random_id.s3_bucket.hex}"
-  tags   = local.tags
+  bucket        = "${local.name}-${data.aws_caller_identity.current.account_id}-${random_id.s3_bucket.hex}"
+  force_destroy = true
+  tags          = local.tags
 }
 
 resource "aws_s3_bucket_versioning" "repository" {
@@ -48,10 +49,18 @@ resource "aws_s3_bucket_lifecycle_configuration" "repository" {
   rule {
     id     = "expire-noncurrent-versions"
     status = "Enabled"
+    filter {}
     noncurrent_version_expiration {
       noncurrent_days = var.s3_noncurrent_version_retention_days
     }
     expiration { expired_object_delete_marker = true }
+  }
+  rule {
+    id     = "expire-qualification-runs"
+    status = "Enabled"
+    filter { prefix = "qualification/" }
+    expiration { days = 7 }
+    noncurrent_version_expiration { noncurrent_days = 7 }
   }
 }
 

@@ -107,3 +107,18 @@ Run one copy of each Bastion service. Admission accounting and repository
 materialization caches are process-local. This profile does not claim multi-host
 availability, SSH access, external identity integration, or safe handling of
 sensitive production repositories.
+
+## AWS Dev Environment
+
+The AWS profile uses ECS Fargate, RDS PostgreSQL, S3 repository truth, EFS
+materialization caches, an ALB, and Secrets Manager. Its staged deployment
+prevents the service from starting before its immutable image and forge data
+exist. A separate bootstrap root owns remote state, GitHub OIDC deployment
+identities, and the application IAM permissions boundary. See
+`deployment/terraform/aws/README.md` for the bootstrap command, protected
+workflow deployment, qualification, and cleanup instructions.
+
+Use a dedicated AWS test account. The generated deployment identity is bounded
+away from bootstrap trust and application secrets outside the Bastion naming
+family, but it necessarily manages account-level test networking, ECS, RDS,
+EFS, and load-balancing resources.

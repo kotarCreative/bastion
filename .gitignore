@@ -2,3 +2,11 @@ work/
 __pycache__/
 .venv/
 .poetry/
+**/.terraform/
+*.tfplan
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+backend-*.hcl
+!backend-*.hcl.example

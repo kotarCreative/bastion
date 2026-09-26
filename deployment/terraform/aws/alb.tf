@@ -7,6 +7,17 @@ resource "aws_lb" "main" {
 
   enable_deletion_protection = false
 
+  lifecycle {
+    precondition {
+      condition     = var.acm_certificate_arn != "" || length(var.http_ingress_cidrs) > 0
+      error_message = "Configure ACM HTTPS or at least one restricted HTTP ingress CIDR."
+    }
+    precondition {
+      condition     = var.acm_certificate_arn == "" || var.domain_name != "" || var.bastion_host != ""
+      error_message = "HTTPS requires domain_name or bastion_host matching the ACM certificate."
+    }
+  }
+
   tags = local.tags
 }
 

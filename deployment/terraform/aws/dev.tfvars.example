@@ -1,0 +1,16 @@
+environment = "dev"
+aws_region = "us-east-1"
+
+# Written automatically to bootstrap.auto.tfvars by bootstrap-aws.sh.
+# permissions_boundary_arn = "arn:aws:iam::123456789012:policy/bastion-dev-permissions-boundary"
+
+# For an initial private test, replace this documentation address with the
+# operator's public IP. Public plaintext HTTP CIDRs are rejected.
+http_ingress_cidrs = ["203.0.113.10/32"]
+
+# For public testing, remove http_ingress_cidrs and configure all three values.
+# domain_name        = "bastion.example.com"
+# hosted_zone_id     = "Z0123456789EXAMPLE"
+# acm_certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/..."
+
+s3_object_prefix = "dev"

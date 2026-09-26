@@ -1,0 +1,198 @@
+name: AWS S3 qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      bucket:
+        description: Exact application repository bucket to qualify
+        required: true
+        type: string
+      owner:
+        description: Twelve-digit AWS account ID that owns the bucket
+        required: true
+        type: string
+      region:
+        description: AWS region containing the bucket
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      bucket:
+        required: true
+        type: string
+      owner:
+        required: true
+        type: string
+      region:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: aws-s3-qualification
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    name: Live conditional object-store qualification
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: aws-s3-qualification
+    env:
+      AWS_REGION: ${{ inputs.region }}
+      BASTION_TEST_AWS_S3: "1"
+      BASTION_TEST_AWS_S3_BUCKET: ${{ inputs.bucket }}
+      BASTION_TEST_AWS_S3_REGION: ${{ inputs.region }}
+      BASTION_TEST_AWS_S3_OWNER: ${{ inputs.owner }}
+      BASTION_TEST_AWS_S3_PREFIX: qualification/${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Require protected-environment configuration
+        env:
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+        run: |
+          test -n "$AWS_ROLE_ARN"
+          test -n "$AWS_REGION"
+          test -n "$BASTION_TEST_AWS_S3_BUCKET"
+          test -n "$BASTION_TEST_AWS_S3_OWNER"
+      - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.region }}
+          role-session-name: bastion-s3-${{ github.run_id }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --disable-pip-version-check poetry==2.4.3
+          poetry install --no-interaction
+      - name: Qualify against AWS S3
+        env:
+          PYTHONPATH: src
+        run: |
+          poetry run python -m unittest tests.test_object_store_s3_live -v
+          poetry run python - <<'PY'
+          import os
+          import threading
+
+          import boto3
+          from botocore.exceptions import ClientError
+
+          from object_store import Create, PreconditionFailed, Update
+          from object_store_s3 import S3ObjectStore, S3ObjectStoreConfig
+
+          bucket = os.environ["BASTION_TEST_AWS_S3_BUCKET"]
+          region = os.environ["BASTION_TEST_AWS_S3_REGION"]
+          prefix = os.environ["BASTION_TEST_AWS_S3_PREFIX"]
+          owner = os.environ["BASTION_TEST_AWS_S3_OWNER"]
+          config = S3ObjectStoreConfig(
+              bucket=bucket,
+              expected_bucket_owner=owner,
+              region=region,
+              prefix=prefix,
+          )
+          store = S3ObjectStore.from_config(config)
+          store.verify_bucket()
+
+          def expect_precondition(operation):
+              try:
+                  operation()
+              except PreconditionFailed:
+                  return
+              raise AssertionError("operation unexpectedly satisfied a stale precondition")
+
+          def parallel(operations):
+              barrier = threading.Barrier(len(operations))
+              outcomes = []
+              lock = threading.Lock()
+
+              def run(operation):
+                  barrier.wait(timeout=10)
+                  try:
+                      operation()
+                      outcome = "won"
+                  except PreconditionFailed:
+                      outcome = "lost"
+                  with lock:
+                      outcomes.append(outcome)
+
+              threads = [threading.Thread(target=run, args=(operation,)) for operation in operations]
+              for thread in threads:
+                  thread.start()
+              for thread in threads:
+                  thread.join(timeout=30)
+              assert not any(thread.is_alive() for thread in threads), "concurrent request timed out"
+              assert sorted(outcomes) == ["lost", "won"], outcomes
+
+          touched = set()
+          try:
+              key = "visibility/object"
+              touched.add(key)
+              first = store.put(key, b"first", mode=Create())
+              assert store.get(key).body == b"first"
+              assert store.head(key) == first
+              assert [item.key for item in store.list_prefix("visibility/")] == [key]
+
+              second = store.put(key, b"second", mode=Update(first.version))
+              expect_precondition(lambda: store.put(key, b"stale", mode=Update(first.version)))
+              expect_precondition(lambda: store.delete(key, if_version=first.version))
+              store.delete(key, if_version=second.version)
+              assert store.head(key) is None
+              assert store.list_prefix("visibility/") == []
+
+              create_key = "concurrency/create"
+              touched.add(create_key)
+              parallel([
+                  lambda: store.put(create_key, b"left", mode=Create()),
+                  lambda: store.put(create_key, b"right", mode=Create()),
+              ])
+
+              update_key = "concurrency/update"
+              touched.add(update_key)
+              base = store.put(update_key, b"base", mode=Create())
+              parallel([
+                  lambda: store.put(update_key, b"left-next", mode=Update(base.version)),
+                  lambda: store.put(update_key, b"right-next", mode=Update(base.version)),
+              ])
+
+              repeat_key = "etag/repeated"
+              touched.add(repeat_key)
+              repeated = store.put(repeat_key, b"same bytes", mode=Create())
+              store.delete(repeat_key, if_version=repeated.version)
+              repeated_again = store.put(repeat_key, b"same bytes", mode=Create())
+              assert repeated.version == repeated_again.version
+
+              client = boto3.client("s3", region_name=region)
+              policy_key = "policy/unconditional"
+              touched.add(policy_key)
+              physical = f"{prefix}/{policy_key}"
+              try:
+                  client.put_object(
+                      Bucket=bucket,
+                      Key=physical,
+                      Body=b"denied",
+                      ServerSideEncryption="AES256",
+                      ExpectedBucketOwner=owner,
+                  )
+              except ClientError as error:
+                  assert error.response["Error"]["Code"] in {"AccessDenied", "403"}
+              else:
+                  raise AssertionError("bucket policy allowed an unconditional write")
+          finally:
+              cleanup_errors = []
+              for key in touched:
+                  try:
+                      current = store.head(key)
+                      if current is not None:
+                          store.delete(key, if_version=current.version)
+                  except Exception as error:
+                      cleanup_errors.append(f"{key}: {error!r}")
+              if cleanup_errors:
+                  raise AssertionError("S3 qualification cleanup failed: " + "; ".join(cleanup_errors))
+
+          print(f"qualified s3://{bucket}/{prefix}")
+          PY

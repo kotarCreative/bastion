@@ -1,0 +1,5 @@
+bucket       = "replace-with-bastion-terraform-state-bucket"
+key          = "bastion/dev/terraform.tfstate"
+region       = "us-east-1"
+encrypt      = true
+use_lockfile = true

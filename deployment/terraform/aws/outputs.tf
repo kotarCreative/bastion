@@ -1,6 +1,6 @@
 output "bastion_url" {
-  description = "URL to reach the deployed Bastion service."
-  value       = var.acm_certificate_arn != "" ? "https://${local.public_host}" : "http://${local.public_host}"
+  description = "URL to reach the deployed Bastion service after deploy_service is enabled."
+  value       = var.deploy_service ? (var.acm_certificate_arn != "" ? "https://${local.public_host}" : "http://${local.public_host}") : null
 }
 
 output "load_balancer_dns" {
@@ -9,13 +9,28 @@ output "load_balancer_dns" {
 }
 
 output "ecr_repository_url" {
-  description = "URL of the ECR repository. Push the container image here before starting the service."
+  description = "Repository where the deployment script publishes immutable images."
   value       = aws_ecr_repository.main.repository_url
 }
 
-output "database_secret_arn" {
-  description = "ARN of the Secrets Manager secret holding the PostgreSQL DSN."
-  value       = aws_secretsmanager_secret.db.arn
+output "ecr_repository_name" {
+  description = "ECR repository name used to resolve an image tag to its digest."
+  value       = aws_ecr_repository.main.name
+}
+
+output "runtime_database_secret_arn" {
+  description = "Restricted PostgreSQL runtime DSN secret ARN."
+  value       = aws_secretsmanager_secret.db_runtime.arn
+}
+
+output "demo_accounts_secret_arn" {
+  description = "Secret containing the generated tester and observer browser passwords."
+  value       = aws_secretsmanager_secret.demo_accounts.arn
+}
+
+output "bootstrap_tokens_secret_arn" {
+  description = "Secret populated by bootstrap with tester and observer API/Git tokens."
+  value       = aws_secretsmanager_secret.bootstrap_tokens.arn
 }
 
 output "repository_bucket" {
@@ -34,27 +49,31 @@ output "ecs_cluster_name" {
 }
 
 output "ecs_service_name" {
-  description = "Name of the ECS service."
-  value       = aws_ecs_service.main.name
+  description = "Name of the ECS service when deploy_service is enabled."
+  value       = var.deploy_service ? aws_ecs_service.main[0].name : null
 }
 
-output "ecs_task_definition_family" {
-  description = "Family of the main ECS task definition, used for one-off bootstrap tasks."
-  value       = aws_ecs_task_definition.main.family
+output "bootstrap_task_definition_arn" {
+  description = "Exact one-off bootstrap task revision, available after a bootstrap image is set."
+  value       = local.bootstrap_image != "" ? aws_ecs_task_definition.bootstrap[0].arn : null
 }
 
-output "bootstrap_command" {
-  description = "Example AWS CLI command to run the demo bootstrap one-off task."
-  value       = "bash ${path.module}/init-forge.sh ${aws_ecs_cluster.main.name} ${aws_ecs_task_definition.main.family} '${join(",", aws_subnet.public[*].id)}' ${aws_security_group.ecs.id} ${aws_cloudwatch_log_group.main.name} ${var.aws_region}"
+output "public_subnet_ids" {
+  description = "Public subnets used by one-off and service tasks."
+  value       = aws_subnet.public[*].id
 }
 
-output "next_steps" {
-  description = "What to do after Terraform apply."
-  value       = <<EOT
-1. Build and push the container image to ${aws_ecr_repository.main.repository_url}:latest
-2. Run the bootstrap task: ${path.module}/init-forge.sh
-3. Wait for the ECS service to report healthy.
-4. Run the smoke test with the printed tokens:
-   BASTION_URL=<bastion_url> BASTION_INSECURE_TLS=0 ${path.module}/smoke-test.sh
-EOT
+output "ecs_security_group_id" {
+  description = "Security group used by ECS tasks."
+  value       = aws_security_group.ecs.id
+}
+
+output "cloudwatch_log_group" {
+  description = "CloudWatch log group for bootstrap and service diagnostics."
+  value       = aws_cloudwatch_log_group.main.name
+}
+
+output "aws_region" {
+  description = "AWS region used by deployment scripts."
+  value       = var.aws_region
 }

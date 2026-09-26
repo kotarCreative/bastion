@@ -5,6 +5,11 @@ data_dir="${BASTION_DATA_DIR:-/var/lib/bastion}"
 root="${BASTION_ROOT:-$data_dir/forge}"
 source_repo="$data_dir/source"
 
+if [ -n "${BASTION_DATABASE:-}" ] && [ -n "${BASTION_ADMIN_DATABASE:-}" ]; then
+    python deployment/provision-postgres.py "$root"
+    unset BASTION_ADMIN_DATABASE
+fi
+
 if [ ! -d "$source_repo/.git" ]; then
     mkdir -p "$source_repo/shared" "$source_repo/private"
     git init -q -b main "$source_repo"
@@ -24,9 +29,6 @@ if ! python -c 'import sys; from pathlib import Path; from state import load_sta
     set -- "$root" "$source_repo" --branch main --object-store "${BASTION_OBJECT_STORE:-filesystem}"
     if [ -n "${BASTION_DATABASE:-}" ]; then
         set -- "$@" --database "${BASTION_DATABASE}"
-        if [ -n "${BASTION_ADMIN_DATABASE:-}" ]; then
-            set -- "$@" --admin-database "${BASTION_ADMIN_DATABASE}"
-        fi
     fi
     python forge.py init "$@"
 fi

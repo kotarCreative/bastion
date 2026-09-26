@@ -7,7 +7,7 @@ variable "name_prefix" {
 variable "environment" {
   description = "Deployment environment name."
   type        = string
-  default     = "test"
+  default     = "dev"
 }
 
 variable "aws_region" {
@@ -58,10 +58,56 @@ variable "acm_certificate_arn" {
   default     = ""
 }
 
+variable "http_ingress_cidrs" {
+  description = "Operator IPv4 /32 addresses allowed to use HTTP when ACM is not configured."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition = alltrue([
+      for cidr in var.http_ingress_cidrs :
+      can(cidrhost(cidr, 0)) && !strcontains(cidr, ":") && endswith(cidr, "/32")
+    ])
+    error_message = "Unencrypted HTTP ingress must contain only individual IPv4 /32 operator addresses."
+  }
+}
+
 variable "container_image" {
-  description = "Container image URI. Leave empty to use the ECR repo URL with the 'latest' tag."
+  description = "Digest-qualified container image URI. Leave empty while provisioning the foundation."
   type        = string
   default     = ""
+
+  validation {
+    condition     = var.container_image == "" || can(regex("@sha256:[0-9a-f]{64}$", var.container_image))
+    error_message = "container_image must be empty or digest-qualified (repository@sha256:...)."
+  }
+}
+
+variable "bootstrap_container_image" {
+  description = "Digest-qualified image for the one-off bootstrap task. Defaults to container_image."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.bootstrap_container_image == "" || can(regex("@sha256:[0-9a-f]{64}$", var.bootstrap_container_image))
+    error_message = "bootstrap_container_image must be empty or digest-qualified (repository@sha256:...)."
+  }
+}
+
+variable "deploy_service" {
+  description = "Create the long-lived ECS service after the image has been pushed and bootstrap has completed."
+  type        = bool
+  default     = false
+}
+
+variable "permissions_boundary_arn" {
+  description = "Bootstrap-owned IAM permissions boundary required on every application task role."
+  type        = string
+
+  validation {
+    condition     = can(regex("^arn:[^:]+:iam::[0-9]{12}:policy/.+$", var.permissions_boundary_arn))
+    error_message = "permissions_boundary_arn must be an IAM policy ARN."
+  }
 }
 
 variable "bastion_host" {
@@ -74,12 +120,6 @@ variable "worker_interval_seconds" {
   description = "Seconds between projection worker passes."
   type        = number
   default     = 30
-}
-
-variable "enable_demo_bootstrap" {
-  description = "Whether to create a one-off bootstrap task definition for the demo catalog."
-  type        = bool
-  default     = true
 }
 
 variable "db_instance_class" {
@@ -97,7 +137,7 @@ variable "db_allocated_storage" {
 variable "db_engine_version" {
   description = "RDS PostgreSQL engine version."
   type        = string
-  default     = "16.4"
+  default     = "16"
 }
 
 variable "ecs_task_cpu" {
@@ -110,18 +150,6 @@ variable "ecs_task_memory" {
   description = "Fargate task memory in MiB."
   type        = number
   default     = 2048
-}
-
-variable "demo_tester_password" {
-  description = "Password for the demo tester account."
-  type        = string
-  default     = "bastion-tester"
-}
-
-variable "demo_observer_password" {
-  description = "Password for the demo observer account."
-  type        = string
-  default     = "bastion-observer"
 }
 
 variable "s3_noncurrent_version_retention_days" {
@@ -137,16 +165,18 @@ variable "s3_noncurrent_version_retention_days" {
 variable "s3_object_prefix" {
   description = "Deployment prefix used by the Bastion S3 repository."
   type        = string
-  default     = ""
+  default     = "app"
   validation {
-    condition = var.s3_object_prefix == "" || (
+    condition = (
       can(regex("^[A-Za-z0-9!_.*'()/-]+$", var.s3_object_prefix)) &&
       !startswith(var.s3_object_prefix, "/") &&
       !endswith(var.s3_object_prefix, "/") &&
-      !strcontains(var.s3_object_prefix, "//") &&
-      !strcontains(var.s3_object_prefix, "/./") &&
-      !strcontains(var.s3_object_prefix, "/../")
+      split("/", var.s3_object_prefix)[0] != "qualification" &&
+      alltrue([
+        for component in split("/", var.s3_object_prefix) :
+        !contains(["", ".", ".."], component)
+      ])
     )
-    error_message = "S3 object prefix must be a relative ASCII key prefix without unsafe components."
+    error_message = "S3 object prefix must be a nonempty safe relative prefix outside qualification/."
   }
 }

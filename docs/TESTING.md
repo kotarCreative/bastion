@@ -52,3 +52,42 @@ python3 -m py_compile forge.py src/*.py tests/*.py
 Set `BASTION_TEST_PG` to run the storage matrix against PostgreSQL. Named failpoints use `BASTION_FAILPOINT`, `BASTION_FAILPOINT_ROOT`, `BASTION_FAILPOINT_RUN_ID`, and `BASTION_FAILPOINT_MARKER`; tests launch isolated child processes and verify manifest reachability after termination.
 
 Rejected-operation tests compare repository manifests, object inventories, control-plane documents, refs, and visible histories before and after the request. Cache reconstruction tests delete local repositories and require deterministic replay from repository truth.
+
+## Local PostgreSQL Matrix
+
+Start the disposable PostgreSQL 16 service and wait for it to become healthy:
+
+```bash
+docker compose -f deployment/compose.postgres-test.yml up -d --wait
+```
+
+Run the storage backend matrix against SQLite and PostgreSQL:
+
+```bash
+BASTION_ADMIN_DATABASE=postgresql://postgres:postgres@127.0.0.1:55432/postgres \
+  BASTION_TEST_PG=postgresql://postgres:postgres@127.0.0.1:55432 \
+  .poetry/bin/poetry run python -m unittest tests.test_storage -v
+```
+
+Exercise the same restricted runtime-role provisioning used by AWS bootstrap:
+
+```bash
+BASTION_ADMIN_DATABASE=postgresql://postgres:postgres@127.0.0.1:55432/postgres \
+  BASTION_DATABASE=postgresql://bastion_runtime:runtime-test-password@127.0.0.1:55432/postgres \
+  .poetry/bin/poetry run python deployment/provision-postgres.py \
+  /var/lib/bastion/forge
+```
+
+Stop the service and discard its tmpfs-backed databases:
+
+```bash
+docker compose -f deployment/compose.postgres-test.yml down
+```
+
+Set `BASTION_TEST_PG_PORT` before both commands if port `55432` is unavailable, and use the same port in both DSNs. `BASTION_ADMIN_DATABASE` is the explicit one-shot provisioning connection. `BASTION_TEST_PG` is a server base URI without a database path; the harness derives and persists a separate database name for each temporary forge. The test account can create those databases; these credentials and the Compose file are for local testing only.
+
+## CI And Test Boundaries
+
+The ordinary CI workflow is hermetic with respect to cloud services. It runs the complete suite on Python 3.11 and 3.12, runs the storage matrix against an ephemeral PostgreSQL service, validates Terraform without configuring a remote backend, builds the Docker image, and validates both Compose files. Unit tests use memory, filesystem, SQLite, PostgreSQL, or injected fakes and do not establish compatibility with AWS S3.
+
+Live AWS behavior is intentionally outside pull-request CI. The manually dispatched, environment-protected workflow is described in [S3 qualification](S3_QUALIFICATION.md). A green ordinary CI run is not evidence that the S3 adapter is qualified against AWS.

@@ -3,18 +3,24 @@ resource "aws_security_group" "alb" {
   vpc_id      = aws_vpc.main.id
   description = "Allows inbound HTTP/HTTPS to the ALB."
 
-  ingress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+  dynamic "ingress" {
+    for_each = var.acm_certificate_arn != "" ? ["0.0.0.0/0"] : var.http_ingress_cidrs
+    content {
+      from_port   = 80
+      to_port     = 80
+      protocol    = "tcp"
+      cidr_blocks = [ingress.value]
+    }
   }
 
-  ingress {
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+  dynamic "ingress" {
+    for_each = var.acm_certificate_arn != "" ? ["0.0.0.0/0"] : []
+    content {
+      from_port   = 443
+      to_port     = 443
+      protocol    = "tcp"
+      cidr_blocks = [ingress.value]
+    }
   }
 
   egress {

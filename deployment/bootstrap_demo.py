@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
 
-from http_server import add_token
+from http_server import add_token, revoke_token
 from identity import CAPABILITIES, binding_identifier, effective_descriptor
 from invariants import check_invariants
 from repository import Repository
@@ -18,6 +19,62 @@ from worker import drain_projection_jobs
 
 def capability_map(**grants: list[str]) -> dict[str, list[str]]:
     return {capability: list(grants.get(capability, [])) for capability in CAPABILITIES}
+
+
+def store_rotated_tokens(
+    root: Path,
+    secrets_client,
+    secret_arn: str,
+    tester: str,
+    observer: str,
+    previous: dict,
+) -> None:
+    previous_credentials = [
+        value
+        for key, value in previous.items()
+        if key in {"tester_token", "observer_token"} and isinstance(value, str)
+    ]
+    superseded_token_ids = [
+        value
+        for value in previous.get("superseded_token_ids", [])
+        if isinstance(value, str)
+    ]
+    for credential in previous_credentials:
+        parts = credential.split(".", 2)
+        if len(parts) == 3 and parts[0] == "bst1":
+            superseded_token_ids.append(parts[1])
+    superseded_token_ids = sorted(set(superseded_token_ids))
+
+    current = {"tester_token": tester, "observer_token": observer}
+    pending = dict(current)
+    if superseded_token_ids:
+        pending["superseded_token_ids"] = superseded_token_ids
+    try:
+        secrets_client.put_secret_value(
+            SecretId=secret_arn,
+            SecretString=json.dumps(pending, sort_keys=True),
+        )
+    except Exception as write_error:
+        try:
+            observed = json.loads(
+                secrets_client.get_secret_value(SecretId=secret_arn)["SecretString"]
+            )
+        except Exception:
+            # The write outcome is ambiguous. Keep both old and new credentials
+            # valid rather than risk publishing revoked credentials.
+            raise write_error
+        if observed != pending:
+            for credential in (tester, observer):
+                revoke_token(root, credential.split(".", 2)[1])
+            raise write_error
+
+    for token_id in superseded_token_ids:
+        revoke_token(root, token_id)
+    if superseded_token_ids:
+        secrets_client.put_secret_value(
+            SecretId=secret_arn,
+            SecretString=json.dumps(current, sort_keys=True),
+        )
 
 
 def ensure_catalog(root: Path) -> None:
@@ -110,15 +167,39 @@ def main() -> int:
     ensure_catalog(root)
     drain_projection_jobs(root)
     check_invariants(root)
+    secret_arn = os.environ.get("BASTION_BOOTSTRAP_TOKENS_SECRET_ARN", "")
+    secrets_client = None
+    previous: dict = {}
+    if secret_arn:
+        import boto3
+
+        secrets_client = boto3.client("secretsmanager")
+        try:
+            previous = json.loads(
+                secrets_client.get_secret_value(SecretId=secret_arn)["SecretString"]
+            )
+            if not isinstance(previous, dict):
+                raise ValueError("bootstrap token secret must contain a JSON object")
+        except secrets_client.exceptions.ResourceNotFoundException:
+            pass
+
     tester = add_token(root, "tester", ["fetch", "push", "ui"], "7d")
     observer = add_token(root, "observer", ["fetch", "ui"], "7d")
-    print("Bastion test data is ready. Save these credentials; they are shown once:")
+    print("Bastion test data is ready.")
     print(
         "Browser accounts: tester and observer (passwords come from "
         "BASTION_TESTER_PASSWORD/BASTION_OBSERVER_PASSWORD; test defaults apply)"
     )
-    print(f"export BASTION_TESTER_TOKEN='{tester}'")
-    print(f"export BASTION_OBSERVER_TOKEN='{observer}'")
+    if secret_arn:
+        assert secrets_client is not None
+        store_rotated_tokens(
+            root, secrets_client, secret_arn, tester, observer, previous
+        )
+        print(f"Git/API tokens were written to Secrets Manager: {secret_arn}")
+    else:
+        print("Save these local credentials; they are shown once:")
+        print(f"export BASTION_TESTER_TOKEN='{tester}'")
+        print(f"export BASTION_OBSERVER_TOKEN='{observer}'")
     return 0
 
 
