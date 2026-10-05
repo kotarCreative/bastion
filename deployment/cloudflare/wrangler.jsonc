@@ -1,0 +1,30 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "bastion-forge",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-04",
+  "compatibility_flags": ["nodejs_compat"],
+  "containers": [
+    {
+      "class_name": "ForgeContainer",
+      "image": "../../Dockerfile",
+      "max_instances": 1,
+      "instance_type": "standard-1"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "FORGE", "class_name": "ForgeContainer" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["ForgeContainer"] }
+  ],
+  "artifacts": [
+    { "binding": "ARTIFACTS", "namespace": "default" }
+  ],
+  "vars": {
+    "ARTIFACTS_REPO": "bastion-private",
+    "BASTION_ROOT": "/var/lib/bastion/forge"
+  }
+}

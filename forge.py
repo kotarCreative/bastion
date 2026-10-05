@@ -79,7 +79,7 @@ def parser() -> argparse.ArgumentParser:
     init.add_argument(
         "--object-store",
         default="filesystem",
-        help="object store: filesystem, filesystem:PATH, or s3://BUCKET/PREFIX",
+        help="object store: filesystem[:PATH], s3://BUCKET/PREFIX, or artifacts+https://<account>.artifacts.cloudflare.net/git/<namespace>/<repo>.git",
     )
     init.add_argument(
         "--s3-region",
@@ -198,7 +198,7 @@ def parser() -> argparse.ArgumentParser:
     restore.add_argument(
         "--object-store",
         default=None,
-        help="target object store: filesystem[:PATH] or s3://BUCKET/PREFIX",
+        help="target object store: filesystem[:PATH], s3://BUCKET/PREFIX, or artifacts+https://<account>.artifacts.cloudflare.net/git/<namespace>/<repo>.git",
     )
     restore.add_argument("--s3-region", default=None)
     restore.add_argument("--s3-expected-bucket-owner", default=None)

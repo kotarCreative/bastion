@@ -29,6 +29,7 @@ from object_store import (
 )
 from object_store_fs import FilesystemObjectStore
 from object_store_s3 import S3ObjectStore, S3ObjectStoreConfig
+from object_store_artifacts import ArtifactsObjectStore, ArtifactsObjectStoreConfig
 from wal import (
     Manifest,
     ReplayState,
@@ -194,6 +195,15 @@ def _config(root: Path) -> dict:
                 )
             except (KeyError, TypeError, ValueError) as error:
                 raise ForgeError("repository configuration has an invalid object store", "integrity") from error
+        elif store.get("kind") == "artifacts":
+            if set(store) != {"kind", "remote", "branch", "token_env"}:
+                raise ForgeError("repository configuration has an invalid object store", "integrity")
+            try:
+                ArtifactsObjectStoreConfig(
+                    remote=store["remote"], branch=store["branch"], token_env=store["token_env"]
+                )
+            except (KeyError, TypeError, ValueError) as error:
+                raise ForgeError("repository configuration has an invalid object store", "integrity") from error
         else:
             raise ForgeError("repository configuration has an unsupported object store", "integrity")
     else:
@@ -210,13 +220,21 @@ def write_repository_config(
     object_store_path: Path | None = None,
     *,
     s3_config: S3ObjectStoreConfig | None = None,
+    artifacts_config: ArtifactsObjectStoreConfig | None = None,
 ) -> dict:
-    if object_store_path is not None and s3_config is not None:
+    if sum(value is not None for value in (object_store_path, s3_config, artifacts_config)) > 1:
         raise ForgeError("repository configuration has multiple object stores")
-    if object_store_path is None and s3_config is None:
+    if object_store_path is None and s3_config is None and artifacts_config is None:
         object_store_path = root / "object-store"
     target = repository_config(root)
-    if s3_config is not None:
+    if artifacts_config is not None:
+        object_store = {
+            "kind": "artifacts",
+            "remote": artifacts_config.remote,
+            "branch": artifacts_config.branch,
+            "token_env": artifacts_config.token_env,
+        }
+    elif s3_config is not None:
         object_store = {
             "bucket": s3_config.bucket,
             "expected_bucket_owner": s3_config.expected_bucket_owner,
@@ -279,7 +297,7 @@ class Repository:
                 if not configured.is_absolute():
                     configured = root / configured
                 store = FilesystemObjectStore(configured)
-            else:
+            elif config["object_store"]["kind"] == "s3":
                 store = S3ObjectStore.from_config(
                     S3ObjectStoreConfig(
                         bucket=config["object_store"]["bucket"],
@@ -288,6 +306,17 @@ class Repository:
                         prefix=config["object_store"]["prefix"],
                         server_side_encryption=config["object_store"]["server_side_encryption"],
                     )
+                )
+            else:
+                configured = config["object_store"]
+                artifacts_config = ArtifactsObjectStoreConfig(
+                    remote=configured["remote"],
+                    branch=configured["branch"],
+                    token_env=configured["token_env"],
+                )
+                store = ArtifactsObjectStore.from_config(
+                    artifacts_config,
+                    cache_dir=root / "materializations" / "artifacts-store.git",
                 )
         return cls(root, store, config["repository_id"])
 

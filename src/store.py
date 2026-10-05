@@ -10,6 +10,7 @@ import re
 import shutil
 import stat
 import threading
+import tempfile
 import time
 import urllib.parse
 import uuid
@@ -2630,7 +2631,7 @@ def _backup_repository(
             )
         source_config = json.loads(config_body)
         source_kind = source_config.get("object_store", {}).get("kind")
-        if source_kind not in {"filesystem", "s3"}:
+        if source_kind not in {"filesystem", "s3", "artifacts"}:
             raise ForgeError("repository configuration has an unsupported object store", "integrity")
         metadata = {
             "format": "bastion-wal-backup",
@@ -2777,7 +2778,7 @@ def _validated_backup_manifest(metadata: dict) -> dict:
             raise ForgeError("WAL backup manifest has an invalid shape", "integrity")
     elif raw_version == 3:
         is_legacy = False
-        if not has_artifacts_key or metadata.get("source_object_store_kind") not in {"filesystem", "s3"}:
+        if not has_artifacts_key or metadata.get("source_object_store_kind") not in {"filesystem", "s3", "artifacts"}:
             raise ForgeError("WAL backup manifest has an invalid shape", "integrity")
     else:
         raise ForgeError("backup format is unsupported")
@@ -2914,6 +2915,7 @@ def _restore_repository(
     from object_store_fs import FilesystemObjectStore
     from object_store import Create, validate_key
     from object_store_s3 import S3ObjectStore, S3ObjectStoreConfig, parse_s3_uri
+    from object_store_artifacts import ArtifactsObjectStore, ArtifactsObjectStoreConfig, parse_artifacts_uri
     from repository import Repository
     from materialization import ensure_canonical_materialized, ensure_intake_materialized, ensure_view_materialized
     from wal import canonical_json
@@ -2986,7 +2988,7 @@ def _restore_repository(
     if config.get("repository_id") != manifest.get("repository_id"):
         raise ForgeError("WAL backup repository ID is inconsistent", "integrity")
     source_kind = config.get("object_store", {}).get("kind")
-    if source_kind not in {"filesystem", "s3"}:
+    if source_kind not in {"filesystem", "s3", "artifacts"}:
         raise ForgeError("WAL backup source object store is invalid", "integrity")
     source_store = config["object_store"]
     if config.get("repository_config_version") is None:
@@ -3010,7 +3012,7 @@ def _restore_repository(
                 or not source_store.get("path")
             ):
                 raise ForgeError("WAL backup configuration has an invalid object store", "integrity")
-        else:
+        elif source_kind == "s3":
             if set(source_store) != {
                 "bucket", "expected_bucket_owner", "kind", "prefix", "region",
                 "server_side_encryption",
@@ -3023,6 +3025,17 @@ def _restore_repository(
                     region=source_store["region"],
                     prefix=source_store["prefix"],
                     server_side_encryption=source_store["server_side_encryption"],
+                )
+            except (KeyError, TypeError, ValueError) as error:
+                raise ForgeError("WAL backup configuration has an invalid object store", "integrity") from error
+        else:
+            if set(source_store) != {"kind", "remote", "branch", "token_env"}:
+                raise ForgeError("WAL backup configuration has an invalid object store", "integrity")
+            try:
+                ArtifactsObjectStoreConfig(
+                    remote=source_store["remote"],
+                    branch=source_store["branch"],
+                    token_env=source_store["token_env"],
                 )
             except (KeyError, TypeError, ValueError) as error:
                 raise ForgeError("WAL backup configuration has an invalid object store", "integrity") from error
@@ -3067,10 +3080,19 @@ def _restore_repository(
             raise ForgeError("WAL backup object hash differs", "integrity")
     _reject_unlisted_object_files(backup_objects, object_entries)
     target_s3_config = None
+    target_artifacts_config = None
     if object_store is None:
         if s3_region is not None or s3_expected_bucket_owner is not None:
             raise ForgeError("S3 options require an explicit S3 object store")
         target_object_store_path = new_root / "object-store"
+    elif object_store.startswith("artifacts+https://"):
+        if s3_region is not None or s3_expected_bucket_owner is not None:
+            raise ForgeError("S3 options are invalid for Artifacts storage")
+        try:
+            target_artifacts_config = parse_artifacts_uri(object_store)
+        except ValueError as error:
+            raise ForgeError(str(error)) from error
+        target_object_store_path = None
     elif object_store.startswith("s3://"):
         if not s3_region or not s3_expected_bucket_owner:
             raise ForgeError("S3 region and expected bucket owner are required")
@@ -3101,7 +3123,7 @@ def _restore_repository(
                     raise ForgeError("object store path has an unsafe component")
             target_object_store_path = candidate if candidate.is_absolute() else new_root / candidate
         else:
-            raise ForgeError("object store must be filesystem, filesystem:PATH, or an s3:// URI")
+            raise ForgeError("object store must be filesystem[:PATH], an s3:// URI, or an artifacts+https:// URI")
     target_store = None
     if target_s3_config is not None:
         try:
@@ -3111,6 +3133,19 @@ def _restore_repository(
                 raise ForgeError("restore target manifest already exists", "conflict")
             if target_store.list_prefix(f"repos/{config['repository_id']}/"):
                 raise ForgeError("restore target S3 prefix is not unused", "conflict")
+        except ForgeError:
+            raise
+        except ObjectStoreError as error:
+            raise ForgeError("object storage is unavailable", "storage") from error
+    if target_artifacts_config is not None:
+        try:
+            with tempfile.TemporaryDirectory(prefix="bastion-artifacts-restore-check-") as check_dir:
+                probe_store = ArtifactsObjectStore.from_config(
+                    target_artifacts_config,
+                    cache_dir=Path(check_dir) / "artifacts-store.git",
+                )
+                if probe_store.list_prefix(f"repos/{config['repository_id']}/"):
+                    raise ForgeError("restore target Artifacts repository namespace is not unused", "conflict")
         except ForgeError:
             raise
         except ObjectStoreError as error:
@@ -3189,6 +3224,7 @@ def _restore_repository(
             config["canonical_branch"],
             target_object_store_path,
             s3_config=target_s3_config,
+            artifacts_config=target_artifacts_config,
         )
         # Spec 013: raw tokens.json is never restored. Legacy backups may
         # still ship the file; verify it when listed, then drop it so the
@@ -3197,8 +3233,14 @@ def _restore_repository(
         if "tokens.json" in artifacts:
             _read_backup_file(backup, "tokens.json", artifacts["tokens.json"])
         if target_store is None:
-            assert target_object_store_path is not None
-            target_store = FilesystemObjectStore(target_object_store_path)
+            if target_artifacts_config is not None:
+                target_store = ArtifactsObjectStore.from_config(
+                    target_artifacts_config,
+                    cache_dir=new_root / "materializations" / "artifacts-store.git",
+                )
+            else:
+                assert target_object_store_path is not None
+                target_store = FilesystemObjectStore(target_object_store_path)
         ordered_entries = sorted(object_entries, key=lambda entry: entry["key"] == "manifest.json")
         for entry in ordered_entries:
             key = entry["key"]

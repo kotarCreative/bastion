@@ -24,6 +24,30 @@ A receive validates one linear branch update in Git quarantine, checks principal
 
 Administrative canonical updates and policy transitions use the same WAL publication path. Policy transitions start parentless projection epochs so newly hidden history is not retained in the active view closure.
 
+## Cloudflare Artifacts Storage
+
+The Artifacts adapter maps logical object keys to Git blobs in a private storage
+branch. Each body has separate version metadata with a fresh opaque generation,
+so changing an object back to earlier bytes does not make a stale version valid.
+A storage mutation creates a commit from the observed remote ref and pushes with
+an exact expected ref. If another storage writer wins, the adapter rechecks the
+object's precondition before retrying. Uncertain writes retain the existing
+ambiguous-outcome recovery behavior at the repository layer.
+
+The Artifacts branch commit serializes storage changes; the Bastion manifest
+still selects the committed WAL chain. Packs uploaded before a rejected manifest
+publication remain unreferenced objects. The local Artifacts Git cache is
+disposable and remote branch queries determine freshness.
+
+The hosted Cloudflare profile uses a Worker with an Artifacts binding and a
+singleton Container for the existing Git processes and Python application.
+Because Container filesystems are ephemeral, the SQLite catalog and credential
+state are checkpointed to the private Artifacts storage before mutation responses
+are acknowledged. Cold start restores that checkpoint and replays committed WAL
+events. The backing repository includes hidden source and credential records,
+so its server token never becomes a client credential. Clients access only
+Bastion's permission-bounded projection and authenticated intake endpoints.
+
 ## Identity
 
 Principals are users or service accounts. Immutable teams, roles, and bindings resolve into a content-addressed effective descriptor (algorithm `capabilities-v3`) containing provenance and per-capability allow and deny prefixes. Prefix lists are normalized, sorted, and exact-deduplicated but never ancestor-minimized, so every prefix that can win longest-match adjudication is preserved. Descriptor identity is independent of a physical view name.

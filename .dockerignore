@@ -7,6 +7,10 @@
 __pycache__
 *.py[cod]
 .benchmarks
+.firecrawl
+**/node_modules
+**/.wrangler
+**/.dev.vars
 work
 results.json
 deployment/terraform

@@ -2,6 +2,10 @@ work/
 __pycache__/
 .venv/
 .poetry/
+.firecrawl/
+**/node_modules/
+**/.wrangler/
+**/.dev.vars
 **/.terraform/
 *.tfplan
 *.tfstate

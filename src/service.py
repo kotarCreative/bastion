@@ -25,6 +25,7 @@ from materialization import (
 )
 from repository import AlreadyCommitted, Candidate, Repository, write_repository_config
 from object_store_s3 import S3ObjectStore, parse_s3_uri
+from object_store_artifacts import ArtifactsObjectStore, ArtifactsObjectStoreConfig, parse_artifacts_uri
 from object_store import ObjectStoreError
 from state import (
     audit_event,
@@ -66,6 +67,7 @@ def init_forge(
     admin_database: str | None = None,
     s3_region: str | None = None,
     s3_expected_bucket_owner: str | None = None,
+    artifacts_config: ArtifactsObjectStoreConfig | None = None,
 ) -> None:
     if run("git", "check-ref-format", "--branch", branch, check=False).returncode:
         raise ForgeError(f"invalid branch name: {branch}")
@@ -120,7 +122,17 @@ def init_forge(
     resolved_owner = s3_expected_bucket_owner or os.environ.get("BASTION_S3_EXPECTED_BUCKET_OWNER")
     s3_config = None
     object_store_path = None
-    if requested_object_store.startswith("s3://"):
+    if artifacts_config is not None:
+        if requested_object_store != "filesystem":
+            raise ForgeError("artifacts configuration conflicts with object store URI")
+    elif requested_object_store.startswith("artifacts+https://"):
+        if s3_region is not None or s3_expected_bucket_owner is not None:
+            raise ForgeError("S3 options are invalid for Artifacts storage")
+        try:
+            artifacts_config = parse_artifacts_uri(requested_object_store)
+        except ValueError as error:
+            raise ForgeError(str(error)) from error
+    elif requested_object_store.startswith("s3://"):
         if not resolved_region or not resolved_owner:
             raise ForgeError("S3 region and expected bucket owner are required")
         try:
@@ -148,6 +160,7 @@ def init_forge(
         branch,
         object_store_path,
         s3_config=s3_config,
+        artifacts_config=artifacts_config,
     )
     state.update(
         {

@@ -40,6 +40,8 @@ roadmap work.
 - [Testing and local operation](docs/TESTING.md)
 - [Test deployment](docs/DEPLOYMENT.md)
 - [AWS dev deployment](deployment/terraform/aws/README.md)
+- [Cloudflare deployment](deployment/cloudflare/README.md)
+- [Artifacts migration plan](docs/CLOUDFLARE_PLAN.md)
 - [Alchemy deployment evaluation](docs/ALCHEMY_EVALUATION.md)
 - [Roadmap](ROADMAP.md)
 
@@ -139,3 +141,44 @@ python3 forge.py check /tmp/bastion-forge
 ```
 
 Run `python3 forge.py --help` for all experimental commands.
+
+## Cloudflare Artifacts
+
+The Cloudflare profile runs Bastion's Python and Git engine in a Cloudflare
+Container behind a Worker. A private Artifacts repository stores the WAL,
+canonical and submission packs, policy descriptors, and hosted control-plane
+checkpoint. Git materializations and the local storage cache can be rebuilt.
+
+Use an Artifacts remote returned by the Cloudflare API or Workers binding:
+
+```bash
+export BASTION_ARTIFACTS_TOKEN='<private repository write token>'
+python3 forge.py init /tmp/bastion-artifacts /path/to/source --branch main \
+  --object-store 'artifacts+https://<ACCOUNT_ID>.artifacts.cloudflare.net/git/default/bastion.git'
+```
+
+The storage branch defaults to `bastion-storage`; URI query parameters `branch`
+and `token_env` select another branch or credential environment variable. The
+persisted configuration contains the remote, branch, and variable name.
+
+Migrate an existing forge with its consistent backup and restore path:
+
+```bash
+python3 forge.py backup /path/to/forge /path/to/backup
+python3 forge.py restore /path/to/backup /path/to/new-forge \
+  --object-store 'artifacts+https://<ACCOUNT_ID>.artifacts.cloudflare.net/git/default/bastion.git'
+python3 forge.py check /path/to/new-forge
+```
+
+Restore requires unused storage keys for the repository being migrated. It
+preserves repository identity, history, policy assignments, accounts, and scoped
+token records. For a hosted Container, follow the deployment instructions to
+install the control-plane checkpoint as well.
+
+Artifacts credentials grant access to the entire private backing repository.
+Users and agents use Bastion's projected Git endpoints and scoped tokens;
+the Worker never issues backing-repository tokens to them. Artifacts stores
+Bastion's durable object data as versioned Git files. Projection and intake
+validation continue to run in Bastion.
+
+Bastion is available under the [MIT license](LICENSE).

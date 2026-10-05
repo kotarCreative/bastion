@@ -17,6 +17,7 @@ from store import LEASE_TTL_SECONDS, open_store
 class _Sessions(threading.local):
     def __init__(self) -> None:
         self.active: dict[str, dict] = {}
+        self.commit_observers: list[tuple[str, Callable[[], None]]] = []
 
 
 _sessions = _Sessions()
@@ -24,6 +25,28 @@ _sessions = _Sessions()
 
 def _session_for(root: Path) -> dict | None:
     return _sessions.active.get(str(root.resolve()))
+
+
+@contextlib.contextmanager
+def observe_state_commits(root: Path, callback: Callable[[], None]) -> Iterator[None]:
+    """Run ``callback`` after each committed ``save_state`` for this thread/root.
+
+    This narrow observer lets hosted runtimes durably checkpoint catalog
+    policy before a later WAL publication can make that policy active.
+    """
+    registration = (str(root.resolve()), callback)
+    _sessions.commit_observers.append(registration)
+    try:
+        yield
+    finally:
+        _sessions.commit_observers.remove(registration)
+
+
+def _notify_state_commit(root: Path) -> None:
+    resolved = str(root.resolve())
+    for observed_root, callback in tuple(_sessions.commit_observers):
+        if observed_root == resolved:
+            callback()
 
 
 def load_state(root: Path) -> dict:
@@ -163,12 +186,14 @@ def save_state(root: Path, state: dict) -> None:
             baseline_versions=session.get("baseline_versions"),
         )
         _refresh_session_baseline(session, state, outcome)
+        _notify_state_commit(root)
         return
     store = open_store(root)
     try:
         store.save_document(state, [], root)
     finally:
         store.close()
+    _notify_state_commit(root)
 
 
 def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
