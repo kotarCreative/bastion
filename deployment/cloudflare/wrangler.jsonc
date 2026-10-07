@@ -14,11 +14,13 @@
   ],
   "durable_objects": {
     "bindings": [
-      { "name": "FORGE", "class_name": "ForgeContainer" }
+      { "name": "FORGE", "class_name": "ForgeContainer" },
+      { "name": "CATALOG", "class_name": "ForgeCatalog" }
     ]
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["ForgeContainer"] }
+    { "tag": "v1", "new_sqlite_classes": ["ForgeContainer"] },
+    { "tag": "v2", "new_sqlite_classes": ["ForgeCatalog"] }
   ],
   "artifacts": [
     { "binding": "ARTIFACTS", "namespace": "default" }
@@ -26,5 +28,6 @@
   "vars": {
     "ARTIFACTS_REPO": "bastion-private",
     "BASTION_ROOT": "/var/lib/bastion/forge"
-  }
+  },
+  "observability": { "enabled": true, "traces": { "enabled": true } }
 }

@@ -1,4 +1,6 @@
-import { Container } from "@cloudflare/containers";
+import { Container, ContainerProxy, type OutboundHandler } from "@cloudflare/containers";
+export { ContainerProxy };
+export { ForgeCatalog } from "./catalog";
 
 interface Env extends Cloudflare.Env {
 	BASTION_ADMIN_SECRET: string;
@@ -33,6 +35,12 @@ function json(body: unknown, status = 200): Response {
 }
 
 export class ForgeContainer extends Container<Env> {
+	static {
+		this.outboundByHost = {
+			"catalog.bastion.internal": (request, env, ctx) =>
+				env.CATALOG.getByName(ctx.containerId).fetch(request),
+		} satisfies Record<string, OutboundHandler<Env>>;
+	}
 	defaultPort = PORT;
 	requiredPorts = [PORT];
 	sleepAfter = "10m";
@@ -118,6 +126,8 @@ export class ForgeContainer extends Container<Env> {
 					BASTION_ARTIFACTS_TOKEN: activeConfig.token,
 					BASTION_BOOTSTRAP_ADMIN_PASSWORD: this.env.BASTION_BOOTSTRAP_ADMIN_PASSWORD,
 					BASTION_ROOT: "/var/lib/bastion/forge",
+					BASTION_DATABASE: "durable_objects",
+					BASTION_CATALOG_ENDPOINT: "http://catalog.bastion.internal",
 				},
 			},
 		});
