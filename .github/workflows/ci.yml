@@ -27,6 +27,33 @@ jobs:
       - name: Run full test suite
         run: poetry run python -m unittest discover -s tests -t . -v
 
+  cloudflare:
+    name: Cloudflare catalog and recovery tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: deployment/cloudflare/package-lock.json
+      - name: Install dependencies
+        run: |
+          python -m pip install --disable-pip-version-check poetry==2.4.3
+          poetry install --no-interaction
+          npm ci --prefix deployment/cloudflare
+      - name: Check Worker and catalog transactions
+        working-directory: deployment/cloudflare
+        run: |
+          npm run check
+          npm test
+          npx wrangler deploy --dry-run --containers-rollout=none
+      - name: Check Python backend, migration, and cold recovery
+        run: poetry run python -m unittest tests.test_durable_objects -v
+
   postgres:
     name: PostgreSQL storage tests
     runs-on: ubuntu-latest
