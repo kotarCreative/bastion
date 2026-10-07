@@ -5,9 +5,9 @@ Branch: `feat/cloudflare-artifacts`.
 ## Outcome
 
 Bastion runs behind a Cloudflare Worker with its existing permission based Git
-projections. Cloudflare Artifacts stores repository truth and the hosted
-control-plane checkpoint. Container disk holds disposable Git materializations
-and a working SQLite database restored from that checkpoint.
+projections. Cloudflare Artifacts stores repository truth. A SQLite-backed Durable Object
+stores the hosted control plane. Container disk holds disposable Git
+materializations and reconstructed configuration, with no live SQLite database.
 
 ## Implementation
 
@@ -19,9 +19,9 @@ and a working SQLite database restored from that checkpoint.
    and restore. Migrate an existing forge with its consistent backup and restore
    path so repository identity, policies, history, accounts, and tokens survive.
 3. Add a Worker using the Artifacts binding and a singleton Cloudflare Container
-   running Python and Git. Persist the hosted catalog and account database in
-   Artifacts before acknowledging mutations. Restore it at cold start and replay
-   newer committed WAL records.
+   running Python and Git. Store the hosted catalog and account database in a
+   separate Durable Object using atomic SQL transactions. Import legacy Artifacts
+   snapshots once, reconstruct configuration at cold start, and replay newer WAL records.
 4. Verify the adapter with actual Git remotes, competing writers, ambiguous
    writes, stale versions, and cache loss. Exercise permission isolation and
    migration, then inspect deployment configuration and restart recovery.
@@ -52,8 +52,8 @@ evidence and the remaining live deployment checks.
   repository identity or permissions.
 - Worker configuration uses documented Artifacts and Containers bindings;
   backing tokens remain private.
-- A hosted control-plane checkpoint survives Container disk loss and catalog
-  edits are durable before a success response.
+- The Durable Object catalog survives Container disk loss and catalog edits
+  are durable before a success response, without full SQLite checkpoints.
 - Documented setup and a concurrent-agent demonstration can be run by another
   developer. A live deployment additionally requires a Cloudflare account with
   Workers Paid and Artifacts access.

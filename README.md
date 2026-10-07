@@ -24,7 +24,7 @@ restrictions:
 - view materialization and database indexes are rebuildable; worker jobs are
   only freshness hints;
 - logical `Change-Id` metadata links different Git representations;
-- durable control-plane state lives in SQLite (default) or PostgreSQL as
+- durable control-plane state lives in SQLite (default), PostgreSQL, or Cloudflare Durable Objects as
   versioned, checksummed document rows guarded by lease-based sessions.
 
 This is a local architecture experiment, not a production security boundary.
@@ -145,9 +145,10 @@ Run `python3 forge.py --help` for all experimental commands.
 ## Cloudflare Artifacts
 
 The Cloudflare profile runs Bastion's Python and Git engine in a Cloudflare
-Container behind a Worker. A private Artifacts repository stores the WAL,
-canonical and submission packs, policy descriptors, and hosted control-plane
-checkpoint. Git materializations and the local storage cache can be rebuilt.
+Container behind a Worker. A SQLite-backed Durable Object stores the persistent
+control plane. A private Artifacts repository stores the WAL, canonical and
+submission packs, and policy descriptors. Git materializations and the local
+storage cache can be rebuilt; the hosted runtime has no live SQLite file.
 
 Use an Artifacts remote returned by the Cloudflare API or Workers binding:
 
@@ -173,7 +174,7 @@ python3 forge.py check /path/to/new-forge
 Restore requires unused storage keys for the repository being migrated. It
 preserves repository identity, history, policy assignments, accounts, and scoped
 token records. For a hosted Container, follow the deployment instructions to
-install the control-plane checkpoint as well.
+stage the one-time Durable Object catalog import as well.
 
 Artifacts credentials grant access to the entire private backing repository.
 Users and agents use Bastion's projected Git endpoints and scoped tokens;
