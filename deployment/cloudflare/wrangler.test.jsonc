@@ -1,0 +1,8 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "bastion-catalog-test",
+  "main": "test/catalog-worker.ts",
+  "compatibility_date": "2026-10-04",
+  "durable_objects": { "bindings": [{ "name": "CATALOG", "class_name": "ForgeCatalog" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ForgeCatalog"] }]
+}

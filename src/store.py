@@ -1,4 +1,4 @@
-"""Durable control-plane store with SQLite and PostgreSQL backends."""
+"""Durable control-plane store with SQLite, PostgreSQL, and Durable Objects backends."""
 
 from __future__ import annotations
 
@@ -15,6 +15,10 @@ import time
 import urllib.parse
 import uuid
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from durable_store import DurableObjectsBackend
 
 from errors import ForgeError
 from object_store_s3 import MAX_OBJECT_SIZE
@@ -152,7 +156,7 @@ def read_backend_record(root: Path) -> dict:
     except (OSError, json.JSONDecodeError) as error:
         raise ForgeError(f"cannot read forge backend record: {error}") from error
     kind = record.get("backend")
-    if kind not in {"sqlite", "postgres"}:
+    if kind not in {"sqlite", "postgres", "durable_objects"}:
         raise ForgeError(f"unknown storage backend: {kind!r}")
     if kind == "postgres" and not record.get("dsn"):
         raise ForgeError("postgres backend record lacks a dsn")
@@ -211,6 +215,12 @@ def load_principals_readonly(root: Path) -> dict[str, dict]:
     record = read_backend_record(root)
     if record["backend"] == "sqlite":
         return _load_table_readonly_sqlite(root / "store.sqlite3", "principals")
+    if record["backend"] == "durable_objects":
+        store = open_store(root)
+        try:
+            return store.load_sections(["principals"])["principals"]
+        finally:
+            store.close()
     dsn = _PostgresBackend._scoped_dsn(record["dsn"], root)
     return _load_table_readonly_postgres(dsn, "principals")
 
@@ -239,6 +249,12 @@ def load_forge_meta_readonly(root: Path) -> dict:
             return parsed
         finally:
             connection.close()
+    if record["backend"] == "durable_objects":
+        store = open_store(root)
+        try:
+            return store.load_sections([])
+        finally:
+            store.close()
     try:
         import psycopg
     except ImportError as error:
@@ -335,6 +351,14 @@ def _postgres_ddl() -> str:
         for table in DOCUMENT_TABLES
     ]
     return ";\n".join(statements)
+
+
+def _index_ddl() -> list[str]:
+    return [
+        "CREATE UNIQUE INDEX IF NOT EXISTS audit_log_event_id "
+        "ON audit_log(event_id) WHERE event_id IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS storage_locks_owner ON storage_locks(owner)",
+    ]
 
 
 class _SqliteBackend:
@@ -1175,7 +1199,7 @@ def _owner_alive(owner: str, local_host: str | None = None, local_boot: str | No
 class Store:
     """One open connection to a forge's durable state."""
 
-    def __init__(self, backend: _SqliteBackend | _PostgresBackend):
+    def __init__(self, backend: _SqliteBackend | _PostgresBackend | DurableObjectsBackend):
         self.backend = backend
         self.connection = backend.connect()
 
@@ -1211,15 +1235,8 @@ class Store:
             raise ForgeError(f"cannot initialize storage schema: {error}") from error
 
     def _ensure_indexes(self) -> None:
-        self._execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS audit_log_event_id "
-            "ON audit_log(event_id) WHERE event_id IS NOT NULL",
-            (),
-        )
-        self._execute(
-            "CREATE INDEX IF NOT EXISTS storage_locks_owner ON storage_locks(owner)",
-            (),
-        )
+        for statement in _index_ddl():
+            self._execute(statement, ())
 
     def _insert_placeholder_free(self, head: str, values: tuple) -> None:
         placeholders = ", ".join([self.backend.param] * len(values))
@@ -1298,7 +1315,7 @@ class Store:
         begin_read = getattr(self.backend, "begin_read", self.backend.begin)
         begin_read(self.connection)
         try:
-            if self.backend.kind == "sqlite":
+            if self.backend.param == "?":
                 rows = self._fetchall(
                     f"SELECT key, doc FROM {table} "
                     f"WHERE json_extract(doc, {self.backend.param}) = {self.backend.param}",
@@ -1327,7 +1344,7 @@ class Store:
         begin_read = getattr(self.backend, "begin_read", self.backend.begin)
         begin_read(self.connection)
         try:
-            if self.backend.kind == "sqlite":
+            if self.backend.param == "?":
                 rows = self._fetchall(
                     f"SELECT key, doc FROM {table} WHERE EXISTS ("
                     f"SELECT 1 FROM json_each(json_extract(doc, {self.backend.param})) "
@@ -1881,7 +1898,7 @@ class Store:
         local_host = host_forge_id(local_root) if isinstance(local_root, Path) else None
         local_boot = _linux_boot_id()
         begin_write = getattr(self.backend, "begin_write", self.backend.begin)
-        sqlite_backend = self.backend.kind == "sqlite"
+        sqlite_backend = self.backend.param == "?"
         while True:
             begin_write(self.connection)
             try:
@@ -2303,6 +2320,9 @@ def open_store(root: Path, *, use_pool: bool = True) -> Store:
         if not path.exists():
             raise ForgeError("forge state is not initialized", "storage")
         return Store(_SqliteBackend(path))
+    if record["backend"] == "durable_objects":
+        from durable_store import DurableObjectsBackend
+        return Store(DurableObjectsBackend(root))
     return Store(_PostgresBackend(record["dsn"], root, pooled=use_pool))
 
 
@@ -2325,12 +2345,17 @@ def initialize_store(
     admin_uri = os.environ.get("BASTION_ADMIN_DATABASE") or admin_database
     if uri.startswith("postgres://") or uri.startswith("postgresql://"):
         record = {"backend": "postgres", "dsn": uri}
+    elif uri == "durable_objects":
+        record = {"backend": "durable_objects"}
     elif uri in ("", "sqlite"):
         record = {"backend": "sqlite"}
     else:
         raise ForgeError(f"unsupported database URI: {uri!r}")
     if record["backend"] == "sqlite":
         store = Store(_SqliteBackend(root / "store.sqlite3"))
+    elif record["backend"] == "durable_objects":
+        from durable_store import DurableObjectsBackend
+        store = Store(DurableObjectsBackend(root))
     else:
         backend = _PostgresBackend(record["dsn"], root, pooled=False)
         # Provisioning happens here (init path) and never in open_store, and
@@ -2522,7 +2547,7 @@ def _backup_repository(
         keys.add(pack["pack_key"])
         keys.add(pack["idx_key"])
     keys.update(f"descriptors/{identifier}.json" for identifier in descriptor_ids)
-    backend_kind = store.backend.kind
+    backend_kind = "sqlite" if store.backend.kind == "durable_objects" else store.backend.kind
     if backend_kind not in {"sqlite", "postgres"}:
         raise ForgeError("unknown storage backend", "storage")
     destination.mkdir(parents=True)

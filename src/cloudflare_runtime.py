@@ -324,6 +324,9 @@ def build_app():
 
     root = Path(os.environ.get("BASTION_ROOT", "/var/lib/bastion/forge"))
     store = build_store()
+    if os.environ.get("BASTION_DATABASE") == "durable_objects":
+        from cloudflare_durable_runtime import build_app as build_durable_app
+        return build_durable_app(root, store)
     try:
         payload, version = _read_snapshot(store)
     except Exception:
