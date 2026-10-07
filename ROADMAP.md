@@ -33,8 +33,8 @@ Bastion currently provides:
 
 ## Server Boundary
 
-- Promote the experimental password login to production identity with TLS,
-  MFA/recovery, rate limiting, quotas, and full account lifecycle management.
+- Complete Clerk production rollout with TLS, webhook-driven deprovisioning,
+  distributed rate limiting, quotas, and administrator invitation management.
 - Add a production SSH entry point.
 - Re-run hidden-object and thin-pack tests against both transports.
 - Add monitoring, tracing, alerting, and service-level objectives.

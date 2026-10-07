@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import cloudflare_runtime
 import forge
 import service
+from accounts import link_clerk_account
 from identity import CAPABILITIES
 from http_server import add_token
 from materialization import ensure_canonical_materialized
@@ -110,7 +111,7 @@ class CloudflareRuntimeIntegrationTest(unittest.TestCase):
                 "BASTION_ARTIFACTS_REMOTE": remote_fixture.remote,
                 "BASTION_ARTIFACTS_TOKEN": "test-backing-token",
                 "BASTION_ARTIFACTS_CACHE": str(cache),
-                "BASTION_BOOTSTRAP_ADMIN_PASSWORD": "bootstrap-recovery-password",
+                "BASTION_BOOTSTRAP_ADMIN_EMAIL": "admin@example.test",
             }
             with patch.dict(os.environ, environment, clear=False), patch.object(
                 ArtifactsObjectStore, "from_config", new=classmethod(https_from_config)
@@ -135,10 +136,9 @@ class CloudflareRuntimeIntegrationTest(unittest.TestCase):
                 restored_config = json.loads((root / "repository.json").read_text())
                 self.assertEqual(original_repository_id, restored_config["repository_id"])
                 self.assertEqual("artifacts", restored_config["object_store"]["kind"])
-                self.assertTrue(
-                    __import__("accounts").verify_password(
-                        root, "admin", "bootstrap-recovery-password"
-                    )
+                self.assertEqual(
+                    ["admin@example.test"],
+                    load_state(root)["principals"]["admin"]["emails"],
                 )
                 manifest, _version, replay = Repository.open(root).load(use_cache=False)
                 self.assertEqual("ready", load_state(root)["repository_state"])
@@ -175,7 +175,7 @@ class CloudflareRuntimeIntegrationTest(unittest.TestCase):
                 "BASTION_ARTIFACTS_REMOTE": remote_fixture.remote,
                 "BASTION_ARTIFACTS_TOKEN": "test-backing-token",
                 "BASTION_ARTIFACTS_CACHE": str(runtime_cache),
-                "BASTION_BOOTSTRAP_ADMIN_PASSWORD": "owner-password-for-recovery",
+                "BASTION_BOOTSTRAP_ADMIN_EMAIL": "admin@example.test",
             }
             with patch.dict(os.environ, environment, clear=False), patch.object(
                 ArtifactsObjectStore,
@@ -192,8 +192,9 @@ class CloudflareRuntimeIntegrationTest(unittest.TestCase):
                 self.assertEqual("artifacts", old_config["object_store"]["kind"])
                 clear_repository_cache()
 
-                # Give Bob a read-only view. The owner account comes from the
-                # cold-start password bootstrap above.
+                # Give Bob a read-only view. The owner invitation comes from
+                # the cold-start email bootstrap above.
+                link_clerk_account(root, "user_runtimeAdmin", ["admin@example.test"])
                 add_principal(root, "bob", ["bob@example.test"])
                 bob_allow = {capability: [] for capability in CAPABILITIES}
                 bob_deny = {capability: [] for capability in CAPABILITIES}
@@ -208,16 +209,6 @@ class CloudflareRuntimeIntegrationTest(unittest.TestCase):
                 )
 
                 server = HttpServer(runtime)
-                status, body, _headers = _http(
-                    server,
-                    "/api/v1/login",
-                    method="POST",
-                    body={"username": "admin", "password": "owner-password-for-recovery"},
-                )
-                self.assertEqual(200, status, body)
-                login = json.loads(body)
-                self.assertIn("access_token", login)
-                self.assertEqual("admin", login["session"]["principal"]["id"])
                 self.assertTrue(
                     all(entry["auth_passed"] for entry in remote_fixture.request_log)
                 )
@@ -235,9 +226,9 @@ class CloudflareRuntimeIntegrationTest(unittest.TestCase):
                 commit_env = dict(os.environ)
                 commit_env.update(
                     GIT_AUTHOR_NAME="Runtime Test",
-                    GIT_AUTHOR_EMAIL="admin@bastion.invalid",
+                    GIT_AUTHOR_EMAIL="admin@example.test",
                     GIT_COMMITTER_NAME="Runtime Test",
-                    GIT_COMMITTER_EMAIL="admin@bastion.invalid",
+                    GIT_COMMITTER_EMAIL="admin@example.test",
                 )
                 _run("git", "-C", str(clone), "commit", "-m", "Add recovery content", env=commit_env)
                 _run("git", "-C", str(clone), "push", authenticated_url, "HEAD:main")
@@ -267,7 +258,7 @@ class CloudflareRuntimeIntegrationTest(unittest.TestCase):
                         server,
                         "/api/v1/permissions",
                         method="POST",
-                        token=login["access_token"],
+                        token=push_token,
                         body={
                             "view_id": "bob",
                             "path_b64": base64.b64encode(path.encode()).decode(),
@@ -356,18 +347,9 @@ class CloudflareRuntimeIntegrationTest(unittest.TestCase):
                 # hidden blob.
                 restarted_server = HttpServer(runtime)
                 self.addCleanup(restarted_server.close)
-                status, body, _headers = _http(
-                    restarted_server,
-                    "/api/v1/login",
-                    method="POST",
-                    body={"username": "admin", "password": "owner-password-for-recovery"},
-                )
-                self.assertEqual(200, status, body)
-                self.assertEqual("admin", json.loads(body)["session"]["principal"]["id"])
-                self.assertTrue(
-                    __import__("accounts").verify_password(
-                        root, "admin", "owner-password-for-recovery"
-                    )
+                self.assertEqual(
+                    "user_runtimeAdmin",
+                    load_state(root)["principals"]["admin"]["clerk_user_id"],
                 )
                 status, _body, _headers = _http(
                     restarted_server, "/api/v1/session", token=bob_token
@@ -385,7 +367,7 @@ class CloudflareRuntimeIntegrationTest(unittest.TestCase):
                     restarted_server,
                     "/api/v1/permissions",
                     method="POST",
-                    token=login["access_token"],
+                    token=push_token,
                     body={
                         "view_id": "bob",
                         "path_b64": base64.b64encode(b"README.md").decode(),

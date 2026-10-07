@@ -8,16 +8,6 @@ resource "random_password" "db_runtime" {
   special = false
 }
 
-resource "random_password" "demo_tester" {
-  length  = 32
-  special = false
-}
-
-resource "random_password" "demo_observer" {
-  length  = 32
-  special = false
-}
-
 resource "aws_secretsmanager_secret" "db_admin" {
   name_prefix             = "${local.name}-db-admin-"
   description             = "One-shot PostgreSQL administration DSN used by the bootstrap task."
@@ -40,21 +30,6 @@ resource "aws_secretsmanager_secret" "db_runtime" {
 resource "aws_secretsmanager_secret_version" "db_runtime" {
   secret_id     = aws_secretsmanager_secret.db_runtime.id
   secret_string = "postgresql://bastion_runtime:${random_password.db_runtime.result}@${aws_db_instance.main.endpoint}/postgres?sslmode=require"
-}
-
-resource "aws_secretsmanager_secret" "demo_accounts" {
-  name_prefix             = "${local.name}-demo-accounts-"
-  description             = "Generated browser passwords for the test accounts."
-  recovery_window_in_days = 7
-  tags                    = local.tags
-}
-
-resource "aws_secretsmanager_secret_version" "demo_accounts" {
-  secret_id = aws_secretsmanager_secret.demo_accounts.id
-  secret_string = jsonencode({
-    tester_password   = random_password.demo_tester.result
-    observer_password = random_password.demo_observer.result
-  })
 }
 
 resource "aws_secretsmanager_secret" "bootstrap_tokens" {

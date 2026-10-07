@@ -28,9 +28,9 @@ restrictions:
   versioned, checksummed document rows guarded by lease-based sessions.
 
 This is a local architecture experiment, not a production security boundary.
-The browser has password-backed user accounts and scoped in-memory sessions,
-but TLS, account recovery, and the wider production identity surface remain
-roadmap work.
+Clerk owns browser signup, sign-in, recovery, MFA/passkeys, and account
+management. Bastion owns repository invitations, principals, permissions, and
+short-lived view-scoped API tokens.
 
 ## Documentation
 
@@ -105,15 +105,82 @@ Then open `http://127.0.0.1:8000/`, enter the token, and browse the effective
 permissions, evaluate path decisions, view the projected tree and visible
 history, and clone the same view with an unmodified Git client.
 
-For account sign-in, set a password on an existing user principal. Passwords
-are read interactively by default so they do not appear in shell history:
+### Clerk authentication setup
+
+Clerk is Bastion's browser identity provider. It supplies account creation,
+email verification, sign-in, recovery, MFA/passkeys, session management, and
+the user profile UI. Bastion continues to own repository invitations and all
+authorization decisions.
+
+1. Create an application in the [Clerk Dashboard](https://dashboard.clerk.com/).
+   Enable the sign-in methods you want users to have and require email
+   verification. MFA and passkeys can be enabled from the same dashboard.
+2. Add the Bastion origin to the Clerk application's allowed origins. For local
+   development this is `http://127.0.0.1:8000`. Use the exact HTTPS origin in a
+   deployed environment, with no path or trailing slash.
+3. Copy the publishable and secret keys from Clerk's **API keys** page and set
+   the server environment:
 
 ```bash
-python3 forge.py set-password /tmp/bastion-forge alice
+export CLERK_PUBLISHABLE_KEY='pk_test_...'
+export CLERK_SECRET_KEY='sk_test_...'
+export CLERK_AUTHORIZED_PARTIES='http://127.0.0.1:8000'
+```
+
+`CLERK_AUTHORIZED_PARTIES` is a comma-separated list when more than one origin
+is permitted. Bastion validates Clerk's `azp` claim against this list. A partial
+Clerk configuration fails startup rather than falling back to another account
+system.
+
+For networkless JWT signature verification, copy the instance **JWKS public
+key** from Clerk's **API keys** page and also set:
+
+```bash
+export CLERK_JWT_KEY='-----BEGIN PUBLIC KEY-----
+...
+-----END PUBLIC KEY-----'
+```
+
+The secret key is still required because Bastion retrieves the authenticated
+user's verified email addresses from Clerk's Backend API when claiming an
+invitation.
+
+4. Invite a user by creating a Bastion principal with the same verified email,
+   assigning its permissions, and creating a view. The earlier quick-start
+   commands already do this for `alice`:
+
+```bash
+python3 forge.py add-principal /tmp/bastion-forge alice \
+  --email alice@example.test
 python3 forge.py add-role /tmp/bastion-forge alice-owner --allow admin=
 python3 forge.py bind-role /tmp/bastion-forge alice-owner --principal alice
-python3 forge.py transition-principal /tmp/bastion-forge alice
+python3 forge.py add-view /tmp/bastion-forge alice \
+  --principal alice --branch main
 ```
+
+5. Start the browser application with the Clerk environment present:
+
+```bash
+.poetry/bin/poetry run python forge.py serve-demo \
+  /tmp/bastion-forge --port 8000
+```
+
+Open `http://127.0.0.1:8000/` and create or sign in to the Clerk account. On
+first sign-in, Bastion atomically links the Clerk user ID to the one invited
+principal whose declared email matches a verified Clerk address. The link is
+durable and does not change if the Clerk email is later edited. No match or an
+ambiguous match is denied, and creating a Clerk account alone never grants
+repository access.
+
+After sign-in, **Account** opens Clerk's profile and security management UI.
+Bastion exchanges the Clerk session for a one-hour, `ui`-only token bound to a
+specific repository view. Git and API tokens remain separately issued,
+revocable credentials.
+
+For the Cloudflare deployment, also set `BASTION_BOOTSTRAP_ADMIN_EMAIL` to the
+verified email that should claim the initial administrator. See
+[Bastion on Cloudflare](deployment/cloudflare/README.md#first-deployment) for
+the complete `wrangler secret put` sequence.
 
 An account whose active descriptor grants root `admin` capability is treated
 as a repository owner. Owners get a **Permissions** tab where they can make an

@@ -13,7 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import cloudflare_runtime
-from accounts import verify_password
+from accounts import link_clerk_account
 from durable_store import DurableObjectsBackend, StagedTransaction
 from errors import ForgeError
 from http_server import add_token
@@ -39,7 +39,7 @@ class DurableObjectsTest(unittest.TestCase):
             "BASTION_DATABASE": "durable_objects",
             "BASTION_ROOT": str(self.root),
             "BASTION_ARTIFACTS_CACHE": str(self.base / "cache"),
-            "BASTION_BOOTSTRAP_ADMIN_PASSWORD": "durable-recovery-password",
+            "BASTION_BOOTSTRAP_ADMIN_EMAIL": "admin@example.test",
         })
         self.environment.start()
         self.addCleanup(self.environment.stop)
@@ -232,14 +232,14 @@ class DurableObjectsTest(unittest.TestCase):
         self.addCleanup(adapter.stop)
         return remote
 
-    def test_fresh_bootstrap_tokens_and_password_survive_disk_and_do_restart(self):
+    def test_fresh_bootstrap_tokens_and_clerk_link_survive_disk_and_do_restart(self):
         self._artifacts()
         app = cloudflare_runtime.build_app()
         self.assertFalse((self.root / "store.sqlite3").exists())
         self.assertEqual("durable_objects", json.loads((self.root / "backend.json").read_text())["backend"])
         repository_id = Repository.open(self.root).repository_id
         token = add_token(self.root, "admin", scopes=["fetch", "push", "ui"])
-        self.assertTrue(verify_password(self.root, "admin", "durable-recovery-password"))
+        link_clerk_account(self.root, "user_durableAdmin", ["admin@example.test"])
         from tests.test_cloudflare_runtime_integration import HttpServer, _http
         server = HttpServer(app)
         self.addCleanup(server.close)
@@ -255,7 +255,7 @@ class DurableObjectsTest(unittest.TestCase):
         _run("git", "clone", authenticated, str(clone))
         (clone / "private.txt").write_text("must remain hidden from bob\n")
         _run("git", "-C", str(clone), "add", "private.txt")
-        commit_env = dict(os.environ, GIT_AUTHOR_NAME="DO Test", GIT_AUTHOR_EMAIL="admin@bastion.invalid", GIT_COMMITTER_NAME="DO Test", GIT_COMMITTER_EMAIL="admin@bastion.invalid")
+        commit_env = dict(os.environ, GIT_AUTHOR_NAME="DO Test", GIT_AUTHOR_EMAIL="admin@example.test", GIT_COMMITTER_NAME="DO Test", GIT_COMMITTER_EMAIL="admin@example.test")
         _run("git", "-C", str(clone), "commit", "-m", "Persist DO-backed push", env=commit_env)
         _run("git", "-C", str(clone), "push", authenticated, "HEAD:main")
         add_principal(self.root, "bob", ["bob@example.invalid"])
@@ -278,7 +278,10 @@ class DurableObjectsTest(unittest.TestCase):
         from store import backup_forge, restore_forge
         backup = backup_forge(self.root, self.base / "backup")
         restored = restore_forge(backup, self.base / "portable-restored", database="sqlite")
-        self.assertTrue(verify_password(restored, "admin", "durable-recovery-password"))
+        self.assertEqual(
+            "user_durableAdmin",
+            load_state(restored)["principals"]["admin"]["clerk_user_id"],
+        )
         self.assertEqual(repository_id, Repository.open(restored).repository_id)
         server.close()
         # Neither repository caches nor the Container filesystem carry durable
@@ -290,7 +293,10 @@ class DurableObjectsTest(unittest.TestCase):
         recovered = cloudflare_runtime.build_app()
         self.assertEqual(repository_id, Repository.open(self.root).repository_id)
         self.assertFalse((self.root / "store.sqlite3").exists())
-        self.assertTrue(verify_password(self.root, "admin", "durable-recovery-password"))
+        self.assertEqual(
+            "user_durableAdmin",
+            load_state(self.root)["principals"]["admin"]["clerk_user_id"],
+        )
         self.assertEqual("ready", load_state(self.root)["repository_state"])
         self.assertEqual(pushed_tip, Repository.open(self.root).load()[0].canonical_tip)
         self.assertEqual(["private.txt"], managed_private_paths(load_state(self.root), "bob"))
@@ -307,7 +313,10 @@ class DurableObjectsTest(unittest.TestCase):
             with self.assertRaisesRegex(ForgeError, "storage unavailable"):
                 cloudflare_runtime.build_app()
         self.runtime.start()
-        self.assertTrue(verify_password(self.root, "admin", "durable-recovery-password"))
+        self.assertEqual(
+            "user_durableAdmin",
+            load_state(self.root)["principals"]["admin"]["clerk_user_id"],
+        )
 
     def test_interrupted_bootstrap_resumes_same_catalog_after_disk_loss(self):
         self._artifacts()
@@ -329,7 +338,10 @@ class DurableObjectsTest(unittest.TestCase):
         self.runtime.restart()
         cloudflare_runtime.build_app()
         self.assertEqual(original_id, Repository.open(self.root).repository_id)
-        self.assertTrue(verify_password(self.root, "admin", "durable-recovery-password"))
+        self.assertEqual(
+            ["admin@example.test"],
+            load_state(self.root)["principals"]["admin"]["emails"],
+        )
         self.assertFalse((self.root / "store.sqlite3").exists())
 
     def test_interrupted_schema_initialization_resumes_without_resetting_data(self):
@@ -348,14 +360,18 @@ class DurableObjectsTest(unittest.TestCase):
         self.assertIsNone(self.runtime.client.status()["root"])
         # Retry with the same disk as a Gunicorn startup retry would do.
         cloudflare_runtime.build_app()
-        self.assertTrue(verify_password(self.root, "admin", "durable-recovery-password"))
+        self.assertEqual(
+            ["admin@example.test"],
+            load_state(self.root)["principals"]["admin"]["emails"],
+        )
         self.assertFalse((self.root / "store.sqlite3").exists())
 
-    def test_legacy_snapshot_import_preserves_identity_accounts_and_tokens(self):
+    def test_legacy_snapshot_import_preserves_identity_links_and_tokens(self):
         self._artifacts()
         with patch.dict(os.environ, {"BASTION_DATABASE": "sqlite"}):
             cloudflare_runtime.build_app()
             repository_id = Repository.open(self.root).repository_id
+            link_clerk_account(self.root, "user_importAdmin", ["admin@example.test"])
             token = add_token(self.root, "admin", scopes=["fetch", "ui"])
             cloudflare_runtime.checkpoint_root(self.root, cloudflare_runtime.build_store(), cloudflare_runtime._read_snapshot(cloudflare_runtime.build_store())[1])
         shutil.rmtree(self.root)
@@ -363,7 +379,10 @@ class DurableObjectsTest(unittest.TestCase):
         app = cloudflare_runtime.build_app()
         self.assertFalse((self.root / "store.sqlite3").exists())
         self.assertEqual(repository_id, Repository.open(self.root).repository_id)
-        self.assertTrue(verify_password(self.root, "admin", "durable-recovery-password"))
+        self.assertEqual(
+            "user_importAdmin",
+            load_state(self.root)["principals"]["admin"]["clerk_user_id"],
+        )
         from tests.test_cloudflare_runtime_integration import HttpServer, _http
         server = HttpServer(app)
         self.addCleanup(server.close)

@@ -10,8 +10,8 @@ is for invite-only testing with synthetic data, not production repositories.
 - S3 is authoritative repository truth.
 - RDS PostgreSQL stores the control plane.
 - EFS stores forge configuration and disposable Git materializations.
-- Secrets Manager stores separate database administration/runtime credentials,
-  generated browser passwords, and generated Git/API tokens.
+- Secrets Manager stores separate database administration/runtime credentials
+  and generated Git/API tokens.
 - ECR stores immutable image tags; ECS always uses a digest-qualified image.
 
 The long-lived task receives only the restricted PostgreSQL runtime credential.
@@ -113,18 +113,14 @@ The deployment prints the two secret ARNs. Retrieve their current values:
 
 ```bash
 aws secretsmanager get-secret-value \
-  --secret-id "$(terraform -chdir=deployment/terraform/aws output -raw demo_accounts_secret_arn)" \
-  --query SecretString --output text
-
-aws secretsmanager get-secret-value \
   --secret-id "$(terraform -chdir=deployment/terraform/aws output -raw bootstrap_tokens_secret_arn)" \
   --query SecretString --output text
 ```
 
-Raw passwords and tokens are not printed to CloudWatch logs or Terraform
-outputs. Re-running bootstrap stores new Git/API tokens and revokes the tokens
-from the previous secret version. It intentionally does not replace passwords
-on already-created accounts.
+Raw tokens are not printed to CloudWatch logs or Terraform outputs. Re-running
+bootstrap stores new Git/API tokens and revokes the tokens from the previous
+secret version. The AWS dev profile uses these tokens for smoke testing; Clerk
+configuration belongs in the production deployment profile.
 
 ## 6. Verify
 

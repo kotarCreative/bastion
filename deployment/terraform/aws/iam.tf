@@ -97,7 +97,6 @@ resource "aws_iam_role_policy" "bootstrap_execution_secrets" {
       Resource = [
         aws_secretsmanager_secret.db_admin.arn,
         aws_secretsmanager_secret.db_runtime.arn,
-        aws_secretsmanager_secret.demo_accounts.arn,
       ]
     }]
   })

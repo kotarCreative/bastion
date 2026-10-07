@@ -153,10 +153,10 @@ def _initialize_source(path: Path) -> None:
 
 
 def bootstrap_root(root: Path) -> None:
-    """Create the first small repository and password login on an empty store."""
-    password = os.environ.get("BASTION_BOOTSTRAP_ADMIN_PASSWORD", "")
-    if not password:
-        raise RuntimeError("BASTION_BOOTSTRAP_ADMIN_PASSWORD is required for first boot")
+    """Create the first small repository and Clerk invitation on an empty store."""
+    admin_email = os.environ.get("BASTION_BOOTSTRAP_ADMIN_EMAIL", "").strip()
+    if not admin_email:
+        raise RuntimeError("BASTION_BOOTSTRAP_ADMIN_EMAIL is required for first boot")
     from identity import CAPABILITIES
     from service import add_principal, add_role, add_view, bind_role, init_forge
     from identity import binding_identifier
@@ -164,7 +164,6 @@ def bootstrap_root(root: Path) -> None:
     from state import load_state, load_state_meta
     from errors import ForgeError
     from object_store_artifacts import ArtifactsObjectStoreConfig
-    from accounts import set_password
 
     try:
         ready = load_state_meta(root).get("repository_state") == "ready"
@@ -190,7 +189,7 @@ def bootstrap_root(root: Path) -> None:
 
     state = load_state(root)
     if "admin" not in state["principals"]:
-        add_principal(root, "admin", ["admin@bastion.invalid"])
+        add_principal(root, "admin", [admin_email])
     state = load_state(root)
     if "admin-role" not in state["roles"]:
         grants = {capability: [""] for capability in CAPABILITIES}
@@ -202,9 +201,6 @@ def bootstrap_root(root: Path) -> None:
     _manifest, _version, replay = Repository.open(root).load()
     if "admin" not in replay.active_views:
         add_view(root, "admin", "admin", "main")
-    state = load_state(root)
-    if "account" not in state["principals"]["admin"]:
-        set_password(root, "admin", password)
 
 
 class DurableRuntime:

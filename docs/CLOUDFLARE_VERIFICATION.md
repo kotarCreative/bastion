@@ -91,7 +91,7 @@ persistent test DO storage. It covers:
   hook subprocess using the production DO backend.
 - A private-path permission epoch and restricted clone/fetch after recovery.
 - Deletion of the forge and Artifacts cache, plus restart of workerd itself:
-  repository identity, passwords, scoped tokens, pushed content, and denials
+  repository identity, Clerk identity links, scoped tokens, pushed content, and denials
   survive without any live `store.sqlite3` file.
 - Interrupted schema initialization and interrupted catalog bootstrap, followed
   by recovery without resetting committed state.
@@ -127,7 +127,7 @@ authority when the remote is unavailable.
 
 The forge migration tests exercise projected pushes, hidden-only changes,
 policy epochs, and backup/restore between Artifacts stores. They check retained
-repository identity, WAL records, permissions, passwords, scoped tokens, and
+repository identity, WAL records, permissions, Clerk identity links, scoped tokens, and
 the absence of hidden Git objects from restricted views.
 
 The hosted runtime tests use the **production** Artifacts adapter over a local

@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 
 import forge
-from accounts import set_password, verify_password
+from accounts import link_clerk_account
 from identity import CAPABILITIES
 from errors import ForgeError
 from repository import Repository
@@ -36,21 +36,6 @@ class AccountAndPrivacyTest(unittest.TestCase):
         add_role(self.fixture.root, "alice-owner", allow, deny)
         bind_role(self.fixture.root, "alice-owner", "principal", "alice")
         transition_principal(self.fixture.root, "alice")
-
-    def test_password_account_is_bound_to_principal_not_descriptor(self) -> None:
-        before = load_state(self.fixture.root)["views"]["alice"]["descriptor_id"]
-        set_password(self.fixture.root, "alice", "correct horse battery staple")
-        self.assertTrue(
-            verify_password(self.fixture.root, "alice", "correct horse battery staple")
-        )
-        self.assertFalse(verify_password(self.fixture.root, "alice", "wrong password"))
-        self.assertFalse(verify_password(self.fixture.root, "unknown", "wrong password"))
-        self.assertNotIn(
-            "correct horse battery staple",
-            str(load_state(self.fixture.root)["principals"]["alice"]),
-        )
-        after = load_state(self.fixture.root)["views"]["alice"]["descriptor_id"]
-        self.assertEqual(before, after)
 
     def test_owner_privacy_edit_reprojects_target_and_can_be_restored(self) -> None:
         self._make_alice_owner()
@@ -95,10 +80,50 @@ class AccountAndPrivacyTest(unittest.TestCase):
                 )
         self.assertEqual(managed_private_paths(load_state(self.fixture.root), "bob"), [])
 
-    def test_account_survives_backup_and_restore(self) -> None:
-        set_password(self.fixture.root, "alice", "durable account password")
-        backup = self.fixture.directory / "account-backup"
-        restored = self.fixture.directory / "account-restored"
+    def test_verified_clerk_email_links_once_and_survives_restore(self) -> None:
+        from state import locked, save_state
+
+        descriptor_before = load_state(self.fixture.root)["views"]["alice"][
+            "descriptor_id"
+        ]
+        with locked(self.fixture.root) as state:
+            state["principals"]["alice"]["emails"] = ["alice@example.test"]
+            save_state(self.fixture.root, state)
+        self.assertEqual(
+            "alice",
+            link_clerk_account(
+                self.fixture.root, "user_clerkAlice", ["ALICE@example.test"]
+            ),
+        )
+        self.assertEqual(
+            "alice",
+            link_clerk_account(
+                self.fixture.root, "user_clerkAlice", ["changed@example.test"]
+            ),
+        )
+        self.assertEqual(
+            descriptor_before,
+            load_state(self.fixture.root)["views"]["alice"]["descriptor_id"],
+        )
+        backup = self.fixture.directory / "clerk-backup"
+        restored = self.fixture.directory / "clerk-restored"
         backup_forge(self.fixture.root, backup)
         restore_forge(backup, restored)
-        self.assertTrue(verify_password(restored, "alice", "durable account password"))
+        self.assertEqual(
+            "alice",
+            link_clerk_account(restored, "user_clerkAlice", ["changed@example.test"]),
+        )
+
+    def test_clerk_link_requires_an_unambiguous_invitation(self) -> None:
+        from service import add_principal
+
+        add_principal(self.fixture.root, "invite-a", ["shared@example.test"])
+        add_principal(self.fixture.root, "invite-b", ["shared@example.test"])
+        with self.assertRaisesRegex(ForgeError, "multiple Bastion principals"):
+            link_clerk_account(
+                self.fixture.root, "user_ambiguous", ["shared@example.test"]
+            )
+        with self.assertRaisesRegex(ForgeError, "no Bastion invitation"):
+            link_clerk_account(
+                self.fixture.root, "user_uninvited", ["nobody@example.test"]
+            )

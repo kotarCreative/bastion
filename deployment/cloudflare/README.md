@@ -3,7 +3,7 @@
 This profile runs the existing Flask UI and Git smart HTTP engine in a
 Cloudflare Container. A named `ForgeContainer` Durable Object coordinates one
 forge's Git work. A separate SQLite-backed `ForgeCatalog` Durable Object owns
-the persistent catalog: principals, roles, views, passwords, token digests,
+the persistent catalog: principals, roles, views, Clerk links, token digests,
 audit rows, leases, and WAL indexes. Artifacts owns repository objects and WAL
 history. Container disk holds only disposable Git materializations, caches,
 and configuration reconstructed from the catalog; it has no live SQLite file.
@@ -32,14 +32,20 @@ npx wrangler login
 npx wrangler types
 npx wrangler deploy
 npx wrangler secret put BASTION_ADMIN_SECRET
-npx wrangler secret put BASTION_BOOTSTRAP_ADMIN_PASSWORD
+npx wrangler secret put BASTION_BOOTSTRAP_ADMIN_EMAIL
+npx wrangler secret put CLERK_PUBLISHABLE_KEY
+npx wrangler secret put CLERK_SECRET_KEY
+npx wrangler secret put CLERK_AUTHORIZED_PARTIES
+# Optional PEM public key for networkless JWT signature verification:
+npx wrangler secret put CLERK_JWT_KEY
 ```
 
-Use separate high-entropy values for the provisioning secret and the initial
-`admin` account password. Keep both values in a password manager. Do not put
-the Artifacts token in a Worker variable or send it to a browser. The first
-secret authorizes provisioning; the second is used only if the Artifacts
-Durable Object catalog and legacy control snapshot do not exist and Bastion must create its initial catalog.
+Use a high-entropy provisioning secret and set the bootstrap administrator to
+an email verified by the intended Clerk account. `CLERK_AUTHORIZED_PARTIES`
+must be the exact public Worker origin, with no path. Configure that origin and
+the desired signup, email verification, MFA, and passkey methods in the Clerk
+Dashboard. Bastion does not require a custom JWT template. Do not put the
+Artifacts token in a Worker variable or send it to a browser.
 
 After deployment, provision once with the admin secret:
 
@@ -50,8 +56,9 @@ curl -i -X POST \
 ```
 
 The route returns repository status only. It does not return the repository
-token. Then open the Worker URL and sign in as `admin` using the bootstrap
-password. The account can manage permissions through the existing UI/API.
+token. Then open the Worker URL and sign in through Clerk with the bootstrap
+administrator email. The first sign-in claims the `admin` principal and can
+manage permissions through the existing UI/API.
 The fresh bootstrap creates only this initial account and view; prepare extra
 principals, accounts, views, and scoped tokens in a restored root before
 publishing its first control snapshot when the demo needs several agents.
@@ -121,7 +128,7 @@ The `v2` Wrangler migration adds `ForgeCatalog` without deleting the existing
 `ForgeContainer` namespace. On the first cold start after upgrading this
 profile, Bastion imports the old Artifacts SQLite snapshot into the DO tables
 and stores the repository configuration in the same atomic transaction.
-Passwords, token digests, audit sequences, permissions, and repository identity
+Clerk identity links, token digests, audit sequences, permissions, and repository identity
 are preserved. It omits old process leases and repairs indexes from the WAL.
 Later starts use the DO catalog and never re-import the old snapshot. Retain
 that snapshot as migration backup; rolling back Worker code alone would serve
@@ -169,14 +176,13 @@ reset Bastion.
 ## Concurrent-agent demo
 
 The canonical branch needs files under `team-a/` and `team-b/` before these
-views are created. Add two accounts and scoped views to the restored local
+views are created. Add two invited principals and scoped views to the restored local
 root before running `checkpoint.py`:
 
 ```sh
 cd /path/to/bastion
 ROOT=/var/tmp/bastion-migrated
 .venv/bin/python forge.py add-principal "$ROOT" agent-a --email agent-a@example.invalid
-.venv/bin/python forge.py set-password "$ROOT" agent-a
 .venv/bin/python forge.py add-role "$ROOT" agent-a-role \
   --allow read=team-a --allow create=team-a --allow modify=team-a \
   --allow delete=team-a --allow mode=team-a --allow symlink=team-a
@@ -186,7 +192,6 @@ ROOT=/var/tmp/bastion-migrated
   --scope fetch --scope push --expires-in 30d
 
 .venv/bin/python forge.py add-principal "$ROOT" agent-b --email agent-b@example.invalid
-.venv/bin/python forge.py set-password "$ROOT" agent-b
 .venv/bin/python forge.py add-role "$ROOT" agent-b-role \
   --allow read=team-b --allow create=team-b --allow modify=team-b \
   --allow delete=team-b --allow mode=team-b --allow symlink=team-b

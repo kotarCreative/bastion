@@ -63,6 +63,24 @@ class DemoHttpError(HttpError):
     """HTTP error raised by demo routes; handled like any transport HttpError."""
 
 
+def _security_headers(clerk_origin: str | None = None) -> dict[str, str]:
+    if clerk_origin is None:
+        return dict(SECURITY_HEADERS)
+    return {
+        **SECURITY_HEADERS,
+        "Content-Security-Policy": (
+            "default-src 'none'; "
+            f"script-src 'self' {clerk_origin} https://*.protect.clerk.com "
+            "https://challenges.cloudflare.com; "
+            "style-src 'self' 'unsafe-inline'; "
+            f"connect-src 'self' {clerk_origin} https://*.protect.clerk.com:*; "
+            "img-src 'self' data: https://img.clerk.com; "
+            "frame-src https://challenges.cloudflare.com https://*.protect.clerk.com; "
+            "base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+        ),
+    }
+
+
 def _forge_root(app: Flask) -> Path:
     return Path(app.config["FORGE_ROOT"])
 
@@ -154,8 +172,11 @@ def _read_bounded_body(maximum: int) -> bytes:
 
 
 def create_app(root: Path) -> Flask:
+    from clerk_auth import ClerkAuthenticator, load_clerk_config
+
     _preflight(root)
     limits.validate()
+    clerk_config = load_clerk_config()
 
     app = Flask(__name__)
     app.config["FORGE_ROOT"] = str(root)
@@ -167,6 +188,13 @@ def create_app(root: Path) -> Flask:
     app.config["ADMISSION_LOCK"] = threading.Lock()
     app.config["ACTIVE_PER_IP"] = {}
     app.config["STOPPING"] = False
+    app.config["CLERK_CONFIG"] = clerk_config
+    app.config["CLERK_AUTHENTICATOR"] = (
+        ClerkAuthenticator(clerk_config) if clerk_config is not None else None
+    )
+    app.config["SECURITY_HEADERS"] = _security_headers(
+        clerk_config.frontend_api_origin if clerk_config is not None else None
+    )
 
     def admit(address: str, receive: bool) -> int:
         """Per-IP admission; 0 when admitted, else 429/503."""
@@ -205,18 +233,13 @@ def create_app(root: Path) -> Flask:
 
     app.config["ADMIT"] = admit
     app.config["RELEASE_ADMISSION"] = release_admission
-    # Online password guessing / scrypt CPU-DoS guard for the demo login.
-    # The demo has no lockout; bound attempts per IP in a sliding window.
-    # This is not a substitute for TLS + external rate limiting if exposed.
-    app.config["LOGIN_ATTEMPTS"] = {}
-    app.config["LOGIN_LOCK"] = threading.Lock()
     # Pagination cursors are HMAC'd with an ephemeral server-side key: a
     # process restart invalidates them, and no client ever sees the key.
     app.config["CURSOR_SECRET"] = secrets.token_hex(32)
 
     @app.after_request
     def _apply_security_headers(response):
-        for key, value in SECURITY_HEADERS.items():
+        for key, value in app.config["SECURITY_HEADERS"].items():
             response.headers.setdefault(key, value)
         if request.path.startswith("/api/"):
             response.headers.setdefault("Cache-Control", "no-store")
@@ -339,26 +362,65 @@ def create_app(root: Path) -> Flask:
             },
         }
 
-    @app.route("/api/v1/login", methods=["POST"])
-    def api_login():
-        """Exchange an account password for a short-lived, scoped bearer token."""
-        import accounts
+    def _issue_ui_session(
+        principal_id: str, requested_view: str | None, expires_in: str
+    ):
         from http_server import add_token
         from repository import Repository
 
-        # Bound scrypt work per IP: 20 attempts per 60s sliding window.
-        client_ip = request.remote_addr or ""
-        now = time.monotonic()
-        with app.config["LOGIN_LOCK"]:
-            attempts = app.config["LOGIN_ATTEMPTS"].get(client_ip, [])
-            attempts = [at for at in attempts if now - at < 60.0]
-            if len(attempts) >= 20:
-                app.config["LOGIN_ATTEMPTS"][client_ip] = attempts
-                response = make_response(jsonify({"error": "throttled"}), 429)
-                response.headers["Cache-Control"] = "no-store"
-                return response
-            attempts.append(now)
-            app.config["LOGIN_ATTEMPTS"][client_ip] = attempts
+        try:
+            _manifest, _version, replay = Repository.open(_forge_root(app)).load()
+        except ForgeError:
+            return {"error": "service-unavailable"}, 503
+        views = sorted(
+            view_id
+            for view_id, active in replay.active_views.items()
+            if active["principal_id"] == principal_id
+        )
+        if not views:
+            return {"error": "no-repositories"}, 403
+        if requested_view is None and len(views) > 1:
+            return {"error": "view-required", "view_ids": views}, 409
+        selected = requested_view or views[0]
+        if selected not in views:
+            return {"error": "forbidden"}, 403
+        try:
+            credential = add_token(
+                _forge_root(app), selected, scopes=["ui"], expires_in=expires_in
+            )
+            envelope = _api_session_envelope(selected)
+        except ForgeError:
+            return {"error": "service-unavailable"}, 503
+        return {"access_token": credential, "session": envelope}, 200
+
+    @app.route("/api/v1/auth/config", methods=["GET"])
+    def api_auth_config():
+        config = app.config["CLERK_CONFIG"]
+        response = make_response(
+            jsonify(
+                {"enabled": False}
+                if config is None
+                else {
+                    "enabled": True,
+                    "publishable_key": config.publishable_key,
+                    "frontend_api_origin": config.frontend_api_origin,
+                }
+            ),
+            200,
+        )
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.route("/api/v1/auth/clerk", methods=["POST"])
+    def api_clerk_login():
+        """Exchange a verified Clerk session for a view-scoped UI token."""
+        import accounts
+        from accounts import AccountLinkError
+        from clerk_auth import ClerkAuthenticationError
+
+        authenticator = app.config["CLERK_AUTHENTICATOR"]
+        if authenticator is None:
+            return jsonify({"error": "not-found"}), 404
         try:
             raw_body = request.get_data(cache=False)
         except RequestEntityTooLarge:
@@ -366,57 +428,33 @@ def create_app(root: Path) -> Flask:
         if len(raw_body) > 4096:
             return jsonify({"error": "bad-request"}), 400
         try:
-            payload = json.loads(raw_body.decode("utf-8")) if raw_body else None
+            payload = json.loads(raw_body.decode("utf-8")) if raw_body else {}
         except (UnicodeDecodeError, ValueError):
             return jsonify({"error": "bad-request"}), 400
-        if not isinstance(payload, dict) or set(payload) not in (
-            {"username", "password"},
-            {"username", "password", "view_id"},
-        ):
+        if not isinstance(payload, dict) or set(payload) not in (set(), {"view_id"}):
             return jsonify({"error": "bad-request"}), 400
-        username = payload.get("username")
-        password = payload.get("password")
         requested_view = payload.get("view_id")
-        if (
-            not isinstance(username, str)
-            or not isinstance(password, str)
-            or (requested_view is not None and not isinstance(requested_view, str))
-        ):
+        if requested_view is not None and not isinstance(requested_view, str):
             return jsonify({"error": "bad-request"}), 400
-        if not accounts.verify_password(_forge_root(app), username, password):
+        try:
+            clerk_user_id, verified_emails = authenticator.authenticate(request.headers)
+            principal_id = accounts.link_clerk_account(
+                _forge_root(app), clerk_user_id, verified_emails
+            )
+        except ClerkAuthenticationError:
             response = make_response(jsonify({"error": "invalid-credentials"}), 401)
             response.headers["Cache-Control"] = "no-store"
             return response
-        try:
-            _manifest, _version, replay = Repository.open(_forge_root(app)).load()
-        except ForgeError:
-            return jsonify({"error": "service-unavailable"}), 503
-        views = sorted(
-            view_id
-            for view_id, active in replay.active_views.items()
-            if active["principal_id"] == username
-        )
-        if not views:
-            return jsonify({"error": "no-repositories"}), 403
-        if requested_view is None and len(views) > 1:
-            response = make_response(
-                jsonify({"error": "view-required", "view_ids": views}), 409
-            )
+        except AccountLinkError:
+            response = make_response(jsonify({"error": "not-invited"}), 403)
             response.headers["Cache-Control"] = "no-store"
             return response
-        selected = requested_view or views[0]
-        if selected not in views:
-            return jsonify({"error": "forbidden"}), 403
-        try:
-            credential = add_token(
-                _forge_root(app), selected, scopes=["ui"], expires_in="12h"
-            )
-            envelope = _api_session_envelope(selected)
         except ForgeError:
-            return jsonify({"error": "service-unavailable"}), 503
-        response = make_response(
-            jsonify({"access_token": credential, "session": envelope}), 200
-        )
+            response = make_response(jsonify({"error": "service-unavailable"}), 503)
+            response.headers["Cache-Control"] = "no-store"
+            return response
+        body, status = _issue_ui_session(principal_id, requested_view, "1h")
+        response = make_response(jsonify(body), status)
         response.headers["Cache-Control"] = "no-store"
         return response
 
@@ -425,9 +463,8 @@ def create_app(root: Path) -> Flask:
         from http_server import revoke_token
 
         record, _view = _api_auth()
-        # Account sessions are UI-only. Operator-issued Git/UI credentials
-        # may also sign in through the compatibility form and must not be
-        # destroyed merely by closing the browser workspace.
+        # Clerk exchanges mint UI-only tokens. Git/API credentials can also
+        # inspect the browser surface and must not be revoked by UI sign-out.
         if set(record.get("scopes", [])) == {"ui"}:
             revoke_token(_forge_root(app), record["token_id"])
         response = make_response(jsonify({"signed_out": True}), 200)

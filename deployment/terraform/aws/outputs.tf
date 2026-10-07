@@ -23,11 +23,6 @@ output "runtime_database_secret_arn" {
   value       = aws_secretsmanager_secret.db_runtime.arn
 }
 
-output "demo_accounts_secret_arn" {
-  description = "Secret containing the generated tester and observer browser passwords."
-  value       = aws_secretsmanager_secret.demo_accounts.arn
-}
-
 output "bootstrap_tokens_secret_arn" {
   description = "Secret populated by bootstrap with tester and observer API/Git tokens."
   value       = aws_secretsmanager_secret.bootstrap_tokens.arn

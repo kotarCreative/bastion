@@ -13,7 +13,7 @@ from unittest.mock import patch
 import forge
 from errors import ForgeError
 from identity import CAPABILITIES
-from accounts import set_password, verify_password
+from accounts import link_clerk_account
 from demo_server import create_app
 from http_server import add_token
 from service import add_role, bind_role, managed_private_paths, set_path_privacy, transition_principal
@@ -206,7 +206,14 @@ class ArtifactsIntegrationTest(unittest.TestCase):
             )
             self.assertEqual(["shared"], managed_private_paths(load_state(fixture.root), "bob"))
 
-            set_password(fixture.root, "alice", "restore durable password")
+            from state import locked, save_state
+
+            with locked(fixture.root) as state:
+                state["principals"]["alice"]["emails"] = ["alice@example.test"]
+                save_state(fixture.root, state)
+            link_clerk_account(
+                fixture.root, "user_artifactsAlice", ["alice@example.test"]
+            )
             scoped_token = add_token(fixture.root, "alice", scopes=["fetch", "ui"])
 
             source_manifest, source_replay = repository_state(fixture.root)
@@ -262,14 +269,11 @@ class ArtifactsIntegrationTest(unittest.TestCase):
             self.assertEqual(["shared"], managed_private_paths(restored_catalog, "bob"))
             self.assertIn("alice-owner", restored_catalog["roles"])
             self.assertIn("principal:alice:alice-owner", restored_catalog["role_bindings"])
-            self.assertTrue(verify_password(restored_root, "alice", "restore durable password"))
-            client_app = create_app(restored_root).test_client()
-            login = client_app.post(
-                "/api/v1/login",
-                json={"username": "alice", "password": "restore durable password"},
+            self.assertEqual(
+                "user_artifactsAlice",
+                restored_catalog["principals"]["alice"]["clerk_user_id"],
             )
-            self.assertEqual(200, login.status_code)
-            self.assertEqual("alice", login.get_json()["session"]["principal"]["id"])
+            client_app = create_app(restored_root).test_client()
             self.assertEqual(
                 200,
                 client_app.get(

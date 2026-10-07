@@ -11,20 +11,27 @@
 "use strict";
 
 (function () {
-  var credential = null; // page memory only
+  var credential = null; // Bastion token, page memory only
   var session = null;
+  var clerk = null;
+  var clerkHadSession = false;
+  var clerkExchangePending = false;
+  var clerkUserButtonMounted = false;
 
   var ELEMENTS = {
     identity: document.getElementById("identity"),
+    clerkUserButton: document.getElementById("clerk-user-button"),
+    manageAccount: document.getElementById("manage-account"),
     logout: document.getElementById("logout"),
     login: document.getElementById("login"),
-    accountLoginForm: document.getElementById("account-login-form"),
-    usernameInput: document.getElementById("username"),
-    passwordInput: document.getElementById("password"),
-    viewInput: document.getElementById("login-view"),
     loginForm: document.getElementById("login-form"),
     tokenInput: document.getElementById("token"),
     loginError: document.getElementById("login-error"),
+    clerkAuth: document.getElementById("clerk-auth"),
+    clerkSignIn: document.getElementById("clerk-sign-in"),
+    clerkViewForm: document.getElementById("clerk-view-form"),
+    clerkView: document.getElementById("clerk-view"),
+    sessionNote: document.getElementById("session-note"),
     workspace: document.getElementById("workspace"),
   };
 
@@ -54,7 +61,7 @@
   function request(path, options) {
     options = options || {};
     var headers = options.headers || {};
-    if (credential) {
+    if (credential && !options.skipCredential) {
       headers["Authorization"] = "Bearer " + credential;
     }
     return fetch(path, {
@@ -66,7 +73,7 @@
       referrerPolicy: "no-referrer",
     }).then(function (response) {
       if (response.status === 401 && !options.optionalAuth) {
-        signOut();
+        clearBastionSession();
         throw new Error("auth-required");
       }
       return response.json().then(function (body) {
@@ -84,18 +91,17 @@
     });
   }
 
-  function signOut() {
+  function clearBastionSession() {
     credential = null;
     session = null;
     ELEMENTS.tokenInput.value = "";
-    ELEMENTS.passwordInput.value = "";
-    ELEMENTS.usernameInput.value = "";
     ELEMENTS.login.hidden = false;
     document.getElementById("homepage").hidden = false;
     document.getElementById("home-nav").hidden = false;
     ELEMENTS.workspace.hidden = true;
     ELEMENTS.identity.hidden = true;
     ELEMENTS.identity.textContent = "";
+    ELEMENTS.manageAccount.hidden = true;
     ELEMENTS.logout.hidden = true;
     clearChildren(document.getElementById("panel-summary"));
     clearChildren(document.getElementById("panel-decision"));
@@ -510,6 +516,7 @@
     ELEMENTS.workspace.hidden = false;
     ELEMENTS.identity.hidden = false;
     ELEMENTS.identity.textContent = session.principal.id + " / " + session.view_id;
+    ELEMENTS.manageAccount.hidden = !clerk;
     ELEMENTS.logout.hidden = false;
     document.getElementById("tab-permissions").hidden = true;
     renderSummary();
@@ -524,6 +531,127 @@
     });
     renderClone();
     showPanel("summary");
+  }
+
+  function loadScript(src, attributes) {
+    return new Promise(function (resolve, reject) {
+      var script = document.createElement("script");
+      script.src = src;
+      script.defer = true;
+      script.crossOrigin = "anonymous";
+      Object.keys(attributes || {}).forEach(function (name) {
+        script.setAttribute(name, attributes[name]);
+      });
+      script.addEventListener("load", resolve);
+      script.addEventListener("error", function () {
+        reject(new Error("authentication service failed to load"));
+      });
+      document.head.appendChild(script);
+    });
+  }
+
+  function showClerkError(message) {
+    ELEMENTS.loginError.hidden = false;
+    ELEMENTS.loginError.textContent = message;
+  }
+
+  function mountClerkUserButton() {
+    if (!clerk || clerkUserButtonMounted) {
+      return;
+    }
+    clerk.mountUserButton(ELEMENTS.clerkUserButton, { afterSignOutUrl: "/" });
+    clerkUserButtonMounted = true;
+    ELEMENTS.clerkUserButton.hidden = false;
+  }
+
+  function exchangeClerkSession(view) {
+    if (!clerk || !clerk.session || clerkExchangePending) {
+      return;
+    }
+    clerkExchangePending = true;
+    ELEMENTS.loginError.hidden = true;
+    clerk.session.getToken().then(function (token) {
+      var payload = {};
+      if (view) {
+        payload.view_id = view;
+      }
+      return request("/api/v1/auth/clerk", {
+        method: "POST",
+        headers: {
+          "Authorization": "Bearer " + token,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+        optionalAuth: true,
+        skipCredential: true,
+      });
+    }).then(function (result) {
+      if (result.status === 409 && Array.isArray(result.body.view_ids)) {
+        clearChildren(ELEMENTS.clerkView);
+        result.body.view_ids.forEach(function (viewId) {
+          var option = document.createElement("option");
+          option.value = visibleText(viewId);
+          option.textContent = visibleText(viewId);
+          ELEMENTS.clerkView.appendChild(option);
+        });
+        ELEMENTS.clerkViewForm.hidden = false;
+        ELEMENTS.clerkSignIn.hidden = true;
+        return;
+      }
+      if (result.status !== 200) {
+        showClerkError(result.status === 403
+          ? "Your Clerk account has not been invited to this repository."
+          : "Clerk sign-in could not be verified.");
+        return;
+      }
+      mountClerkUserButton();
+      openSession(result.body.access_token, result.body.session);
+    }).catch(function () {
+      showClerkError("Clerk sign-in failed. Please try again.");
+    }).then(function () {
+      clerkExchangePending = false;
+    });
+  }
+
+  function configureClerk(config) {
+    if (!config.enabled) {
+      return Promise.resolve();
+    }
+    ELEMENTS.clerkAuth.hidden = false;
+    ELEMENTS.sessionNote.textContent =
+      "Authentication, recovery, MFA, and account security are managed by Clerk.";
+    return loadScript(config.frontend_api_origin + "/npm/@clerk/ui@1/dist/ui.browser.js")
+      .then(function () {
+        return loadScript(
+          config.frontend_api_origin + "/npm/@clerk/clerk-js@6/dist/clerk.browser.js",
+          { "data-clerk-publishable-key": config.publishable_key }
+        );
+      })
+      .then(function () {
+        clerk = window.Clerk;
+        return clerk.load({ ui: { ClerkUI: window.__internal_ClerkUICtor } });
+      })
+      .then(function () {
+        clerkHadSession = Boolean(clerk.session);
+        clerk.addListener(function (state) {
+          var hasSession = Boolean(state.session);
+          if (!clerkHadSession && hasSession && !session) {
+            mountClerkUserButton();
+            exchangeClerkSession();
+          }
+          if (clerkHadSession && !hasSession && credential) {
+            request("/api/v1/logout", { method: "POST", optionalAuth: true })
+              .then(clearBastionSession, clearBastionSession);
+          }
+          clerkHadSession = hasSession;
+        });
+        if (clerk.isSignedIn) {
+          mountClerkUserButton();
+          exchangeClerkSession();
+        } else {
+          clerk.mountSignIn(ELEMENTS.clerkSignIn);
+        }
+      });
   }
 
   function authenticate(token) {
@@ -559,40 +687,26 @@
     authenticate(token);
   });
 
-  ELEMENTS.accountLoginForm.addEventListener("submit", function (event) {
+  ELEMENTS.clerkViewForm.addEventListener("submit", function (event) {
     event.preventDefault();
-    var username = ELEMENTS.usernameInput.value.trim();
-    var password = ELEMENTS.passwordInput.value;
-    var view = ELEMENTS.viewInput.value.trim();
-    ELEMENTS.passwordInput.value = "";
-    ELEMENTS.loginError.hidden = true;
-    var payload = { username: username, password: password };
-    if (view) {
-      payload.view_id = view;
+    exchangeClerkSession(ELEMENTS.clerkView.value);
+  });
+
+  ELEMENTS.manageAccount.addEventListener("click", function () {
+    if (clerk) {
+      clerk.openUserProfile();
     }
-    request("/api/v1/login", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-      optionalAuth: true,
-    }).then(function (result) {
-      if (result.status !== 200) {
-        ELEMENTS.loginError.hidden = false;
-        ELEMENTS.loginError.textContent = result.status === 409
-          ? "This account has multiple repository views. Enter one and sign in again."
-          : "Username or password is incorrect.";
-        return;
-      }
-      openSession(result.body.access_token, result.body.session);
-    }).catch(function () {
-      ELEMENTS.loginError.hidden = false;
-      ELEMENTS.loginError.textContent = "Sign-in failed.";
-    });
   });
 
   ELEMENTS.logout.addEventListener("click", function () {
     request("/api/v1/logout", { method: "POST", optionalAuth: true })
-      .then(signOut, signOut);
+      .then(function () {
+        clearBastionSession();
+        return clerk ? clerk.signOut() : null;
+      }, function () {
+        clearBastionSession();
+        return clerk ? clerk.signOut() : null;
+      });
   });
 
   document.querySelectorAll(".tab").forEach(function (tab) {
@@ -601,6 +715,16 @@
     });
   });
 
-  // Reloading the page starts from a fresh module: the credential is gone.
-  signOut();
+  // The Bastion credential starts empty; Clerk may restore its own session.
+  clearBastionSession();
+  request("/api/v1/auth/config", { optionalAuth: true })
+    .then(function (result) {
+      if (result.status !== 200) {
+        throw new Error("authentication configuration unavailable");
+      }
+      return configureClerk(result.body);
+    })
+    .catch(function () {
+      showClerkError("Authentication is temporarily unavailable.");
+    });
 })();

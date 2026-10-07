@@ -4,7 +4,11 @@ export { ForgeCatalog } from "./catalog";
 
 interface Env extends Cloudflare.Env {
 	BASTION_ADMIN_SECRET: string;
-	BASTION_BOOTSTRAP_ADMIN_PASSWORD: string;
+	BASTION_BOOTSTRAP_ADMIN_EMAIL: string;
+	CLERK_PUBLISHABLE_KEY?: string;
+	CLERK_SECRET_KEY?: string;
+	CLERK_AUTHORIZED_PARTIES?: string;
+	CLERK_JWT_KEY?: string;
 }
 
 type StoredArtifacts = { remote: string; token: string; expiresAt: number };
@@ -111,6 +115,23 @@ export class ForgeContainer extends Container<Env> {
 		}
 		await this.refreshTokenBeforeStart();
 		const activeConfig = (await this.ctx.storage.get<StoredArtifacts>(PRIVATE_CONFIG))!;
+		const clerkValues = [
+			this.env.CLERK_PUBLISHABLE_KEY,
+			this.env.CLERK_SECRET_KEY,
+			this.env.CLERK_AUTHORIZED_PARTIES,
+		];
+		if (clerkValues.some(Boolean) && !clerkValues.every(Boolean)) {
+			throw new Error("incomplete Clerk configuration");
+		}
+		const clerkEnv =
+			this.env.CLERK_PUBLISHABLE_KEY && this.env.CLERK_SECRET_KEY && this.env.CLERK_AUTHORIZED_PARTIES
+				? {
+						CLERK_PUBLISHABLE_KEY: this.env.CLERK_PUBLISHABLE_KEY,
+						CLERK_SECRET_KEY: this.env.CLERK_SECRET_KEY,
+						CLERK_AUTHORIZED_PARTIES: this.env.CLERK_AUTHORIZED_PARTIES,
+						...(this.env.CLERK_JWT_KEY ? { CLERK_JWT_KEY: this.env.CLERK_JWT_KEY } : {}),
+					}
+				: {};
 		await this.startAndWaitForPorts({
 			ports: [PORT],
 			cancellationOptions: {
@@ -124,10 +145,11 @@ export class ForgeContainer extends Container<Env> {
 				envVars: {
 					BASTION_ARTIFACTS_REMOTE: activeConfig.remote,
 					BASTION_ARTIFACTS_TOKEN: activeConfig.token,
-					BASTION_BOOTSTRAP_ADMIN_PASSWORD: this.env.BASTION_BOOTSTRAP_ADMIN_PASSWORD,
+					BASTION_BOOTSTRAP_ADMIN_EMAIL: this.env.BASTION_BOOTSTRAP_ADMIN_EMAIL,
 					BASTION_ROOT: "/var/lib/bastion/forge",
 					BASTION_DATABASE: "durable_objects",
 					BASTION_CATALOG_ENDPOINT: "http://catalog.bastion.internal",
+					...clerkEnv,
 				},
 			},
 		});

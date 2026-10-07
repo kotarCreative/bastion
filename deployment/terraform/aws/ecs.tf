@@ -32,7 +32,6 @@ resource "aws_ecs_task_definition" "bootstrap" {
     host                        = local.public_host
     runtime_database_secret_arn = aws_secretsmanager_secret.db_runtime.arn
     admin_database_secret_arn   = aws_secretsmanager_secret.db_admin.arn
-    demo_accounts_secret_arn    = aws_secretsmanager_secret.demo_accounts.arn
     bootstrap_tokens_secret_arn = aws_secretsmanager_secret.bootstrap_tokens.arn
     s3_bucket                   = aws_s3_bucket.repository.bucket
     s3_region                   = var.aws_region
@@ -58,7 +57,6 @@ resource "aws_ecs_task_definition" "bootstrap" {
     aws_iam_role_policy.bootstrap_task,
     aws_secretsmanager_secret_version.db_admin,
     aws_secretsmanager_secret_version.db_runtime,
-    aws_secretsmanager_secret_version.demo_accounts,
     time_sleep.s3_versioning_propagation,
   ]
 

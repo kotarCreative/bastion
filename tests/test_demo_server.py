@@ -9,6 +9,7 @@ import tempfile
 import unittest
 import urllib.parse
 from pathlib import Path
+from unittest.mock import patch
 
 import forge
 import demo_server
@@ -97,9 +98,14 @@ class DemoServerTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn(b"/assets/app.js", response.data)
         self.assertIn(b"/assets/app.css", response.data)
-        self.assertIn(b'id="account-login-form"', response.data)
+        self.assertIn(b'id="clerk-sign-in"', response.data)
         self.assertIn(b'id="tab-permissions"', response.data)
         self.assertNotIn(b"<script>", response.data)  # external script only
+
+    def test_auth_config_is_disabled_without_clerk_environment(self) -> None:
+        response = self.client.get("/api/v1/auth/config")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), {"enabled": False})
 
     def test_assets_are_served(self) -> None:
         css = self.client.get("/assets/app.css")
@@ -118,12 +124,11 @@ class DemoServerTest(unittest.TestCase):
         self.assertNotIn("outerHTML", js)
         self.assertIn("page memory only", js)
         self.assertIn("Bearer ", js)
-        # The token input is cleared right after use.
+        # The Git/API token input is cleared right after use.
         self.assertIn('tokenInput.value = ""', js)
         shell = self.client.get("/").data.decode()
-        self.assertIn('type="password"', shell)
-        shell_without_quotes = shell
-        self.assertNotIn("<style", shell_without_quotes)
+        self.assertNotIn('name="password"', shell)
+        self.assertNotIn("<style", shell)
 
     def test_unknown_routes_are_generic(self) -> None:
         for path in ("/login", "/logout", "/whoami", "/evaluate", "/browse",
@@ -180,54 +185,57 @@ class DemoServerTest(unittest.TestCase):
         self.assertNotIn("canonical_frontier", body)
         self.assertEqual(response.headers.get("Cache-Control"), "no-store")
 
-    def test_account_login_issues_and_logout_revokes_memory_session(self) -> None:
-        from accounts import set_password
+    def test_clerk_session_claims_invited_principal_and_issues_ui_token(self) -> None:
+        from state import locked, save_state
 
-        set_password(self.forge, "alice", "correct horse battery staple")
-        rejected = self.client.post(
-            "/api/v1/login",
-            json={"username": "alice", "password": "wrong password"},
-        )
-        self.assertEqual(rejected.status_code, 401)
-        self.assertEqual(rejected.get_json(), {"error": "invalid-credentials"})
-        unknown = self.client.post(
-            "/api/v1/login",
-            json={"username": "unknown", "password": "wrong password"},
-        )
-        self.assertEqual(unknown.status_code, 401)
-        self.assertEqual(unknown.get_json(), rejected.get_json())
+        encoded_domain = base64.urlsafe_b64encode(
+            b"clerk.example.test$"
+        ).decode("ascii").rstrip("=")
+        environment = {
+            "CLERK_PUBLISHABLE_KEY": f"pk_test_{encoded_domain}",
+            "CLERK_SECRET_KEY": "sk_test_secret",
+            "CLERK_AUTHORIZED_PARTIES": "https://bastion.example.test",
+        }
+        with locked(self.forge) as state:
+            state["principals"]["alice"]["emails"] = ["alice@example.test"]
+            save_state(self.forge, state)
+        with patch.dict(os.environ, environment, clear=False):
+            app = create_app(self.forge)
 
-        accepted = self.client.post(
-            "/api/v1/login",
-            json={"username": "alice", "password": "correct horse battery staple"},
+        class FakeAuthenticator:
+            def authenticate(self, _headers):
+                return "user_clerkAlice", ["alice@example.test"]
+
+        app.config["CLERK_AUTHENTICATOR"] = FakeAuthenticator()
+        client = app.test_client()
+        config = client.get("/api/v1/auth/config")
+        self.assertEqual(config.status_code, 200)
+        self.assertEqual(config.get_json()["frontend_api_origin"], "https://clerk.example.test")
+        self.assertIn(
+            "https://clerk.example.test",
+            config.headers["Content-Security-Policy"],
+        )
+        accepted = client.post(
+            "/api/v1/auth/clerk",
+            json={},
+            headers={"Authorization": "Bearer clerk-session"},
         )
         self.assertEqual(accepted.status_code, 200)
         body = accepted.get_json()
         self.assertEqual(body["session"]["principal"]["id"], "alice")
-        self.assertEqual(body["session"]["view_id"], "alice")
-        self.assertTrue(body["access_token"].startswith("bst1."))
-        self.assertIsNone(accepted.headers.get("Set-Cookie"))
-
+        self.assertEqual(
+            load_state(self.forge)["principals"]["alice"]["clerk_user_id"],
+            "user_clerkAlice",
+        )
+        self.assertEqual(
+            client.get(
+                "/api/v1/session", headers=_bearer_header(body["access_token"])
+            ).status_code,
+            200,
+        )
         bearer = _bearer_header(body["access_token"])
-        self.assertEqual(
-            self.client.get("/api/v1/session", headers=bearer).status_code, 200
-        )
-        signed_out = self.client.post("/api/v1/logout", headers=bearer)
-        self.assertEqual(signed_out.status_code, 200)
-        self.assertEqual(
-            self.client.get("/api/v1/session", headers=bearer).status_code, 401
-        )
-        # Signing out of the compatibility token flow clears the browser but
-        # does not revoke an operator-issued Git/UI credential.
-        legacy_bearer = _bearer_header(self.alice_token)
-        self.assertEqual(
-            self.client.post("/api/v1/logout", headers=legacy_bearer).status_code,
-            200,
-        )
-        self.assertEqual(
-            self.client.get("/api/v1/session", headers=legacy_bearer).status_code,
-            200,
-        )
+        self.assertEqual(client.post("/api/v1/logout", headers=bearer).status_code, 200)
+        self.assertEqual(client.get("/api/v1/session", headers=bearer).status_code, 401)
 
     def test_permissions_require_repository_owner(self) -> None:
         self.assertEqual(self.client.get("/api/v1/permissions").status_code, 401)

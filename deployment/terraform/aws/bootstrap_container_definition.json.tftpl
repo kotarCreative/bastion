@@ -15,9 +15,7 @@
     ],
     "secrets": [
       { "name": "BASTION_DATABASE", "valueFrom": "${runtime_database_secret_arn}" },
-      { "name": "BASTION_ADMIN_DATABASE", "valueFrom": "${admin_database_secret_arn}" },
-      { "name": "BASTION_TESTER_PASSWORD", "valueFrom": "${demo_accounts_secret_arn}:tester_password::" },
-      { "name": "BASTION_OBSERVER_PASSWORD", "valueFrom": "${demo_accounts_secret_arn}:observer_password::" }
+      { "name": "BASTION_ADMIN_DATABASE", "valueFrom": "${admin_database_secret_arn}" }
     ],
     "mountPoints": [
       {

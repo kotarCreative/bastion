@@ -124,5 +124,4 @@ aws ecs wait services-stable \
   --services "${service}"
 
 echo "Deployment complete: $(tf output -raw bastion_url)"
-echo "Browser passwords secret: $(tf output -raw demo_accounts_secret_arn)"
 echo "Git/API tokens secret: $(tf output -raw bootstrap_tokens_secret_arn)"

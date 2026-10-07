@@ -56,17 +56,23 @@ with a stable message. Same-user local processes remain trusted operators of
 the filesystem itself; the enforced boundary is the network surface.
 
 Production must add TLS, real sshd integration calling a forge entry point,
-protected service storage, account recovery/MFA, database authorization, and
-login rate limiting.
+protected service storage, database authorization, and distributed admission
+controls. Clerk owns browser account recovery, MFA/passkeys, email verification,
+and primary login abuse controls.
 
-Browser accounts are attached only to `user` principals. The server stores
-only salted scrypt password digests (`N=16384`, `r=8`, `p=1`); the application
-never puts raw passwords in view descriptors, WAL records, responses, logs,
-cookies, URLs, or Web Storage.
-A successful login issues a random, digest-only bearer token scoped only to
-`ui` for 12 hours; logout revokes it. The browser retains the token only in
-page memory. Account authentication is still experimental and must be served
-behind TLS.
+Browser identities are attached only to `user` principals. Bastion verifies
+each Clerk session token using the Clerk backend SDK, restricts its `azp` claim
+to `CLERK_AUTHORIZED_PARTIES`, rejects pending, banned, locked, and
+deprovisioned users, and obtains verified addresses from Clerk's Backend API.
+A first login can claim only one pre-existing user principal with a matching
+declared email. Bastion persists the Clerk user ID so later email changes cannot
+move the identity to another principal. Creating a Clerk account does not grant
+repository access.
+
+After verification, Bastion issues a random, digest-only bearer token scoped
+only to `ui` for one hour; logout revokes it. The browser retains that Bastion
+token only in page memory. Clerk manages its own browser session. Account
+authentication must be served behind TLS.
 
 ## Hard Invariants
 

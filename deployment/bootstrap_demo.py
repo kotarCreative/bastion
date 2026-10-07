@@ -144,24 +144,6 @@ def ensure_catalog(root: Path) -> None:
     if replay.active_views["tester"]["descriptor_id"] != fresh["id"]:
         transition_principal(root, "tester")
 
-    from accounts import set_password
-
-    state = load_state(root)
-    if "account" not in state["principals"]["tester"]:
-        set_password(
-            root,
-            "tester",
-            os.environ.get("BASTION_TESTER_PASSWORD", "bastion-tester"),
-        )
-    state = load_state(root)
-    if "account" not in state["principals"]["observer"]:
-        set_password(
-            root,
-            "observer",
-            os.environ.get("BASTION_OBSERVER_PASSWORD", "bastion-observer"),
-        )
-
-
 def main() -> int:
     root = Path(sys.argv[1])
     ensure_catalog(root)
@@ -186,10 +168,6 @@ def main() -> int:
     tester = add_token(root, "tester", ["fetch", "push", "ui"], "7d")
     observer = add_token(root, "observer", ["fetch", "ui"], "7d")
     print("Bastion test data is ready.")
-    print(
-        "Browser accounts: tester and observer (passwords come from "
-        "BASTION_TESTER_PASSWORD/BASTION_OBSERVER_PASSWORD; test defaults apply)"
-    )
     if secret_arn:
         assert secrets_client is not None
         store_rotated_tokens(

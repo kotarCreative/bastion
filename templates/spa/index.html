@@ -13,6 +13,8 @@
   <a class="brand" href="/" aria-label="Bastion home"><span class="brand-mark" aria-hidden="true">b.</span> bastion<span class="brand-period">.</span></a>
   <nav id="home-nav" class="home-nav" aria-label="Main navigation"><a href="#how-it-works">How it works</a><a href="#login" class="nav-signin">Sign in <span aria-hidden="true">↗</span></a></nav>
   <span id="identity" class="identity" hidden></span>
+  <div id="clerk-user-button" hidden></div>
+  <button id="manage-account" type="button" hidden>Account</button>
   <button id="logout" type="button" hidden>Sign out</button>
 </header>
 <main id="app">
@@ -53,20 +55,16 @@
     <p class="eyebrow">WELCOME BACK</p>
     <h2>Sign in to Bastion</h2>
     <p class="hint">Your code is right where you left it.</p>
-    <form id="account-login-form" autocomplete="on">
-      <label for="username">Username</label>
-      <input id="username" name="username" type="text" autocomplete="username"
-             spellcheck="false" required>
-      <label for="password">Password</label>
-      <input id="password" name="password" type="password"
-             autocomplete="current-password" required>
-      <label for="login-view">Repository view <span class="optional">(only for accounts with multiple views)</span></label>
-      <input id="login-view" name="view" type="text" autocomplete="off"
-             spellcheck="false">
-      <button type="submit" class="account-submit">Open workspace <span aria-hidden="true">↗</span></button>
-    </form>
+    <div id="clerk-auth" hidden>
+      <div id="clerk-sign-in"></div>
+      <form id="clerk-view-form" hidden>
+        <label for="clerk-view">Choose a repository view</label>
+        <select id="clerk-view" name="view"></select>
+        <button type="submit" class="account-submit">Open workspace <span aria-hidden="true">↗</span></button>
+      </form>
+    </div>
     <details>
-      <summary>Use an access token</summary>
+      <summary>Use a Git or API access token</summary>
       <form id="login-form" autocomplete="off">
       <label for="token">Access token</label>
       <input id="token" name="token" type="password" autocomplete="off"
@@ -75,7 +73,7 @@
       </form>
     </details>
     <p id="login-error" class="error" role="alert" hidden></p>
-    <p class="session-note">Sessions expire after 12 hours. Reloading signs you out.</p>
+    <p id="session-note" class="session-note">Account authentication is managed by Clerk.</p>
   </section>
   <section id="workspace" hidden>
     <nav class="tabs" role="tablist">

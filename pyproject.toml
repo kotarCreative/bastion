@@ -12,6 +12,7 @@ flask = "^3.1"
 gunicorn = "^23.0"
 psycopg = {extras = ["binary"], version = "^3.2"}
 boto3 = "^1.35"
+clerk-backend-api = "^7.0.0"
 
 [build-system]
 requires = ["poetry-core"]
