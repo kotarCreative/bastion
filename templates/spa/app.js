@@ -18,6 +18,7 @@
   var treeState = { stack: [], entries: [], cursor: null, loading: false };
   var fullTree = true;
   var treeRun = 0;
+  var invitationRun = 0;
 
   var ELEMENTS = {
     homepage: document.getElementById("homepage"),
@@ -137,6 +138,7 @@
   }
 
   function clearBastionSession() {
+    invitationRun += 1;
     credential = null;
     session = null;
     historyRendered = false;
@@ -556,6 +558,7 @@
   }
 
   function renderPermissions(initialBody) {
+    var invitationVersion = ++invitationRun;
     var panel = document.getElementById("panel-permissions");
     clearChildren(panel);
     var card = element("div", "permission-card");
@@ -564,9 +567,10 @@
     var content = element("div");
     card.appendChild(content);
     panel.appendChild(card);
-    renderInvitation(card);
 
     function populate(body) {
+      if (invitationVersion !== invitationRun) return;
+      renderInvitation(card, body.account_picker_enabled, invitationVersion);
       if (!body.targets.length) {
         content.appendChild(element("p", "hint", "This repository has no other collaborators."));
         return;
@@ -647,10 +651,10 @@
     }).catch(function () { content.appendChild(element("p", "error", "Permissions are unavailable.")); });
   }
 
-  function renderInvitation(card) {
+  function renderInvitation(card, pickerEnabled, version) {
     var section = element("section", "invitation-section");
     section.appendChild(element("h2", null, "Invite a collaborator"));
-    section.appendChild(element("p", "hint", "Set permissions before inviting. They can sign in with a Clerk account using this verified email. Share this site's URL with them; no email is sent."));
+    section.appendChild(element("p", "hint", "Select an existing Clerk account or invite someone by email, then set their permissions. Share this site's URL with them; no email is sent."));
     var form = element("form");
     var id = element("input");
     id.id = "invite-id";
@@ -662,6 +666,105 @@
     email.id = "invite-email";
     email.type = "email";
     email.required = true;
+    var selectedAccount = null;
+    var source = element("select");
+    source.id = "invite-source";
+    if (pickerEnabled) {
+      var existingOption = element("option", null, "Select an existing Clerk account");
+      existingOption.value = "account";
+      source.appendChild(existingOption);
+    }
+    var emailOption = element("option", null, "Invite by email");
+    emailOption.value = "email";
+    source.appendChild(emailOption);
+    var sourceLabel = element("label", null, "Invite method");
+    sourceLabel.setAttribute("for", source.id);
+    form.appendChild(sourceLabel);
+    form.appendChild(source);
+    var picker = element("div", "account-picker");
+    var searchLabel = element("label", null, "Find a Clerk account");
+    searchLabel.setAttribute("for", "invite-search");
+    var search = element("input");
+    search.id = "invite-search";
+    search.type = "search";
+    search.maxLength = 100;
+    search.placeholder = "Search by name or email";
+    search.setAttribute("autocomplete", "off");
+    var searchStatus = element("p", "hint", "Enter at least 2 characters to search.");
+    searchStatus.setAttribute("role", "status");
+    var results = element("div", "account-results");
+    var more = textButton("load-more", "Load more accounts");
+    more.hidden = true;
+    var selection = element("p", "account-selection");
+    selection.setAttribute("role", "status");
+    [searchLabel, search, searchStatus, results, more, selection].forEach(function (node) { picker.appendChild(node); });
+    form.appendChild(picker);
+    var searchVersion = 0;
+    var timer = null;
+    var nextOffset = null;
+    var token = credential;
+
+    function active(run) {
+      return version === invitationRun && token === credential && run === searchVersion;
+    }
+    function searchAccounts(offset, run) {
+      if (!active(run)) return;
+      var query = search.value.trim();
+      searchStatus.textContent = "Searching Clerk accounts…";
+      more.disabled = true;
+      request("/api/v1/accounts?query=" + encodeURIComponent(query) + "&offset=" + offset).then(function (result) {
+        if (!active(run)) return;
+        if (result.status !== 200) throw new Error("search-unavailable");
+        result.body.accounts.forEach(function (account) {
+          var button = textButton("account-option", account.name + " · " + account.email + (account.already_invited ? " · Already invited" : ""));
+          button.disabled = account.already_invited;
+          button.addEventListener("click", function () {
+            selectedAccount = account;
+            email.value = account.email;
+            selection.textContent = "Selected: " + account.name + " · " + account.email;
+            if (!id.value) id.value = account.email.split("@")[0].replace(/[^A-Za-z0-9._-]/g, "-").replace(/^[^A-Za-z0-9]+/, "").slice(0, 64);
+          });
+          results.appendChild(button);
+        });
+        nextOffset = result.body.next_offset;
+        more.hidden = nextOffset === null;
+        searchStatus.textContent = results.children.length ? "Select an account below. Only active accounts with verified email are shown." : "No eligible accounts on this page. Try another search or invite by email.";
+      }).catch(function () {
+        if (!active(run)) return;
+        searchStatus.textContent = "Account search is unavailable. Try again or choose Invite by email.";
+        more.hidden = true;
+      }).then(function () { if (active(run)) more.disabled = false; });
+    }
+    search.addEventListener("input", function () {
+      var run = ++searchVersion;
+      if (timer) window.clearTimeout(timer);
+      clearChildren(results);
+      more.hidden = true;
+      if (search.value.trim().length < 2) {
+        searchStatus.textContent = "Enter at least 2 characters to search.";
+        return;
+      }
+      timer = window.setTimeout(function () { searchAccounts(0, run); }, 300);
+    });
+    more.addEventListener("click", function () {
+      if (nextOffset !== null) searchAccounts(nextOffset, ++searchVersion);
+    });
+    function changeSource() {
+      searchVersion += 1;
+      if (timer) window.clearTimeout(timer);
+      selectedAccount = null;
+      selection.textContent = "";
+      email.value = "";
+      picker.hidden = source.value !== "account";
+      email.readOnly = source.value === "account";
+      email.required = source.value !== "account";
+      clearChildren(results);
+      more.hidden = true;
+      search.value = "";
+      searchStatus.textContent = "Enter at least 2 characters to search.";
+    }
+    source.addEventListener("change", changeSource);
+    changeSource();
     var access = element("select");
     access.id = "invite-access";
     [["read-only", "Read-only — browse files and history"], ["contributor", "Contributor — read, create, edit, and delete allowed files"]].forEach(function (item) {
@@ -691,18 +794,26 @@
     card.appendChild(section);
     form.addEventListener("submit", function (event) {
       event.preventDefault();
+      if (source.value === "account" && !selectedAccount) {
+        outcome.className = "error";
+        outcome.textContent = "Search for and select a Clerk account first.";
+        return;
+      }
       var selectedPaths = paths.value.split(/\r?\n/).map(function (value) { return value.trim(); }).filter(Boolean);
       if (!selectedPaths.length) return;
       submit.disabled = true;
       outcome.className = "hint";
       outcome.textContent = "Creating the permission-scoped invitation…";
+      var payload = { principal_id: id.value.trim(), access: access.value, readable_paths: selectedPaths };
+      if (source.value === "account") payload.clerk_user_id = selectedAccount.clerk_user_id;
+      else payload.email = email.value.trim();
       request("/api/v1/invitations", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ principal_id: id.value.trim(), email: email.value.trim(), access: access.value, readable_paths: selectedPaths }),
+        body: JSON.stringify(payload),
       }).then(function (result) {
         if (result.status !== 201) {
           outcome.className = "error";
-          outcome.textContent = result.status === 409 ? "That identifier or email is already invited. Choose a unique collaborator." : "Invitation failed. Check the identifier, email, and existing repository paths.";
+          outcome.textContent = result.status === 409 ? "That identifier, email, or Clerk account is already invited. Choose a unique collaborator." : result.body.error === "account-unavailable" ? "That account is no longer available or has no verified email. Search again." : "Invitation failed. Check the account, identifier, email, and existing repository paths.";
           return;
         }
         renderPermissions();

@@ -735,10 +735,44 @@ def create_app(root: Path) -> Flask:
             abort(response)
         return view_state, descriptor
 
+    @app.route("/api/v1/accounts", methods=["GET"])
+    def api_search_accounts():
+        from clerk_auth import ClerkDirectoryError
+
+        _record, view = _api_auth()
+        _require_repository_owner(view)
+        authenticator = app.config["CLERK_AUTHENTICATOR"]
+        if authenticator is None:
+            return jsonify({"error": "directory-disabled"}), 404
+        query = request.args.get("query", "").strip()
+        try:
+            offset = int(request.args.get("offset", "0"))
+        except ValueError:
+            return jsonify({"error": "bad-request"}), 400
+        if (
+            len(request.query_string) > 4096 or not 2 <= len(query) <= 100
+            or not 0 <= offset <= 10_000
+            or set(request.args) - {"query", "offset"}
+        ):
+            return jsonify({"error": "bad-request"}), 400
+        try:
+            page = authenticator.search_accounts(query, offset)
+            principals = load_state_sections(_forge_root(app), ["principals"])["principals"]
+            for account in page["accounts"]:
+                account["already_invited"] = any(
+                    item.get("clerk_user_id") == account["clerk_user_id"]
+                    or account["email"] in item.get("emails", [])
+                    for item in principals.values()
+                )
+        except (ClerkDirectoryError, ForgeError):
+            return jsonify({"error": "directory-unavailable"}), 503
+        return jsonify(page), 200
+
     @app.route("/api/v1/invitations", methods=["POST"])
     def api_invite_collaborator():
         import api_v1 as _api
         from service import invite_collaborator
+        from clerk_auth import ClerkDirectoryError
 
         _record, view = _api_auth()
         _require_repository_owner(view)
@@ -751,13 +785,27 @@ def create_app(root: Path) -> Flask:
             return jsonify({"error": "bad-request"}), 400
         if (
             not isinstance(payload, dict)
-            or set(payload) != {"principal_id", "email", "readable_paths", "access"}
+            or set(payload) not in (
+                {"principal_id", "email", "readable_paths", "access"},
+                {"principal_id", "clerk_user_id", "readable_paths", "access"},
+            )
             or not isinstance(payload.get("principal_id"), str)
-            or not isinstance(payload.get("email"), str)
+            or not isinstance(payload.get("email", payload.get("clerk_user_id")), str)
             or not isinstance(payload.get("readable_paths"), list)
             or not isinstance(payload.get("access"), str)
         ):
             return jsonify({"error": "bad-request"}), 400
+        if "clerk_user_id" in payload:
+            authenticator = app.config["CLERK_AUTHENTICATOR"]
+            if authenticator is None:
+                return jsonify({"error": "directory-disabled"}), 404
+            try:
+                account = authenticator.get_account(payload["clerk_user_id"])
+            except ClerkDirectoryError:
+                return jsonify({"error": "directory-unavailable"}), 503
+            if account is None or account["clerk_user_id"] != payload["clerk_user_id"]:
+                return jsonify({"error": "account-unavailable"}), 400
+            payload["email"] = account["email"]
         try:
             invite_collaborator(_forge_root(app), view, **payload)
         except ForgeError as error:
@@ -802,7 +850,9 @@ def create_app(root: Path) -> Flask:
                 )
         except ForgeError:
             return jsonify({"error": "service-unavailable"}), 503
-        response = make_response(jsonify({"targets": targets}), 200)
+        response = make_response(jsonify({
+            "targets": targets, "account_picker_enabled": app.config["CLERK_AUTHENTICATOR"] is not None,
+        }), 200)
         response.headers["Cache-Control"] = "no-store"
         return response
 

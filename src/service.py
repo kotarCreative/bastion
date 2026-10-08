@@ -381,7 +381,7 @@ def add_view(
 
 def invite_collaborator(
     root: Path, actor_view_id: str, principal_id: str, email: str,
-    readable_paths: list[str], access: str,
+    readable_paths: list[str], access: str, clerk_user_id: str | None = None,
 ) -> None:
     """Invite a scoped user, fenced by the owner's WAL policy."""
     if access not in {"read-only", "contributor"}:
@@ -389,6 +389,11 @@ def invite_collaborator(
     identity.validate_identifier(principal_id)
     validate_view_name(principal_id)
     emails = identity.normalize_emails([email])
+    if clerk_user_id is not None and (
+        not isinstance(clerk_user_id, str) or not clerk_user_id.startswith("user_")
+        or len(clerk_user_id) > 255
+    ):
+        raise ForgeError("invalid Clerk user identity")
     if not isinstance(readable_paths, list) or not readable_paths or len(readable_paths) > 100:
         raise ForgeError("choose between one and 100 readable paths")
     if not all(isinstance(path, str) for path in readable_paths):
@@ -407,6 +412,10 @@ def invite_collaborator(
             raise ForgeError("repository owner permission is required", "policy")
         if principal_id in state["principals"] or principal_id in replay.active_views:
             raise ForgeError("collaborator identifier already exists", "conflict")
+        if clerk_user_id and any(
+            item.get("clerk_user_id") == clerk_user_id for item in state["principals"].values()
+        ):
+            raise ForgeError("Clerk account already invited", "conflict")
         if any(set(emails).intersection(item.get("emails", [])) for item in state["principals"].values()):
             raise ForgeError("email already invited", "conflict")
         canonical = ensure_canonical_materialized(root, manifest, repository)
@@ -416,6 +425,8 @@ def invite_collaborator(
         role_id = "invite-" + uuid.uuid4().hex
         old = copy.deepcopy(state)
         identity.add_principal(state, principal_id, emails)
+        if clerk_user_id:
+            state["principals"][principal_id]["clerk_user_id"] = clerk_user_id
         allow = identity.empty_capability_map()
         allow["read"] = paths
         if access == "contributor":

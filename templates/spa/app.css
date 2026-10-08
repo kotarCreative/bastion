@@ -333,5 +333,10 @@ summary { color: var(--muted); font-size: 11px; cursor: pointer; }
 .invitation-section { border-top: 1px solid var(--line); padding-top: 24px; margin-top: 24px; }
 .invitation-section textarea { width: 100%; padding: 10px 12px; border: 1px solid var(--line-strong); border-radius: 6px; color: var(--ink); background: var(--panel); font: inherit; resize: vertical; }
 .invitation-section textarea:focus-visible { outline: 3px solid var(--accent-light); outline-offset: 2px; }
+.account-results { display: flex; flex-direction: column; gap: 6px; }
+.account-option { width: 100%; padding: 10px 12px; text-align: left; border: 1px solid var(--line); border-radius: 5px; background: var(--panel); color: var(--ink); cursor: pointer; overflow-wrap: anywhere; }
+.account-option:hover { background: var(--soft); }
+.account-option:disabled { opacity: .6; cursor: default; }
+.account-selection { color: var(--ok); font-weight: 600; }
 .code-toolbar { flex-wrap: wrap; }
 .code-toolbar button { padding: 6px 10px; border: 1px solid var(--line-strong); border-radius: 5px; background: var(--panel); color: var(--ink); cursor: pointer; font-size: 11px; }

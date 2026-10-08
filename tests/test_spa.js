@@ -61,7 +61,7 @@ const context = {
     createElement: tag => new Node(tag),
     querySelectorAll: selector => selector === ".tab" ? tabs : panels,
   },
-  window: { location: { protocol: "https:", host: "demo.test" }, scrollTo() {} },
+  window: { location: { protocol: "https:", host: "demo.test" }, scrollTo() {}, setTimeout, clearTimeout },
   TextEncoder, btoa: value => Buffer.from(value, "binary").toString("base64"), Intl, Date,
   fetch: async (path, options) => {
     calls.push({ path, options });
@@ -69,7 +69,16 @@ const context = {
     let status = 200;
     if (path === "/api/v1/auth/config") body = { enabled: false };
     else if (path === "/api/v1/session") body = envelope;
-    else if (path === "/api/v1/permissions") body = { targets: [] };
+    else if (path === "/api/v1/permissions") body = { targets: [], account_picker_enabled: true };
+    else if (path.startsWith("/api/v1/accounts?")) {
+      const offset = new URLSearchParams(path.split("?")[1]).get("offset");
+      body = offset === "0" ? { accounts: [
+        { clerk_user_id: "user_owner", name: "Owner", email: "owner@example.test", already_invited: true },
+        { clerk_user_id: "user_writer", name: "Writer", email: "writer@example.test", already_invited: false },
+      ], next_offset: 20 } : { accounts: [
+        { clerk_user_id: "user_other", name: "Other", email: "other@example.test", already_invited: false },
+      ], next_offset: null };
+    }
     else if (path === "/api/v1/invitations") {
       const payload = JSON.parse(options.body);
       body = { view_id: payload.principal_id, access: payload.access };
@@ -112,6 +121,8 @@ const settle = async () => { for (let i = 0; i < 8; i++) await new Promise(resol
 
   const permissions = nodes.get("panel-permissions");
   const find = id => descendants(permissions).find(node => node.id === id);
+  find("invite-source").value = "email";
+  find("invite-source").fire("change");
   find("invite-id").value = "reader";
   find("invite-email").value = "reader@example.test";
   find("invite-access").value = "read-only";
@@ -124,5 +135,44 @@ const settle = async () => { for (let i = 0; i < 8; i++) await new Promise(resol
   });
   assert.match(text(permissions), /Invited reader with read-only access/);
   assert.equal(invitation.options.headers.Authorization, "Bearer owner-token");
-  console.log("SPA checks passed: nested tree, pagination, collapse, folder mode, scoped invitation.");
+
+  assert.equal(find("invite-source").value, "account");
+  find("invite-id").value = "writer";
+  find("invite-access").value = "contributor";
+  find("invite-paths").value = "src/public";
+  descendants(permissions).find(node => node.tagName === "form").fire("submit");
+  await settle();
+  assert.equal(calls.filter(call => call.path === "/api/v1/invitations").length, 1);
+  assert.match(text(permissions), /select a Clerk account first/);
+  find("invite-search").value = "w";
+  find("invite-search").fire("input");
+  await new Promise(resolve => setTimeout(resolve, 350));
+  assert.equal(calls.filter(call => call.path.startsWith("/api/v1/accounts?")).length, 0);
+  find("invite-search").value = "wri";
+  find("invite-search").fire("input");
+  find("invite-search").value = "writer";
+  find("invite-search").fire("input");
+  await new Promise(resolve => setTimeout(resolve, 350));
+  await settle();
+  const searches = calls.filter(call => call.path.startsWith("/api/v1/accounts?"));
+  assert.equal(searches.length, 1);
+  assert.match(searches[0].path, /query=writer/);
+  const options = descendants(permissions).filter(node => node.className === "account-option");
+  assert.equal(options[0].disabled, true);
+  assert.equal(options[1].disabled, false);
+  descendants(permissions).find(node => node.textContent === "Load more accounts").fire("click");
+  await settle();
+  assert.ok(calls.some(call => call.path.includes("offset=20")));
+  assert.match(text(permissions), /Other/);
+  options[1].fire("click");
+  assert.equal(find("invite-email").value, "writer@example.test");
+  assert.equal(find("invite-email").readOnly, true);
+  descendants(permissions).find(node => node.tagName === "form").fire("submit");
+  await settle();
+  const pickerInvitation = calls.filter(call => call.path === "/api/v1/invitations")[1];
+  assert.deepEqual(JSON.parse(pickerInvitation.options.body), {
+    principal_id: "writer", clerk_user_id: "user_writer", access: "contributor", readable_paths: ["src/public"],
+  });
+  assert.match(text(permissions), /Invited writer with contributor access/);
+  console.log("SPA checks passed: tree, scoped invitations, Clerk search debounce, pagination, account selection.");
 })().catch(error => { console.error(error); process.exitCode = 1; });

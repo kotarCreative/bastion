@@ -199,7 +199,15 @@ imported repository as the owner, the owner must also have root `read` access.
 
 In **People & permissions**, use **Invite a collaborator** to set a unique
 identifier, verified email, permission level, and allowed paths before granting
-access. **Read-only** grants read access; **Contributor** also grants create,
+access. When Clerk is configured, **Select an existing Clerk account** searches
+the live Clerk directory by name or email (at least two characters). Select a
+verified account from the results, or choose **Invite by email** for someone who
+has not registered yet. Already-invited accounts are marked and cannot be selected.
+Directory search is available only to repository owners and requires no webhook.
+Picker invitations revalidate the account server-side and bind its stable Clerk
+user ID before granting access; the browser cannot substitute another email.
+
+**Read-only** grants read access; **Contributor** also grants create,
 modify, delete, mode, and symlink access within those same paths. Enter one
 existing file or folder per line, or `/` for the whole repository. Other paths
 are absent from their projection, including the file tree and history. Neither

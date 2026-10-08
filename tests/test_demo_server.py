@@ -483,6 +483,75 @@ class DemoServerTest(unittest.TestCase):
                 invite_collaborator(self.forge, "owner", "invitee", "invitee@example.test", ["visible"], "read-only")
         self.assertNotIn("invitee", load_state(self.forge)["principals"])
 
+    def test_account_search_is_owner_only_bounded_and_marks_invited_users(self) -> None:
+        from unittest.mock import Mock
+
+        authenticator = Mock()
+        self.app.config["CLERK_AUTHENTICATOR"] = authenticator
+        for headers, status in (({}, 401), (self._bearer(self.alice_token), 403)):
+            response = self.client.get("/api/v1/accounts?query=reader", headers=headers)
+            self.assertEqual(response.status_code, status)
+        authenticator.search_accounts.assert_not_called()
+        owner = self._owner_token()
+        headers = self._bearer(owner)
+        for query in ({"query": "a"}, {"query": "a" * 101}, {"query": "reader", "offset": "invalid"}, {"query": "reader", "offset": "-1"}, {"query": "reader", "offset": "10001"}):
+            self.assertEqual(self.client.get("/api/v1/accounts", query_string=query, headers=headers).status_code, 400)
+        authenticator.search_accounts.return_value = {"accounts": [
+            {"clerk_user_id": "user_owner", "name": "Owner", "email": "owner@example.test"},
+            {"clerk_user_id": "user_reader", "name": "Reader", "email": "reader@example.test"},
+        ], "next_offset": 20}
+        response = self.client.get("/api/v1/accounts?query=reader&offset=20", headers=headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        self.assertEqual([item["already_invited"] for item in response.get_json()["accounts"]], [True, False])
+        authenticator.search_accounts.assert_called_once_with("reader", 20)
+
+    def test_picker_invitation_binds_stable_account_and_enforces_scope(self) -> None:
+        from accounts import link_clerk_account
+        from unittest.mock import Mock
+
+        owner = self._owner_token()
+        authenticator = Mock()
+        self.app.config["CLERK_AUTHENTICATOR"] = authenticator
+        authenticator.get_account.return_value = {"clerk_user_id": "user_reader", "email": "reader@example.test", "name": "Reader"}
+        payload = {"principal_id": "reader", "clerk_user_id": "user_reader", "access": "read-only", "readable_paths": ["visible/file.txt"]}
+        response = self.client.post("/api/v1/invitations", json=payload, headers=self._bearer(owner))
+        self.assertEqual(response.status_code, 201)
+        authenticator.get_account.assert_called_once_with("user_reader")
+        principal = load_state(self.forge)["principals"]["reader"]
+        self.assertEqual(principal["clerk_user_id"], "user_reader")
+        self.assertEqual(principal["emails"], ["reader@example.test"])
+        self.assertEqual(link_clerk_account(self.forge, "user_reader", ["changed@example.test"]), "reader")
+        token = add_token(self.forge, "reader")
+        descriptor = self.client.get("/api/v1/session", headers=self._bearer(token)).get_json()["descriptor"]
+        self.assertEqual(descriptor["capabilities"]["modify"], [])
+        self.assertEqual(self.client.get("/api/v1/blob", query_string={"path_b64": self._b64(b"hidden/secret.txt")}, headers=self._bearer(token)).status_code, 404)
+        self.assertEqual(self.client.post("/api/v1/invitations", json=payload | {"principal_id": "other"}, headers=self._bearer(owner)).status_code, 409)
+        forged = payload | {"principal_id": "forged", "email": "forged@example.test"}
+        self.assertEqual(self.client.post("/api/v1/invitations", json=forged, headers=self._bearer(owner)).status_code, 400)
+        forge.check_invariants(self.forge)
+
+    def test_picker_rechecks_unavailable_accounts_and_handles_directory_outages(self) -> None:
+        from clerk_auth import ClerkDirectoryError
+        from unittest.mock import Mock
+
+        owner = self._owner_token()
+        headers = self._bearer(owner)
+        payload = {"principal_id": "reader", "clerk_user_id": "user_reader", "access": "read-only", "readable_paths": ["visible"]}
+        self.assertEqual(self.client.get("/api/v1/accounts?query=reader", headers=headers).status_code, 404)
+        self.assertEqual(self.client.post("/api/v1/invitations", json=payload, headers=headers).status_code, 404)
+        authenticator = Mock()
+        self.app.config["CLERK_AUTHENTICATOR"] = authenticator
+        authenticator.get_account.return_value = None
+        self.assertEqual(self.client.post("/api/v1/invitations", json=payload, headers=headers).get_json(), {"error": "account-unavailable"})
+        authenticator.get_account.side_effect = ClerkDirectoryError("private details")
+        self.assertEqual(self.client.post("/api/v1/invitations", json=payload, headers=headers).status_code, 503)
+        authenticator.search_accounts.side_effect = ClerkDirectoryError("private details")
+        response = self.client.get("/api/v1/accounts?query=reader", headers=headers)
+        self.assertEqual(response.status_code, 503)
+        self.assertNotIn(b"private details", response.data)
+        self.assertNotIn("reader", load_state(self.forge)["principals"])
+
     def test_git_info_refs_requires_auth(self) -> None:
         response = self.client.get(
             "/alice.git/info/refs", query_string={"service": "git-upload-pack"}
