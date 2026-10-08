@@ -11,6 +11,7 @@ __pycache__
 **/node_modules
 **/.wrangler
 **/.dev.vars
+**/.env
 work
 results.json
 deployment/terraform

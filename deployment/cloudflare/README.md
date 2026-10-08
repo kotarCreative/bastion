@@ -36,7 +36,8 @@ npx wrangler secret put BASTION_BOOTSTRAP_ADMIN_EMAIL
 npx wrangler secret put CLERK_PUBLISHABLE_KEY
 npx wrangler secret put CLERK_SECRET_KEY
 npx wrangler secret put CLERK_AUTHORIZED_PARTIES
-# Optional PEM public key for networkless JWT signature verification:
+# Optional: only needed for networkless JWT signature verification.
+# Leave unset to use Clerk's live JWKS endpoint (recommended).
 npx wrangler secret put CLERK_JWT_KEY
 ```
 
@@ -46,6 +47,12 @@ must be the exact public Worker origin, with no path. Configure that origin and
 the desired signup, email verification, MFA, and passkey methods in the Clerk
 Dashboard. Bastion does not require a custom JWT template. Do not put the
 Artifacts token in a Worker variable or send it to a browser.
+
+`CLERK_JWT_KEY` is optional. An invalid or stale static key prevents sign-in
+even when the other Clerk settings are correct. Omit it from bulk secret
+uploads when using live JWKS verification. If a static key is already set,
+remove it with `npx wrangler secret delete CLERK_JWT_KEY` and restart the
+Container so the running Python process loads the updated environment.
 
 After deployment, provision once with the admin secret:
 
@@ -66,6 +73,13 @@ publishing its first control snapshot when the demo needs several agents.
 Cloudflare's Artifacts namespace defaults to `default` in this config. Change
 that namespace and the fixed repo variable before deploying if the account
 uses another namespace. Re-run `npx wrangler types` after binding changes.
+
+Production uses the `bastion-production` repository. Keep local previews on a
+separate repository (for example, override `ARTIFACTS_REPO` with `bastion-private`
+using `wrangler dev --var ARTIFACTS_REPO:bastion-private`). A local preview's
+catalog is local to workerd, even when its Artifacts repository is remote.
+Production cannot bootstrap against those existing objects without importing
+the matching catalog; startup intentionally fails closed in that case.
 
 ## Local preview
 

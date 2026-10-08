@@ -6,6 +6,7 @@ __pycache__/
 **/node_modules/
 **/.wrangler/
 **/.dev.vars
+**/.env
 **/.terraform/
 *.tfplan
 *.tfstate

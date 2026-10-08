@@ -26,7 +26,7 @@
     { "binding": "ARTIFACTS", "namespace": "default" }
   ],
   "vars": {
-    "ARTIFACTS_REPO": "bastion-private",
+    "ARTIFACTS_REPO": "bastion-production",
     "BASTION_ROOT": "/var/lib/bastion/forge"
   },
   "observability": { "enabled": true, "traces": { "enabled": true } }
