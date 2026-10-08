@@ -100,6 +100,9 @@ class DemoServerTest(unittest.TestCase):
         self.assertIn(b"/assets/app.css", response.data)
         self.assertIn(b'id="clerk-sign-in"', response.data)
         self.assertIn(b'id="tab-permissions"', response.data)
+        self.assertIn(b'id="tab-profile"', response.data)
+        self.assertIn(b'id="tree-list"', response.data)
+        self.assertIn(b'id="clone-dialog"', response.data)
         self.assertNotIn(b"<script>", response.data)  # external script only
 
     def test_auth_config_is_disabled_without_clerk_environment(self) -> None:
@@ -321,6 +324,38 @@ class DemoServerTest(unittest.TestCase):
         self.assertIn("visible", paths)
         self.assertNotIn("hidden", paths)
 
+    def test_blob_reads_only_visible_text_files(self) -> None:
+        visible = self.client.get(
+            "/api/v1/blob",
+            query_string={"path_b64": self._b64(b"visible/file.txt")},
+            headers=_bearer_header(self.alice_token),
+        )
+        self.assertEqual(visible.status_code, 200)
+        self.assertEqual(visible.get_json()["text"], "visible 2\n")
+        self.assertFalse(visible.get_json()["binary"])
+        self.assertEqual(
+            set(visible.get_json()),
+            {"projected_tip", "path_b64", "path_display", "size", "binary", "text"},
+        )
+
+        binary = self.client.get(
+            "/api/v1/blob",
+            query_string={"path_b64": self._b64(b"visible/blob.bin")},
+            headers=_bearer_header(self.alice_token),
+        )
+        self.assertEqual(binary.status_code, 200)
+        self.assertTrue(binary.get_json()["binary"])
+        self.assertIsNone(binary.get_json()["text"])
+
+        for path in (b"hidden/secret.txt", b"missing.txt", b"visible"):
+            response = self.client.get(
+                "/api/v1/blob",
+                query_string={"path_b64": self._b64(path)},
+                headers=_bearer_header(self.alice_token),
+            )
+            self.assertEqual(response.status_code, 404)
+            self.assertEqual(response.get_json(), {"error": "not-found"})
+
     def test_hidden_tree_prefix_is_generic_404(self) -> None:
         hidden = self._b64(b"hidden")
         for token in (self.alice_token, self.bob_token):
@@ -357,6 +392,96 @@ class DemoServerTest(unittest.TestCase):
         self.assertIn("message_display", commits[0])
 
     # -- Git routes ----------------------------------------------------------
+
+    def _owner_token(self) -> str:
+        from identity import empty_capability_map
+        from service import add_principal, add_role, bind_role, add_view
+
+        add_principal(self.forge, "owner", ["owner@example.test"])
+        allow = empty_capability_map()
+        allow["read"] = [""]
+        allow["admin"] = [""]
+        add_role(self.forge, "owner-role", allow, empty_capability_map())
+        bind_role(self.forge, "owner-role", "principal", "owner")
+        add_view(self.forge, "owner", "owner", "main")
+        return add_token(self.forge, "owner")
+
+    def test_invitation_applies_scoped_permissions_before_first_login(self) -> None:
+        from accounts import link_clerk_account
+
+        owner = self._owner_token()
+        for access, name in (("read-only", "reader"), ("contributor", "writer")):
+            with self.subTest(access=access):
+                response = self.client.post(
+                    "/api/v1/invitations", headers=self._bearer(owner),
+                    json={"principal_id": name, "email": name + "@example.test",
+                          "access": access, "readable_paths": ["visible/file.txt"]},
+                )
+                self.assertEqual(response.status_code, 201, response.get_json())
+                self.assertEqual(link_clerk_account(self.forge, "user_" + name, [name + "@example.test"]), name)
+                token = add_token(self.forge, name)
+                envelope = self.client.get("/api/v1/session", headers=self._bearer(token)).get_json()
+                capabilities = envelope["descriptor"]["capabilities"]
+                self.assertEqual(bool(capabilities["modify"]), access == "contributor")
+                self.assertEqual(capabilities["admin"], [])
+                root = self.client.get("/api/v1/tree", headers=self._bearer(token)).get_json()
+                self.assertEqual([item["path_display"] for item in root["entries"]], ["visible"])
+                children = self.client.get("/api/v1/tree", query_string={"path_b64": self._b64(b"visible")}, headers=self._bearer(token)).get_json()
+                self.assertEqual([item["path_display"] for item in children["entries"]], ["visible/file.txt"])
+                for path in (b"hidden/secret.txt", b"visible/blob.bin"):
+                    hidden = self.client.get("/api/v1/blob", query_string={"path_b64": self._b64(path)}, headers=self._bearer(token))
+                    self.assertEqual(hidden.status_code, 404)
+                self.assertEqual(self.client.get("/api/v1/permissions", headers=self._bearer(token)).status_code, 403)
+        forge.check_invariants(self.forge)
+
+    def test_invitation_rejects_nonowners_invalid_paths_and_duplicates(self) -> None:
+        payload = {"principal_id": "invitee", "email": "invitee@example.test",
+                   "access": "read-only", "readable_paths": ["visible"]}
+        self.assertEqual(self.client.post("/api/v1/invitations", json=payload).status_code, 401)
+        self.assertEqual(self.client.post("/api/v1/invitations", json=payload, headers=self._bearer(self.alice_token)).status_code, 403)
+        owner = self._owner_token()
+        for change in ({"readable_paths": ["missing"]}, {"access": "admin"}, {"readable_paths": ["../hidden"]}, {"readable_paths": ["visible\x00"]}, {"readable_paths": []}):
+            response = self.client.post("/api/v1/invitations", json=payload | change, headers=self._bearer(owner))
+            self.assertEqual(response.status_code, 400)
+            self.assertNotIn("invitee", load_state(self.forge)["principals"])
+        self.assertEqual(self.client.post("/api/v1/invitations", json=payload, headers=self._bearer(owner)).status_code, 201)
+        for change in ({}, {"principal_id": "other"}, {"email": "another@example.test"}):
+            self.assertEqual(self.client.post("/api/v1/invitations", json=payload | change, headers=self._bearer(owner)).status_code, 409)
+
+    def test_owner_can_hide_and_restore_invited_contributor_paths(self) -> None:
+        owner = self._owner_token()
+        self.client.post("/api/v1/invitations", headers=self._bearer(owner), json={
+            "principal_id": "invitee", "email": "invitee@example.test",
+            "access": "contributor", "readable_paths": ["/"],
+        })
+        token = add_token(self.forge, "invitee")
+        before = self.client.get("/api/v1/session", headers=self._bearer(token)).get_json()
+        for private in (True, False):
+            response = self.client.post("/api/v1/permissions", headers=self._bearer(owner), json={
+                "view_id": "invitee", "path_b64": self._b64(b"hidden"), "private": private,
+            })
+            self.assertEqual(response.status_code, 200)
+            tree = self.client.get("/api/v1/tree", headers=self._bearer(token)).get_json()
+            self.assertEqual("hidden" in [item["path_display"] for item in tree["entries"]], not private)
+            for capability in ("read", "modify"):
+                decision = self.client.post("/api/v1/decisions", headers=self._bearer(token), json={
+                    "capability": capability, "path_b64": self._b64(b"hidden/secret.txt"),
+                }).get_json()
+                self.assertEqual(decision["allowed"], not private)
+        after = self.client.get("/api/v1/session", headers=self._bearer(token)).get_json()
+        self.assertGreater(after["descriptor"]["projection_epoch"], before["descriptor"]["projection_epoch"])
+        forge.check_invariants(self.forge)
+
+    def test_rejected_invitation_fence_rolls_back_catalog(self) -> None:
+        from errors import ForgeError
+        from repository import Repository
+        from service import invite_collaborator
+
+        self._owner_token()
+        with patch.object(Repository, "publish", side_effect=ForgeError("ownership changed", "conflict")):
+            with self.assertRaises(ForgeError):
+                invite_collaborator(self.forge, "owner", "invitee", "invitee@example.test", ["visible"], "read-only")
+        self.assertNotIn("invitee", load_state(self.forge)["principals"])
 
     def test_git_info_refs_requires_auth(self) -> None:
         response = self.client.get(

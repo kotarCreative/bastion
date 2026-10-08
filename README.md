@@ -183,12 +183,34 @@ verified email that should claim the initial administrator. See
 the complete `wrangler secret put` sequence.
 
 An account whose active descriptor grants root `admin` capability is treated
-as a repository owner. Owners get a **Permissions** tab where they can make an
+as a repository owner. Owners get a **People & permissions** tab where they can make an
 existing file or folder private for another principal's view, or restore its
 inherited visibility. Each edit publishes a new immutable descriptor and
 projection epoch before the UI reports success. Within the current prototype,
 one forge root is one uploaded/imported repository; start the demo server for
 that root to manage it.
+
+The **Code** tab opens an expanded file structure, including nested directories
+and all paginated entries visible to the signed-in user. Folder names can be
+clicked to collapse their children; files open a preview. **Browse one folder**
+switches to directory-by-directory browsing, and **Refresh view** reloads the
+active permissions and projected files after a privacy change. To show the entire
+imported repository as the owner, the owner must also have root `read` access.
+
+In **People & permissions**, use **Invite a collaborator** to set a unique
+identifier, verified email, permission level, and allowed paths before granting
+access. **Read-only** grants read access; **Contributor** also grants create,
+modify, delete, mode, and symlink access within those same paths. Enter one
+existing file or folder per line, or `/` for the whole repository. Other paths
+are absent from their projection, including the file tree and history. Neither
+level grants administrator, branch, merge, or tag capabilities. You can then
+hide individual files or folders using the collaborator privacy controls.
+
+Invitations provision access immediately; they do not send email. Share the
+site URL with the invitee, who signs in through Clerk with the invited verified
+email. Git tokens are issued separately using the existing CLI. For a privacy
+demo, open the owner account and collaborator account in separate browser
+profiles, change the collaborator's privacy settings, and refresh their view.
 
 Use normal Git inside `alice`:
 

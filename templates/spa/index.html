@@ -4,95 +4,164 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
-<meta name="description" content="Bastion is an experimental Git forge with path-level permissions. One repository, the right view for every collaborator.">
-<title>Bastion — A place for your code. A boundary for its access.</title>
+<meta name="description" content="Bastion is a permission-aware Git forge. Share one repository while every collaborator sees only the code they need.">
+<title>Bastion | Permission-aware Git hosting</title>
 <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
 <header class="topbar">
-  <a class="brand" href="/" aria-label="Bastion home"><span class="brand-mark" aria-hidden="true">b.</span> bastion<span class="brand-period">.</span></a>
-  <nav id="home-nav" class="home-nav" aria-label="Main navigation"><a href="#how-it-works">How it works</a><a href="#login" class="nav-signin">Sign in <span aria-hidden="true">↗</span></a></nav>
-  <span id="identity" class="identity" hidden></span>
-  <div id="clerk-user-button" hidden></div>
-  <button id="manage-account" type="button" hidden>Account</button>
-  <button id="logout" type="button" hidden>Sign out</button>
+  <a class="brand" href="/" aria-label="Bastion home"><span class="brand-mark" aria-hidden="true">b</span><span>bastion</span></a>
+  <nav id="home-nav" class="home-nav" aria-label="Main navigation">
+    <a href="#product">Product</a>
+    <a href="#principles">How it works</a>
+    <a href="#login" class="nav-button">Sign in</a>
+  </nav>
+  <div id="session-nav" class="session-nav" hidden>
+    <button id="repository-nav" class="quiet-button" type="button">Repository</button>
+    <button id="profile-nav" class="quiet-button" type="button">Profile</button>
+    <span id="identity" class="identity" hidden></span>
+    <div id="clerk-user-button" hidden></div>
+    <button id="manage-account" class="quiet-button" type="button" hidden>Account</button>
+    <button id="logout" class="quiet-button" type="button" hidden>Sign out</button>
+  </div>
 </header>
+
 <main id="app">
   <div id="homepage">
     <section class="hero" aria-labelledby="hero-title">
       <div class="hero-copy">
-        <p class="eyebrow"><span class="status-dot"></span> THE PERMISSION-AWARE GIT FORGE</p>
-        <h1 id="hero-title">Your code.<br>Your people.<br><em>Your boundaries.</em></h1>
-        <p class="hero-description">A shared repository doesn’t have to mean shared access to everything. Give every collaborator the right view of your code.</p>
-        <div class="hero-actions"><a class="primary-link" href="#login">Enter your workspace <span aria-hidden="true">↗</span></a><a class="text-link" href="#how-it-works">Explore Bastion <span aria-hidden="true">↓</span></a></div>
-        <p class="hero-note"><span aria-hidden="true">⌘</span> Same Git. More intentional access.</p>
+        <p class="eyebrow"><span class="status-dot"></span> PERMISSION-AWARE GIT HOSTING</p>
+        <h1 id="hero-title">Ship together.<br><em>Share precisely.</em></h1>
+        <p class="hero-description">Bastion gives every collaborator a real Git repository containing exactly the paths they are allowed to use. No custom client. No accidental over-sharing.</p>
+        <div class="hero-actions">
+          <a class="primary-link" href="#login">Open your workspace <span aria-hidden="true">→</span></a>
+          <a class="text-link" href="#principles">See how it works <span aria-hidden="true">↓</span></a>
+        </div>
+        <div class="trust-line"><span>Works with standard Git</span><span>Path-level access</span><span>Auditable policy</span></div>
       </div>
-      <div class="repository-illustration" role="img" aria-label="Example: a shared repository gives engineering access to src and shared, while design sees design and shared. Each team gets its own repository view.">
-        <div class="diagram-caption"><span>ONE REPOSITORY. PURPOSEFUL VIEWS.</span><span>01 / 03</span></div>
-        <div class="repo-window">
-          <div class="repo-window-header"><span class="repo-symbol">▱</span><strong>acme / platform</strong><span class="branch-tag">⑂ main</span></div>
-          <div class="repo-row"><span>▱ <b>src</b></span><span class="path-tag">engineering</span></div>
-          <div class="repo-row"><span>▱ <b>design</b></span><span class="path-tag purple">design</span></div>
-          <div class="repo-row"><span>▱ <b>shared</b></span><span class="path-tag neutral">everyone</span></div>
-          <div class="repo-row"><span>▱ <b>internal</b></span><span class="private-tag">private <span aria-hidden="true">⊘</span></span></div>
+
+      <div id="product" class="repository-preview" aria-label="A repository shown through a permission-aware view">
+        <div class="preview-topline"><span class="window-dots" aria-hidden="true"><i></i><i></i><i></i></span><span>acme / platform</span><span class="preview-private">Scoped view</span></div>
+        <div class="preview-meta">
+          <div><span class="preview-icon" aria-hidden="true">B</span><strong>platform</strong><small>Engineering view</small></div>
+          <span class="branch-chip">main</span>
         </div>
-        <div class="projection-line"><span>PATH-LEVEL PERMISSIONS</span></div>
-        <div class="view-cards">
-          <div class="view-card"><span class="view-icon">⌘</span><strong>Engineering view</strong><code>src/ &nbsp; shared/</code><span class="view-footer"><i></i> Ready to clone <span>↗</span></span></div>
-          <div class="view-card design-view"><span class="view-icon">✳</span><strong>Design view</strong><code>design/ &nbsp; shared/</code><span class="view-footer"><i></i> Ready to clone <span>↗</span></span></div>
+        <div class="preview-row"><span class="file-glyph folder-glyph" aria-hidden="true"></span><strong>src</strong><span>Visible</span></div>
+        <div class="preview-row"><span class="file-glyph folder-glyph" aria-hidden="true"></span><strong>shared</strong><span>Visible</span></div>
+        <div class="preview-row muted-row"><span class="file-glyph lock-glyph" aria-hidden="true"></span><strong>finance</strong><span>Not in this view</span></div>
+        <div class="preview-readme">
+          <span>README.md</span>
+          <h2>Build the platform</h2>
+          <p>This view contains the services and shared packages your team needs.</p>
         </div>
-        <p class="diagram-note">Only the code they need. In the Git they already know.</p>
+        <div class="preview-stamp"><span class="status-dot"></span> Projection ready to clone</div>
       </div>
     </section>
-    <section id="how-it-works" class="features" aria-label="How Bastion works">
-      <article><span class="feature-number">01 / DEFINE</span><h2>Draw the right boundaries.</h2><p>Grant access by file or folder. Shape permissions around the way your people actually work.</p></article>
-      <article><span class="feature-number">02 / COLLABORATE</span><h2>One repo. Individual views.</h2><p>Collaborators fetch a projected repository containing only the code their permissions let them see.</p></article>
-      <article><span class="feature-number">03 / BUILD</span><h2>Keep your Git workflow.</h2><p>Clone, commit, and push with your existing Git client. Familiar tools, thoughtfully scoped access.</p></article>
+
+    <section id="principles" class="principles" aria-label="How Bastion works">
+      <div class="section-heading"><p class="eyebrow">ONE REPOSITORY, PURPOSEFUL VIEWS</p><h2>Security that follows the shape of the work.</h2></div>
+      <div class="principle-grid">
+        <article><span>01</span><h3>Define the boundary</h3><p>Grant read and write capabilities to exact files or directories. Explicit restrictions win where precision matters.</p></article>
+        <article><span>02</span><h3>Project the repository</h3><p>Each person receives a normal Git view with inaccessible paths removed from the tree and visible history.</p></article>
+        <article><span>03</span><h3>Keep the workflow</h3><p>Clone, branch, commit, and push with the tools your team already uses. Bastion enforces policy at the boundary.</p></article>
+      </div>
     </section>
-    <div class="workspace-intro"><p class="eyebrow">A PLACE TO BUILD TOGETHER</p><h2>Your workspace awaits.</h2><p>Sign in to explore your repository, inspect permissions,<br>and pick up where you left off.</p><span class="intro-decoration" aria-hidden="true">b.</span></div>
+
+    <section class="landing-cta">
+      <div><p class="eyebrow">YOUR CODE, ON YOUR TERMS</p><h2>See the repository<br>you are meant to see.</h2></div>
+      <p>Sign in to browse your projected code, read documentation, inspect history, and clone a permission-bounded repository.</p>
+    </section>
   </div>
-  <section id="login" class="card">
-    <p class="eyebrow">WELCOME BACK</p>
-    <h2>Sign in to Bastion</h2>
-    <p class="hint">Your code is right where you left it.</p>
-    <div id="clerk-auth" hidden>
-      <div id="clerk-sign-in"></div>
-      <form id="clerk-view-form" hidden>
-        <label for="clerk-view">Choose a repository view</label>
-        <select id="clerk-view" name="view"></select>
-        <button type="submit" class="account-submit">Open workspace <span aria-hidden="true">↗</span></button>
-      </form>
+
+  <section id="login" class="login-shell">
+    <div class="login-aside">
+      <span class="login-index">ACCESS / 01</span>
+      <h2>Welcome back.</h2>
+      <p>Your repository view is assembled from the permissions active for your account.</p>
+      <div class="login-proof"><span class="status-dot"></span><span>Credentials remain in page memory only</span></div>
     </div>
-    <details>
-      <summary>Use a Git or API access token</summary>
-      <form id="login-form" autocomplete="off">
-      <label for="token">Access token</label>
-      <input id="token" name="token" type="password" autocomplete="off"
-             spellcheck="false" required>
-      <button type="submit">Sign in</button>
-      </form>
-    </details>
-    <p id="login-error" class="error" role="alert" hidden></p>
-    <p id="session-note" class="session-note">Account authentication is managed by Clerk.</p>
+    <div class="login-card">
+      <p class="eyebrow">SIGN IN TO BASTION</p>
+      <div id="clerk-auth" hidden>
+        <div id="clerk-sign-in"></div>
+        <form id="clerk-view-form" hidden>
+          <label for="clerk-view">Repository view</label>
+          <select id="clerk-view" name="view"></select>
+          <button type="submit" class="primary-button">Open repository <span aria-hidden="true">→</span></button>
+        </form>
+      </div>
+      <details>
+        <summary>Use a Git or API access token</summary>
+        <form id="login-form" autocomplete="off">
+          <label for="token">Access token</label>
+          <input id="token" name="token" type="password" autocomplete="off" spellcheck="false" required placeholder="bst1…">
+          <button type="submit" class="primary-button">Open repository <span aria-hidden="true">→</span></button>
+        </form>
+      </details>
+      <p id="login-error" class="error" role="alert" hidden></p>
+      <p id="session-note" class="session-note">Account authentication is managed by Clerk.</p>
+    </div>
   </section>
+
   <section id="workspace" hidden>
-    <nav class="tabs" role="tablist">
-      <button type="button" class="tab" id="tab-summary" role="tab" aria-selected="true">Summary</button>
-      <button type="button" class="tab" id="tab-decision" role="tab" aria-selected="false">Decision inspector</button>
-      <button type="button" class="tab" id="tab-tree" role="tab" aria-selected="false">Tree</button>
-      <button type="button" class="tab" id="tab-history" role="tab" aria-selected="false">History</button>
-      <button type="button" class="tab" id="tab-permissions" role="tab" aria-selected="false" hidden>Permissions</button>
-      <button type="button" class="tab" id="tab-clone" role="tab" aria-selected="false">Clone</button>
-    </nav>
-    <section id="panel-summary" class="card panel" role="tabpanel" aria-labelledby="tab-summary"></section>
-    <section id="panel-decision" class="card panel" role="tabpanel" aria-labelledby="tab-decision" hidden></section>
-    <section id="panel-tree" class="card panel" role="tabpanel" aria-labelledby="tab-tree" hidden></section>
-    <section id="panel-history" class="card panel" role="tabpanel" aria-labelledby="tab-history" hidden></section>
-    <section id="panel-permissions" class="card panel" role="tabpanel" aria-labelledby="tab-permissions" hidden></section>
-    <section id="panel-clone" class="card panel" role="tabpanel" aria-labelledby="tab-clone" hidden></section>
+    <header class="repo-header">
+      <div class="repo-title-row">
+        <div class="repo-avatar" aria-hidden="true">B</div>
+        <div>
+          <p class="repo-path"><span id="repo-owner">workspace</span> / <strong id="repo-name">repository</strong></p>
+          <p class="repo-description">Your permission-bounded repository view</p>
+        </div>
+        <span class="visibility-badge"><span class="status-dot"></span> Protected view</span>
+        <button id="clone-action" class="clone-button" type="button">Clone <span aria-hidden="true">⌄</span></button>
+      </div>
+      <nav class="repo-tabs" aria-label="Repository navigation">
+        <button type="button" class="tab" id="tab-code" data-panel="code" aria-selected="true">Code</button>
+        <button type="button" class="tab" id="tab-history" data-panel="history" aria-selected="false">History</button>
+        <button type="button" class="tab" id="tab-decision" data-panel="decision" aria-selected="false">Access inspector</button>
+        <button type="button" class="tab" id="tab-permissions" data-panel="permissions" aria-selected="false" hidden>People &amp; permissions</button>
+        <button type="button" class="tab" id="tab-profile" data-panel="profile" aria-selected="false">Profile</button>
+      </nav>
+    </header>
+
+    <section id="panel-code" class="workspace-panel" role="tabpanel" aria-labelledby="tab-code">
+      <div class="code-toolbar">
+        <span id="branch-name" class="branch-button">main</span>
+        <span id="projection-status" class="projection-status"><span class="status-dot"></span> Permission projection active</span>
+        <span id="tip-label" class="tip-label"></span>
+        <button id="tree-mode" type="button" aria-pressed="true">Browse one folder</button>
+        <button id="refresh-repo" type="button">Refresh view</button>
+      </div>
+      <div id="file-viewer" class="file-viewer" hidden></div>
+      <div class="file-browser">
+        <div class="browser-head">
+          <nav id="repo-breadcrumb" class="repo-breadcrumb" aria-label="Repository path"></nav>
+          <span id="entry-count"></span>
+        </div>
+        <div id="tree-list" class="tree-list" aria-live="polite"></div>
+        <button id="tree-more" class="load-more" type="button" hidden>Load more files</button>
+      </div>
+      <article id="readme-panel" class="readme-panel" hidden>
+        <header><span class="document-icon" aria-hidden="true"></span><strong id="readme-name">README.md</strong></header>
+        <div id="readme-content" class="readme-content"></div>
+      </article>
+    </section>
+
+    <section id="panel-history" class="workspace-panel" role="tabpanel" aria-labelledby="tab-history" hidden></section>
+    <section id="panel-decision" class="workspace-panel narrow-panel" role="tabpanel" aria-labelledby="tab-decision" hidden></section>
+    <section id="panel-permissions" class="workspace-panel narrow-panel" role="tabpanel" aria-labelledby="tab-permissions" hidden></section>
+    <section id="panel-profile" class="workspace-panel" role="tabpanel" aria-labelledby="tab-profile" hidden></section>
   </section>
 </main>
-<footer class="site-footer"><span class="footer-brand">bastion.</span><span>Built for shared work. Designed for boundaries.</span><span class="prototype-label"><span class="status-dot"></span> Experimental prototype</span></footer>
+
+<dialog id="clone-dialog" class="clone-dialog">
+  <div class="dialog-title"><div><p class="eyebrow">GET THE CODE</p><h2>Clone this view</h2></div><button id="clone-close" class="icon-button" type="button" aria-label="Close">×</button></div>
+  <p class="hint">This URL serves only the repository projection assigned to your identity.</p>
+  <label for="clone-url">Clone URL</label>
+  <div class="copy-field"><code id="clone-url"></code><button id="copy-clone" type="button">Copy</button></div>
+  <div class="clone-note"><strong>Authentication required</strong><p>When Git prompts for a password, use a Bastion token with fetch access. Keep <code>credential.useHttpPath</code> enabled when using multiple views on the same host.</p></div>
+</dialog>
+
+<footer class="site-footer"><a class="footer-brand" href="/">bastion</a><span>Purpose-built access for shared code.</span><span class="prototype-label"><span class="status-dot"></span> Experimental prototype</span></footer>
 <script src="/assets/app.js"></script>
 </body>
 </html>

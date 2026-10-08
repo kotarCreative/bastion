@@ -32,6 +32,7 @@ MAX_JSON_BODY_BYTES = 16 * 1024
 MAX_B64_FIELD_BYTES = 8192
 MAX_PATH_BYTES = 4096
 MAX_CURSOR_BYTES = 512
+MAX_BLOB_PREVIEW_BYTES = 1024 * 1024
 CURSOR_TTL_SECONDS = 3600
 
 ERROR_AUTH = "auth-required"
@@ -273,6 +274,27 @@ def batched_blob_sizes(repo_path: Path, oids: list[str]) -> dict[str, int]:
             except ValueError as error:
                 raise ForgeError("blob size could not be read") from error
     return sizes
+
+
+def read_blob(repo_path: Path, normalized: str) -> tuple[str, bytes]:
+    """Read one bounded blob from HEAD without accepting a Git revision."""
+    path = os.fsencode(normalized)
+    raw = git_command(repo_path, "ls-tree", "-z", "HEAD", "--", path).stdout
+    records = [record for record in raw.split(b"\0") if record]
+    if len(records) != 1:
+        raise ForgeError("no such path")
+    metadata, separator, returned_path = records[0].partition(b"\t")
+    fields = metadata.split(b" ")
+    if not separator or returned_path != path or len(fields) != 3 or fields[1] != b"blob":
+        raise ForgeError("no such path")
+    oid = fields[2].decode("ascii")
+    size = blob_size(repo_path, oid)
+    if size > MAX_BLOB_PREVIEW_BYTES:
+        raise ForgeError("blob is too large")
+    content = git_command(repo_path, "cat-file", "blob", oid).stdout
+    if len(content) != size:
+        raise ForgeError("blob size changed while reading")
+    return oid, content
 
 
 def _subtree_has_visible_leaf_streamed(

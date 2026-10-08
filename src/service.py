@@ -379,6 +379,85 @@ def add_view(
     ensure_intake_materialized(root, materialized, manifest)
 
 
+def invite_collaborator(
+    root: Path, actor_view_id: str, principal_id: str, email: str,
+    readable_paths: list[str], access: str,
+) -> None:
+    """Invite a scoped user, fenced by the owner's WAL policy."""
+    if access not in {"read-only", "contributor"}:
+        raise ForgeError("invalid collaborator access")
+    identity.validate_identifier(principal_id)
+    validate_view_name(principal_id)
+    emails = identity.normalize_emails([email])
+    if not isinstance(readable_paths, list) or not readable_paths or len(readable_paths) > 100:
+        raise ForgeError("choose between one and 100 readable paths")
+    if not all(isinstance(path, str) for path in readable_paths):
+        raise ForgeError("readable paths must be strings")
+    paths = sorted(set(normalize_prefix(path) for path in readable_paths))
+    if any("\x00" in path or len(os.fsencode(path)) > 4096 for path in paths):
+        raise ForgeError("invalid readable path")
+    repository = Repository.open(root)
+    with locked(root) as state:
+        manifest, _version, replay = repository.load()
+        actor = replay.active_views.get(actor_view_id)
+        if actor is None:
+            raise ForgeError("unknown owner view", "policy")
+        descriptor = repository._descriptor(actor["descriptor_id"])
+        if not capability_allowed(descriptor["capabilities"]["admin"], descriptor["restrictions"]["admin"], b""):
+            raise ForgeError("repository owner permission is required", "policy")
+        if principal_id in state["principals"] or principal_id in replay.active_views:
+            raise ForgeError("collaborator identifier already exists", "conflict")
+        if any(set(emails).intersection(item.get("emails", [])) for item in state["principals"].values()):
+            raise ForgeError("email already invited", "conflict")
+        canonical = ensure_canonical_materialized(root, manifest, repository)
+        for path in paths:
+            if path and git(canonical, "cat-file", "-e", f"{manifest.canonical_tip}:{path}", check=False).returncode:
+                raise ForgeError("readable path does not exist")
+        role_id = "invite-" + uuid.uuid4().hex
+        old = copy.deepcopy(state)
+        identity.add_principal(state, principal_id, emails)
+        allow = identity.empty_capability_map()
+        allow["read"] = paths
+        if access == "contributor":
+            for capability in ("create", "modify", "delete", "mode", "symlink"):
+                allow[capability] = paths
+        identity.add_role(state, role_id, allow, identity.empty_capability_map())
+        identity.bind_role(state, role_id, "principal", principal_id)
+        fresh = identity.effective_descriptor(state, principal_id, actor["projected_ref"])
+        save_state(root, state)
+
+        def build(current_manifest, current_replay):
+            current_actor = current_replay.active_views.get(actor_view_id)
+            if current_actor != actor:
+                raise ForgeError("repository ownership changed during invitation", "policy")
+            if current_manifest.canonical_tip != manifest.canonical_tip:
+                raise ForgeError("repository changed during invitation", "conflict")
+            if principal_id in current_replay.active_views:
+                raise ForgeError("collaborator view already exists", "conflict")
+            payload = {
+                "view_id": principal_id, "principal_id": principal_id,
+                "projected_ref": actor["projected_ref"], "descriptor_id": fresh["id"],
+                "descriptor_generation": 1, "projection_epoch": 1,
+                "canonical_frontier": current_manifest.canonical_tip,
+            }
+            return Candidate(record_fingerprint(repository.repository_id, "view_create", payload), payload)
+
+        try:
+            repository.put_descriptor(fresh)
+            repository.publish(build)
+        except ForgeError as error:
+            if error.category in {"policy", "conflict"}:
+                save_state(root, old)
+            raise
+        manifest, _version, replay = repository.load()
+        from state import recover
+
+        recover(root, state, pinned=(manifest, _version, replay), repository=repository)
+        save_state(root, state)
+        audit_event(root, "collaborator.invite", actor["principal_id"], principal_id)
+    ensure_view_materialized(root, principal_id, manifest, replay, repository)
+
+
 def sync_view(root: Path, name: str) -> None:
     # Explicit sync performs full validation rather than the request fast path.
     state = load_state(root)

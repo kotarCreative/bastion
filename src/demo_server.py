@@ -616,6 +616,54 @@ def create_app(root: Path) -> Flask:
         response.headers["Cache-Control"] = "no-store"
         return response
 
+    @app.route("/api/v1/blob", methods=["GET"])
+    def api_blob():
+        import api_v1 as _api
+
+        _record, view = _api_auth()
+        if len(request.query_string) > _api.MAX_QUERY_BYTES:
+            return jsonify({"error": "bad-request"}), 400
+        raw_b64 = request.args.get("path_b64", "")
+        try:
+            raw_path = _api.b64decode_field(raw_b64)
+            normalized = _api.normalize_api_path(raw_path)
+            if not normalized:
+                raise ForgeError("a file path is required")
+            _view_state, descriptor, repo_path, tip = _resolve_api_view(view)
+            if not capability_allowed(
+                descriptor["capabilities"]["read"],
+                descriptor["restrictions"]["read"],
+                os.fsencode(normalized),
+            ):
+                raise ForgeError("no such path")
+            _oid, content = _api.read_blob(repo_path, normalized)
+        except ForgeError:
+            response = make_response(jsonify({"error": "not-found"}), 404)
+            response.headers["Cache-Control"] = "no-store"
+            return response
+        binary = b"\x00" in content
+        text = None
+        if not binary:
+            try:
+                text = content.decode("utf-8")
+            except UnicodeDecodeError:
+                binary = True
+        response = make_response(
+            jsonify(
+                {
+                    "projected_tip": tip,
+                    "path_b64": _api.b64encode_raw(os.fsencode(normalized)),
+                    "path_display": _api.display(os.fsencode(normalized)),
+                    "size": len(content),
+                    "binary": binary,
+                    "text": text,
+                }
+            ),
+            200,
+        )
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
     @app.route("/api/v1/decisions", methods=["POST"])
     def api_decisions():
         import api_v1 as _api
@@ -687,6 +735,38 @@ def create_app(root: Path) -> Flask:
             abort(response)
         return view_state, descriptor
 
+    @app.route("/api/v1/invitations", methods=["POST"])
+    def api_invite_collaborator():
+        import api_v1 as _api
+        from service import invite_collaborator
+
+        _record, view = _api_auth()
+        _require_repository_owner(view)
+        raw = request.get_data(cache=False)
+        if len(raw) > _api.MAX_JSON_BODY_BYTES:
+            return jsonify({"error": "bad-request"}), 400
+        try:
+            payload = json.loads(raw)
+        except (ValueError, UnicodeDecodeError):
+            return jsonify({"error": "bad-request"}), 400
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"principal_id", "email", "readable_paths", "access"}
+            or not isinstance(payload.get("principal_id"), str)
+            or not isinstance(payload.get("email"), str)
+            or not isinstance(payload.get("readable_paths"), list)
+            or not isinstance(payload.get("access"), str)
+        ):
+            return jsonify({"error": "bad-request"}), 400
+        try:
+            invite_collaborator(_forge_root(app), view, **payload)
+        except ForgeError as error:
+            if error.category in {"storage", "integrity"}:
+                return jsonify({"error": "service-unavailable"}), 503
+            status = 409 if error.category == "conflict" else 400
+            return jsonify({"error": "invitation-conflict" if status == 409 else "bad-request"}), status
+        return jsonify({"view_id": payload["principal_id"], "access": payload["access"]}), 201
+
     @app.route("/api/v1/permissions", methods=["GET"])
     def api_permissions():
         import api_v1 as _api
@@ -698,16 +778,20 @@ def create_app(root: Path) -> Flask:
         try:
             _manifest, _version, replay = Repository.open(_forge_root(app)).load()
             state = load_state_sections(
-                _forge_root(app), ["roles", "role_bindings"]
+                _forge_root(app), ["roles", "role_bindings", "principals"]
             )
             targets = []
             for view_id, active in sorted(replay.active_views.items()):
                 if active["principal_id"] == actor["principal_id"]:
                     continue
+                target_descriptor = Repository.open(_forge_root(app))._descriptor(active["descriptor_id"])
                 targets.append(
                     {
                         "view_id": view_id,
                         "principal_id": active["principal_id"],
+                        "emails": state["principals"].get(active["principal_id"], {}).get("emails", []),
+                        "readable_paths": _api.capability_map_object(target_descriptor["capabilities"])["read"],
+                        "can_modify": bool(target_descriptor["capabilities"]["modify"]),
                         "private_paths": [
                             _api.prefix_object(path)
                             for path in managed_private_paths(

@@ -271,18 +271,19 @@ def effective_grants(
         effective_deny[capability] = normalize_prefixes(deny_union[capability])
     # A user-facing "private folder" must remain private even when another
     # role contains a narrower allow below it. Capabilities-v3 normally lets
-    # narrower grants override an ancestor deny, so mirror every nested read
+    # narrower grants override an ancestor deny, so mirror every nested file
     # grant as an equal-specificity deny. Equal specificity is denied.
     if managed_private:
-        absolute_denies = set(effective_deny["read"])
-        for private_path in normalize_prefixes(managed_private):
-            absolute_denies.add(private_path)
-            absolute_denies.update(
-                allow_path
-                for allow_path in effective_allow["read"]
-                if prefix_covers(private_path, allow_path)
-            )
-        effective_deny["read"] = normalize_prefixes(list(absolute_denies))
+        for capability in ("read", "create", "modify", "delete", "mode", "symlink"):
+            absolute_denies = set(effective_deny[capability])
+            for private_path in normalize_prefixes(managed_private):
+                absolute_denies.add(private_path)
+                absolute_denies.update(
+                    allow_path
+                    for allow_path in effective_allow[capability]
+                    if prefix_covers(private_path, allow_path)
+                )
+            effective_deny[capability] = normalize_prefixes(list(absolute_denies))
     return effective_allow, effective_deny
 
 
