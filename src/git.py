@@ -35,10 +35,18 @@ def run(
             timeout=timeout,
         )
     except subprocess.TimeoutExpired as error:
-        raise ForgeError(f"{' '.join(os.fsdecode(arg) for arg in args)}: timed out", "limits") from error
+        # The message is the full argv, which carries absolute server paths.
+        raise ForgeError(
+            f"{' '.join(os.fsdecode(arg) for arg in args)}: timed out",
+            "limits",
+            operator_detail=True,
+        ) from error
     if check and process.returncode:
         detail = process.stderr.decode(errors="replace").strip()
-        raise ForgeError(f"{' '.join(os.fsdecode(arg) for arg in args)}: {detail}")
+        raise ForgeError(
+            f"{' '.join(os.fsdecode(arg) for arg in args)}: {detail}",
+            operator_detail=True,
+        )
     return process
 
 

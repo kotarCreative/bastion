@@ -203,7 +203,7 @@ def init_forge(
             if probe.returncode or probe.stdout.decode().strip() != "true":
                 shutil.rmtree(bootstrap, ignore_errors=True)
         if not bootstrap.exists():
-            run("git", "clone", "--bare", "--no-local", str(source), str(bootstrap))
+            run("git", "clone", "--bare", "--no-local", str(source), str(bootstrap), env=clean_env())
         if output(bootstrap, "rev-parse", "--show-object-format") != "sha1":
             raise ForgeError("this experiment currently supports SHA-1 repositories only")
         canonical_tip = ref(bootstrap, canonical_ref)
@@ -244,7 +244,7 @@ def init_forge(
     ensure_canonical_materialized(root, manifest, repository)
     staging = root / "admin-staging.git"
     if not staging.is_dir():
-        run("git", "init", "--bare", "-q", "-b", branch, str(staging))
+        run("git", "init", "--bare", "-q", "-b", branch, str(staging), env=clean_env())
     shutil.rmtree(bootstrap, ignore_errors=True)
     state = load_state(root)
     if state.get("repository_id") != repository_id:
@@ -410,6 +410,7 @@ def invite_collaborator(
         descriptor = repository._descriptor(actor["descriptor_id"])
         if not capability_allowed(descriptor["capabilities"]["admin"], descriptor["restrictions"]["admin"], b""):
             raise ForgeError("repository owner permission is required", "policy")
+        require_delegable_coverage(descriptor, paths, access)
         if principal_id in state["principals"] or principal_id in replay.active_views:
             raise ForgeError("collaborator identifier already exists", "conflict")
         if clerk_user_id and any(
@@ -457,7 +458,11 @@ def invite_collaborator(
             repository.put_descriptor(fresh)
             repository.publish(build)
         except ForgeError as error:
-            if error.category in {"policy", "conflict"}:
+            # Same pre-publication rollback policy as `set_path_privacy`: every
+            # refusal raised before the manifest CAS is definitive, so the
+            # half-applied catalog must not survive. Only an ambiguous
+            # `storage` fault retains the desired catalog.
+            if error.category in {"policy", "conflict", "limits"}:
                 save_state(root, old)
             raise
         manifest, _version, replay = repository.load()
@@ -514,6 +519,43 @@ def _commit_parent(canonical: Path, oid: str) -> str:
 
     parents = output(canonical, "show", "-s", "--format=%P", oid).split()
     return parents[0] if parents else ZERO_OID
+
+
+DELEGATED_CAPABILITIES = {
+    "read-only": ("read",),
+    "contributor": ("read", "create", "modify", "delete", "mode", "symlink"),
+}
+
+
+def require_delegable_coverage(descriptor: dict, paths: list[str], access: str) -> None:
+    """Forbid delegating visibility the granter does not itself hold.
+
+    Root ``admin`` at ``b""`` is the repository-owner proof and authorizes the
+    *act* of inviting a collaborator, including assigning the documented
+    Contributor level. It is not, however, a licence to disclose repository
+    content the owner cannot see: an owner restricted to a subtree must not
+    mint a collaborator whose view reaches outside it, because that leaks both
+    hidden paths and their contents.
+
+    Write delegation stays under owner authority, matching the documented
+    owner workflow in which a read-only owner assigns a Contributor.
+    """
+    read_allow = descriptor["capabilities"]["read"]
+    read_restrictions = descriptor["restrictions"]["read"]
+    for path in paths:
+        prefix = os.fsencode(path)
+        # An invitation grants the whole subtree, not just its directory
+        # boundary. Checking only that boundary would let an administrator
+        # bypass a nested private path by inviting someone to its parent.
+        denied_descendant = any(
+            (not prefix or os.fsencode(restriction).startswith(prefix + b"/"))
+            and not capability_allowed(read_allow, read_restrictions, os.fsencode(restriction))
+            for restriction in read_restrictions
+        )
+        if not capability_allowed(read_allow, read_restrictions, prefix) or denied_descendant:
+            raise ForgeError(
+                "cannot grant visibility you do not hold yourself", "policy"
+            )
 
 
 def require_admin_coverage(
@@ -760,20 +802,33 @@ def set_path_privacy(
         ):
             raise ForgeError("repository owner permission is required", "policy")
 
+        principal_id = target["principal_id"]
+        # Browser identities attach only to user principals, so the browser
+        # editor must not attach a UI-managed privacy role to a service
+        # account view.
+        if state["principals"].get(principal_id, {}).get("kind") != "user":
+            raise ForgeError(
+                "only user principals have browser-managed privacy", "policy"
+            )
+
         canonical = ensure_canonical_materialized(root, manifest, repository)
         treeish = f"{manifest.canonical_tip}:{normalized}"
         if git(canonical, "cat-file", "-e", treeish, check=False).returncode:
             raise ForgeError("repository path does not exist")
 
-        principal_id = target["principal_id"]
         paths = set(managed_private_paths(state, principal_id))
         if private:
             paths.add(normalized)
         else:
             paths.discard(normalized)
         desired_paths = sorted(paths)
-        if desired_paths == managed_private_paths(state, principal_id):
-            return desired_paths
+        # Do not short-circuit when the catalog already matches the request.
+        # The catalog can diverge from the committed WAL (see the rollback
+        # policy below), and a catalog-only comparison would answer "already
+        # applied" for an edit that never reached any active view. Idempotency
+        # is resolved against committed truth by `build` below, which compares
+        # the freshly resolved descriptor against each active view's bound
+        # descriptor and returns AlreadyCommitted only when they truly match.
 
         old_roles = copy.deepcopy(state["roles"])
         old_bindings = copy.deepcopy(state["role_bindings"])
@@ -829,10 +884,14 @@ def set_path_privacy(
             repository.put_descriptor(fresh)
             repository.publish(build)
         except ForgeError as error:
-            # Only definitive pre-publication policy/conflict failures are
-            # safe to roll back. A storage error can have an ambiguous commit
-            # outcome, in which case retaining the desired catalog is safer.
-            if error.category in {"policy", "conflict"}:
+            # Roll back every failure raised before the manifest CAS
+            # linearization point. `limits` covers admission and budget
+            # refusals (WAL sequence exhaustion, git subprocess timeouts),
+            # which are raised before anything is uploaded or committed, so
+            # discarding the catalog edit is definitive rather than ambiguous.
+            # Only `storage` is retained: a storage fault can have an ambiguous
+            # commit outcome, where keeping the desired catalog is safer.
+            if error.category in {"policy", "conflict", "limits"}:
                 state["roles"] = old_roles
                 state["role_bindings"] = old_bindings
                 if fresh["id"] not in old_descriptor_ids:

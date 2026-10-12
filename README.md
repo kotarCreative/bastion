@@ -45,6 +45,90 @@ short-lived view-scoped API tokens.
 - [Alchemy deployment evaluation](docs/ALCHEMY_EVALUATION.md)
 - [Roadmap](ROADMAP.md)
 
+## Local multi-repository hosting
+
+The explicit local host commands provide operator-managed account approval and
+independent per-repository forge roots. `serve-host` adds account sign-in,
+repository discovery, browser creation/switching, scoped permissions and
+credentials, and namespaced HTTPS Git routing. This is a persistent-local-storage
+prototype, not a production multi-tenant deployment.
+The host catalog must live on persistent local storage; remote database and
+object-store configuration is rejected. `list-repos` is operator inventory and
+may include reserved, provisioning, or failed operations; it is not an
+authorization-filtered account discovery API.
+
+```sh
+python forge.py approve-host-account ./bastion-host alice --email alice@example.com
+# Optional capacity; omitted means no configured account limit.
+python forge.py approve-host-account ./bastion-host bob --email bob@example.com --repo-limit 20
+python forge.py link-host-account ./bastion-host user_123 --email alice@example.com
+python forge.py create-repo ./bastion-host alice demo --request-id demo-001 --seed-empty
+python forge.py create-repo ./bastion-host alice imported --request-id import-001 \
+  --source /path/to/local/git/repository --branch main
+python forge.py list-repos ./bastion-host --owner alice
+```
+
+Repository names and owners are lowercase URL slugs. Request IDs are
+idempotency keys; reuse with different inputs is rejected. A seeded-empty
+repository contains a deterministic initial commit: clone its owner view and
+make commits on top of that history. Pushing unrelated local history is not
+supported. Imports pin the selected local source branch tip; a changed source
+requires a new request. Owner view `owner` has all currently supported
+capabilities and the account's approved email identities. Existing direct-root
+commands and `serve-demo <root>` are unchanged.
+
+### Serve multiple users and repositories
+
+Approve accounts first, configure the Clerk environment described below, and
+serve the explicit host root:
+
+```sh
+# Configure before initializing/migrating the catalog; reservations count.
+export BASTION_HOST_REPO_LIMIT=1000
+python forge.py approve-host-account ./bastion-host alice --email alice@example.com
+python forge.py approve-host-account ./bastion-host bob --email bob@example.com
+python forge.py serve-host ./bastion-host --host 127.0.0.1 --port 8000
+```
+
+`serve-host` refuses an unknown root or an existing single-repository forge. It
+migrates an existing supported host catalog without replacing repository roots.
+Use one server process: request, Git, receive, and provisioning admission are
+shared across its repositories, not across multiple server processes. The default
+total repository budget is 1000, persisted in the host catalog; setting
+`BASTION_HOST_REPO_LIMIT` when initializing/migrating explicitly updates it.
+Failed/reserved operations count against both host and configured account limits.
+`BASTION_MAX_ACTIVE_PROVISIONS` defaults to 2. Existing `BASTION_MAX_ACTIVE_*`
+transport limits still apply across the host's child apps.
+
+An approved account can sign in with no repositories, create its first one, and
+switch between owned/shared repositories. Browser creation is **seeded-empty
+only**: clone, commit, then push. Existing history still uses the operator's
+`create-repo --source` command, not a web upload or an unrelated first push.
+
+Permissions and Credentials operate on the selected repository only. Invitations
+target already approved host accounts, selected from Clerk or by verified email;
+they do not approve new accounts or send email. An interrupted discovery update
+is reconciled against committed repository access, never treated as a new grant.
+An invitation cannot delegate a folder containing a path the administrator is
+not allowed to read. A disabled membership is not reactivated by retrying an old
+invitation. Membership disabling alone does **not** revoke existing repository
+credentials; revoke tokens and fence repository policy separately.
+
+Git URLs are `/<owner>/<repository>.git`; the Basic username remains your
+repository **view ID**, not necessarily the URL's owner. Use the clone URL shown
+in the app, enable `git config --global credential.useHttpPath true`, and create
+a fetch/push token in that repository's Credentials tab. Profile/clone guidance
+lists the allowed commit author emails. Host sessions and browser UI sessions
+cannot substitute for Git credentials, and a token from one repository cannot
+authorize another.
+
+Without Clerk configured, the server supports operator-issued host sessions for
+local testing, but does not provide an open signup/login bypass. Do not expose
+the development HTTP server publicly without a TLS/authenticated deployment
+plan. Remote storage/catalog adapters, coordinated account deprovisioning,
+distributed admission, and consistent whole-host backup/restore remain rollout
+work; existing per-repository backup commands do not back up the host catalog.
+
 ## Quick Start
 
 Requirements:
@@ -175,7 +259,8 @@ repository access.
 After sign-in, **Account** opens Clerk's profile and security management UI.
 Bastion exchanges the Clerk session for a one-hour, `ui`-only token bound to a
 specific repository view. Git and API tokens remain separately issued,
-revocable credentials.
+revocable credentials; create them from the **Credentials** tab (or
+`forge.py add-token`).
 
 For the Cloudflare deployment, also set `BASTION_BOOTSTRAP_ADMIN_EMAIL` to the
 verified email that should claim the initial administrator. See
@@ -216,9 +301,16 @@ hide individual files or folders using the collaborator privacy controls.
 
 Invitations provision access immediately; they do not send email. Share the
 site URL with the invitee, who signs in through Clerk with the invited verified
-email. Git tokens are issued separately using the existing CLI. For a privacy
-demo, open the owner account and collaborator account in separate browser
-profiles, change the collaborator's privacy settings, and refresh their view.
+email.
+
+The **Credentials** tab lets any signed-in user mint their own Git tokens:
+choose the view, a read-only (fetch) or read-and-write (fetch, push) access
+level, and an expiry. The secret is shown once, and tokens can be revoked from
+the same tab. A push token is offered only for a view whose policy grants a
+write capability. Operators can still issue tokens with `forge.py add-token`.
+For a privacy demo, open the owner account and collaborator account in separate
+browser profiles, change the collaborator's privacy settings, and refresh their
+view.
 
 Use normal Git inside `alice`:
 

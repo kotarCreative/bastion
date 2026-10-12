@@ -9,6 +9,7 @@ the spec-013 security headers and no-store responses to every route.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
@@ -18,7 +19,7 @@ import time
 from pathlib import Path
 
 import limits
-from flask import Flask, Response, abort, jsonify, make_response, request
+from flask import Flask, Response, abort, g, jsonify, make_response, request
 from werkzeug.exceptions import RequestEntityTooLarge
 
 from errors import ForgeError
@@ -187,6 +188,7 @@ def create_app(root: Path) -> Flask:
     app.config["REQUEST_SLOTS"] = threading.BoundedSemaphore(limits.MAX_ACTIVE_REQUESTS)
     app.config["ADMISSION_LOCK"] = threading.Lock()
     app.config["ACTIVE_PER_IP"] = {}
+    app.config["ACTIVE_PER_TOKEN"] = {}
     app.config["STOPPING"] = False
     app.config["CLERK_CONFIG"] = clerk_config
     app.config["CLERK_AUTHENTICATOR"] = (
@@ -196,8 +198,8 @@ def create_app(root: Path) -> Flask:
         clerk_config.frontend_api_origin if clerk_config is not None else None
     )
 
-    def admit(address: str, receive: bool) -> int:
-        """Per-IP admission; 0 when admitted, else 429/503."""
+    def admit(address: str, receive: bool, token_id: str | None = None) -> int:
+        """Per-IP and per-token admission; 0 when admitted, else 429/503."""
         receive_acquired = False
         if receive and not app.config["RECEIVE_SLOTS"].acquire(blocking=False):
             return 503
@@ -214,6 +216,20 @@ def create_app(root: Path) -> Flask:
                     if receive_acquired:
                         app.config["RECEIVE_SLOTS"].release()
                     return 429
+                # A single credential must not escape its own budget by
+                # spreading across source addresses.
+                if token_id is not None:
+                    token_limit = (
+                        limits.MAX_RECEIVES_PER_TOKEN
+                        if receive
+                        else limits.MAX_ACTIVE_PER_TOKEN
+                    )
+                    token_active = app.config["ACTIVE_PER_TOKEN"].get(token_id, 0)
+                    if token_active >= token_limit:
+                        if receive_acquired:
+                            app.config["RECEIVE_SLOTS"].release()
+                        return 429
+                    app.config["ACTIVE_PER_TOKEN"][token_id] = token_active + 1
                 app.config["ACTIVE_PER_IP"][address] = active + 1
                 return 0
         except BaseException:
@@ -221,7 +237,7 @@ def create_app(root: Path) -> Flask:
                 app.config["RECEIVE_SLOTS"].release()
             raise
 
-    def release_admission(address: str, receive: bool) -> None:
+    def release_admission(address: str, receive: bool, token_id: str | None = None) -> None:
         if receive:
             app.config["RECEIVE_SLOTS"].release()
         with app.config["ADMISSION_LOCK"]:
@@ -230,12 +246,43 @@ def create_app(root: Path) -> Flask:
                 app.config["ACTIVE_PER_IP"][address] = remaining
             else:
                 app.config["ACTIVE_PER_IP"].pop(address, None)
+            if token_id is not None:
+                token_remaining = app.config["ACTIVE_PER_TOKEN"].get(token_id, 0) - 1
+                if token_remaining > 0:
+                    app.config["ACTIVE_PER_TOKEN"][token_id] = token_remaining
+                else:
+                    app.config["ACTIVE_PER_TOKEN"].pop(token_id, None)
 
     app.config["ADMIT"] = admit
     app.config["RELEASE_ADMISSION"] = release_admission
     # Pagination cursors are HMAC'd with an ephemeral server-side key: a
     # process restart invalidates them, and no client ever sees the key.
     app.config["CURSOR_SECRET"] = secrets.token_hex(32)
+
+    @app.before_request
+    def _bound_concurrent_requests():
+        """Cap total in-flight requests for the whole app.
+
+        The per-IP and per-credential admission counters only cover the two
+        Git RPC routes. Without this every /api/ route - including the
+        unauthenticated Clerk exchange, which makes blocking outbound calls,
+        and the tree/blob readers, which spawn Git subprocesses - would be
+        bounded only by the WSGI server's thread count.
+        """
+        if request.path in ("/healthz", "/readyz"):
+            return None
+        if not app.config["REQUEST_SLOTS"].acquire(blocking=False):
+            response = make_response(jsonify({"error": "server-saturated"}), 503)
+            response.headers["Cache-Control"] = "no-store"
+            return response
+        g._bastion_request_slot = True
+        return None
+
+    @app.teardown_request
+    def _release_request_slot(_exception):
+        if getattr(g, "_bastion_request_slot", False):
+            app.config["REQUEST_SLOTS"].release()
+            g._bastion_request_slot = False
 
     @app.after_request
     def _apply_security_headers(response):
@@ -887,8 +934,14 @@ def create_app(root: Path) -> Flask:
             paths = set_path_privacy(
                 _forge_root(app), view, payload["view_id"], normalized, payload["private"]
             )
-        except ForgeError:
-            response = make_response(jsonify({"error": "bad-request"}), 400)
+        except ForgeError as error:
+            # Budget and storage refusals are server-side, not client
+            # mistakes. Reporting them as 400 hides exactly the conditions
+            # that decide whether the catalog edit was rolled back.
+            if error.category in {"storage", "integrity", "limits"}:
+                response = make_response(jsonify({"error": "service-unavailable"}), 503)
+            else:
+                response = make_response(jsonify({"error": "bad-request"}), 400)
             response.headers["Cache-Control"] = "no-store"
             return response
         response = make_response(
@@ -903,12 +956,191 @@ def create_app(root: Path) -> Flask:
         response.headers["Cache-Control"] = "no-store"
         return response
 
+    # Git credentials: a signed-in principal mints and revokes long-lived
+    # fetch/push tokens for its *own* views. The browser `ui` session token is
+    # excluded here; these are the credentials an unmodified Git client uses.
+    GIT_CREDENTIAL_SCOPES = ("fetch", "push")
+    WRITE_CAPABILITIES = ("create", "modify", "delete", "mode", "symlink")
+    MAX_CREDENTIAL_SECONDS = 365 * 86400
+
+    def _caller_views(view: str) -> tuple[str, dict[str, dict]]:
+        """Return the caller's principal id and every active view of it."""
+        from repository import Repository
+
+        repository = Repository.open(_forge_root(app))
+        _manifest, _version, replay = repository.load()
+        active = replay.active_views.get(view)
+        if active is None:
+            abort(404)
+        principal_id = active["principal_id"]
+        views: dict[str, dict] = {}
+        for view_id, item in replay.active_views.items():
+            if item["principal_id"] != principal_id:
+                continue
+            try:
+                views[view_id] = repository._descriptor(item["descriptor_id"])
+            except ForgeError:
+                continue
+        return principal_id, views
+
+    def _can_push(descriptor: dict) -> bool:
+        return any(
+            descriptor["capabilities"].get(name) for name in WRITE_CAPABILITIES
+        )
+
+    def _git_tokens(views: dict[str, dict]) -> list[dict]:
+        from http_server import list_tokens
+
+        return [
+            token
+            for token in list_tokens(_forge_root(app))
+            if token["view_id"] in views
+            and token["scopes"]
+            and set(token["scopes"]).issubset(set(GIT_CREDENTIAL_SCOPES))
+        ]
+
+    @app.route("/api/v1/credentials", methods=["GET"])
+    def api_credentials():
+        _record, view = _api_auth()
+        try:
+            principal_id, views = _caller_views(view)
+            tokens = _git_tokens(views)
+        except ForgeError:
+            return jsonify({"error": "service-unavailable"}), 503
+        response = make_response(jsonify({
+            "principal_id": principal_id,
+            "views": [
+                {"view_id": view_id, "can_push": _can_push(descriptor)}
+                for view_id, descriptor in sorted(views.items())
+            ],
+            "tokens": [
+                {
+                    "token_id": token["token_id"],
+                    "view_id": token["view_id"],
+                    "scopes": token["scopes"],
+                    "created_at": token["created_at"],
+                    "expires_at": token["expires_at"],
+                    "revoked_at": token["revoked_at"],
+                }
+                for token in tokens
+            ],
+        }), 200)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.route("/api/v1/credentials", methods=["POST"])
+    def api_create_credential():
+        import api_v1 as _api
+        import tokens as _tokens
+        from http_server import add_token
+
+        _record, view = _api_auth()
+        try:
+            raw = request.get_data(cache=False)
+        except RequestEntityTooLarge:
+            return jsonify({"error": "bad-request"}), 400
+        if len(raw) > _api.MAX_JSON_BODY_BYTES:
+            return jsonify({"error": "bad-request"}), 400
+        try:
+            payload = json.loads(raw.decode("utf-8")) if raw else None
+        except (UnicodeDecodeError, ValueError):
+            return jsonify({"error": "bad-request"}), 400
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"view_id", "scopes", "expires_in"}
+            or not isinstance(payload.get("view_id"), str)
+            or not isinstance(payload.get("scopes"), list)
+            or not payload.get("scopes")
+            or not all(isinstance(item, str) for item in payload["scopes"])
+            or not isinstance(payload.get("expires_in"), str)
+        ):
+            return jsonify({"error": "bad-request"}), 400
+        if not set(payload["scopes"]).issubset(set(GIT_CREDENTIAL_SCOPES)):
+            return jsonify({"error": "bad-request"}), 400
+        try:
+            expires_at = _tokens.parse_expires_in(payload["expires_in"])
+        except ForgeError:
+            return jsonify({"error": "bad-request"}), 400
+        if (
+            expires_at is None
+            or expires_at - int(time.time()) > MAX_CREDENTIAL_SECONDS
+        ):
+            return jsonify({"error": "bad-request"}), 400
+        try:
+            _principal_id, views = _caller_views(view)
+        except ForgeError:
+            return jsonify({"error": "service-unavailable"}), 503
+        target = payload["view_id"]
+        if target not in views:
+            return jsonify({"error": "forbidden"}), 403
+        if "push" in payload["scopes"] and not _can_push(views[target]):
+            # A push credential for a view with no write capability would be a
+            # dead credential; refuse it rather than issue a misleading token.
+            return jsonify({"error": "forbidden"}), 403
+        try:
+            credential = add_token(
+                _forge_root(app),
+                target,
+                scopes=sorted(set(payload["scopes"])),
+                expires_in=payload["expires_in"],
+            )
+        except ForgeError as error:
+            if error.category in {"storage", "integrity"}:
+                return jsonify({"error": "service-unavailable"}), 503
+            return jsonify({"error": "bad-request"}), 400
+        response = make_response(jsonify({
+            "credential": credential,
+            "token": {
+                "view_id": target,
+                "scopes": sorted(set(payload["scopes"])),
+                "expires_at": expires_at,
+            },
+        }), 201)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.route("/api/v1/credentials/<token_id>", methods=["DELETE"])
+    def api_revoke_credential(token_id: str):
+        import tokens as _tokens
+        from http_server import revoke_token
+
+        _record, view = _api_auth()
+        if not _tokens.TOKEN_ID_RE.fullmatch(token_id):
+            return jsonify({"error": "not-found"}), 404
+        try:
+            _principal_id, views = _caller_views(view)
+            owned = {token["token_id"] for token in _git_tokens(views)}
+        except ForgeError:
+            return jsonify({"error": "service-unavailable"}), 503
+        if token_id not in owned:
+            # Unknown and other-principal token ids share one 404, so the route
+            # cannot be used to probe which token ids exist.
+            return jsonify({"error": "not-found"}), 404
+        try:
+            revoked = revoke_token(_forge_root(app), token_id)
+        except ForgeError:
+            return jsonify({"error": "service-unavailable"}), 503
+        if not revoked:
+            return jsonify({"error": "not-found"}), 404
+        response = make_response(jsonify({"revoked": True, "token_id": token_id}), 200)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
     def _asset(name: str, content_type: str) -> Response:
         target = (ASSET_DIR / name).resolve()
         if target.parent != ASSET_DIR.resolve() or not target.is_file():
             abort(404)
         body = target.read_bytes()
-        response = Response(body, 200, content_type=content_type)
+        # A content hash lets a browser revalidate cheaply and, crucially,
+        # never keep running a stale shell after a deploy. Without a
+        # validator the app would appear broken until a hard reload.
+        etag = '"' + hashlib.sha256(body).hexdigest() + '"'
+        if request.headers.get("If-None-Match") == etag:
+            response = Response(status=304)
+        else:
+            response = Response(body, 200, content_type=content_type)
+        response.headers["ETag"] = etag
+        response.headers["Cache-Control"] = "no-cache"
         return response
 
     @app.route("/", methods=["GET"])
@@ -929,29 +1161,37 @@ def create_app(root: Path) -> Flask:
         service = parse_service(request.query_string.decode())
         if service is None:
             raise DemoHttpError(404, BODY_404)
-        _authenticate_git(root, view, service)
 
         from repository import Repository as _Repository
 
-        try:
-            _repository, manifest, _active, materialized = _resolve_service(root, view)
-        except ForgeError:
-            raise DemoHttpError(404, BODY_404)
-        if service == "git-receive-pack" and (
-            manifest.head_seq >= limits.MAX_WAL_SEQUENCE
-            or limits.free_below_floor(root)
-        ):
-            raise DemoHttpError(503, b"demo-read-only")
-        repo_path = materialized.path if service == "git-upload-pack" else _git_repo(
-            root, view, service
-        )[0]
-        alternates = None if service == "git-upload-pack" else materialized.path / "objects"
-        throttled = app.config["ADMIT"](request.remote_addr or "", service == "git-receive-pack")
+        # Admission is taken before intake materialization and before any
+        # request body is buffered, so a client cannot force unbounded replay
+        # work or per-request memory ahead of the budget checks.
+        record = _authenticate_git(root, view, service)
+        receive = service == "git-receive-pack"
+        throttled = app.config["ADMIT"](
+            request.remote_addr or "", receive, record["token_id"]
+        )
         if throttled:
             raise DemoHttpError(
                 throttled, b"throttled" if throttled == 429 else b"server saturated"
             )
         try:
+            try:
+                _repository, manifest, _active, materialized = _resolve_service(root, view)
+            except ForgeError:
+                raise DemoHttpError(404, BODY_404)
+            if receive and (
+                manifest.head_seq >= limits.MAX_WAL_SEQUENCE
+                or limits.free_below_floor(root)
+            ):
+                raise DemoHttpError(503, b"demo-read-only")
+            repo_path = materialized.path if service == "git-upload-pack" else _git_repo(
+                root, view, service
+            )[0]
+            alternates = (
+                None if service == "git-upload-pack" else materialized.path / "objects"
+            )
             if not app.config["GIT_SLOTS"].acquire(blocking=False):
                 raise DemoHttpError(503, b"server saturated")
             try:
@@ -968,7 +1208,9 @@ def create_app(root: Path) -> Flask:
             finally:
                 app.config["GIT_SLOTS"].release()
         finally:
-            app.config["RELEASE_ADMISSION"](request.remote_addr or "", service == "git-receive-pack")
+            app.config["RELEASE_ADMISSION"](
+                request.remote_addr or "", receive, record["token_id"]
+            )
         if completed.returncode:
             app.logger.error("git advertisement failed")
             raise DemoHttpError(500, b"git advertisement failed")
@@ -984,41 +1226,46 @@ def create_app(root: Path) -> Flask:
         root = _forge_root(app)
         if service not in SERVICES:
             raise DemoHttpError(404, BODY_404)
-        _authenticate_git(root, view, service)
 
+        # Admission precedes materialization and body buffering so a client
+        # cannot force unbounded intake replay work or hold a large buffered
+        # body ahead of the concurrency and per-credential budgets.
+        record = _authenticate_git(root, view, service)
         receive = service == "git-receive-pack"
-        if receive and limits.free_below_floor(root):
-            raise DemoHttpError(503, b"demo-read-only")
-        repo_path, alternates = _git_repo(root, view, service)
-        protocol = request.headers.get("Git-Protocol")
-        maximum = UPLOAD_MAX_BODY if service == "git-upload-pack" else RECEIVE_MAX_BODY
-        raw = _read_bounded_body(maximum)
-        payload = decode_body(raw, request.headers.get("Content-Encoding"), maximum)
-
-        try:
-            _repository, _manifest, active, _materialized = _resolve_service(root, view)
-        except ForgeError:
-            raise DemoHttpError(404, BODY_404)
-
-        extra_env = {
-            "BASTION_VIEW": view,
-            "BASTION_TRANSPORT": "http",
-            "BASTION_REMOTE_ADDR": request.remote_addr or "",
-        }
-        if service == "git-receive-pack":
-            extra_env["BASTION_PRINCIPAL_ID"] = active["principal_id"]
-        idempotency_key = request.headers.get("Idempotency-Key")
-        if idempotency_key and service == "git-receive-pack":
-            if len(idempotency_key) > 256 or not idempotency_key.strip():
-                raise DemoHttpError(400, b"invalid Idempotency-Key")
-            extra_env["BASTION_IDEMPOTENCY_KEY"] = idempotency_key
-
-        throttled = app.config["ADMIT"](request.remote_addr or "", receive)
+        throttled = app.config["ADMIT"](
+            request.remote_addr or "", receive, record["token_id"]
+        )
         if throttled:
             raise DemoHttpError(
                 throttled, b"throttled" if throttled == 429 else b"server saturated"
             )
         try:
+            if receive and limits.free_below_floor(root):
+                raise DemoHttpError(503, b"demo-read-only")
+            repo_path, alternates = _git_repo(root, view, service)
+            protocol = request.headers.get("Git-Protocol")
+            maximum = UPLOAD_MAX_BODY if service == "git-upload-pack" else RECEIVE_MAX_BODY
+            raw = _read_bounded_body(maximum)
+            payload = decode_body(raw, request.headers.get("Content-Encoding"), maximum)
+
+            try:
+                _repository, _manifest, active, _materialized = _resolve_service(root, view)
+            except ForgeError:
+                raise DemoHttpError(404, BODY_404)
+
+            extra_env = {
+                "BASTION_VIEW": view,
+                "BASTION_TRANSPORT": "http",
+                "BASTION_REMOTE_ADDR": request.remote_addr or "",
+            }
+            if service == "git-receive-pack":
+                extra_env["BASTION_PRINCIPAL_ID"] = active["principal_id"]
+            idempotency_key = request.headers.get("Idempotency-Key")
+            if idempotency_key and service == "git-receive-pack":
+                if len(idempotency_key) > 256 or not idempotency_key.strip():
+                    raise DemoHttpError(400, b"invalid Idempotency-Key")
+                extra_env["BASTION_IDEMPOTENCY_KEY"] = idempotency_key
+
             if not app.config["GIT_SLOTS"].acquire(blocking=False):
                 raise DemoHttpError(503, b"server saturated")
             try:
@@ -1034,7 +1281,9 @@ def create_app(root: Path) -> Flask:
             finally:
                 app.config["GIT_SLOTS"].release()
         finally:
-            app.config["RELEASE_ADMISSION"](request.remote_addr or "", receive)
+            app.config["RELEASE_ADMISSION"](
+                request.remote_addr or "", receive, record["token_id"]
+            )
         if completed.returncode:
             app.logger.error("git service failed")
             raise DemoHttpError(500, b"git service failed")

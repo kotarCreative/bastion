@@ -103,8 +103,20 @@
     </div>
   </section>
 
+  <section id="host-dashboard" class="host-dashboard" hidden>
+    <div class="section-heading"><p class="eyebrow">YOUR WORKSPACE</p><h2 id="host-heading">Repositories</h2><p id="host-message" role="status"></p></div>
+    <div id="repository-list" class="repository-list" aria-live="polite"></div>
+    <form id="create-repository" class="create-repository" autocomplete="off">
+      <h3>Create a repository</h3><p>Creates a seeded-empty repository on <code id="default-branch">main</code>.</p>
+      <label for="new-repository-name">Repository name</label><input id="new-repository-name" required maxlength="64" pattern="[a-z0-9][a-z0-9-]{0,63}" placeholder="my-project">
+      <button class="primary-button" type="submit">Create repository</button><p id="create-error" class="error" role="status"></p>
+      <p class="hint">Importing existing history is not supported here yet. Clone then commit/push.</p>
+    </form>
+  </section>
+
   <section id="workspace" hidden>
     <header class="repo-header">
+      <button id="repository-list-nav" class="quiet-button" type="button" hidden>← All repositories</button>
       <div class="repo-title-row">
         <div class="repo-avatar" aria-hidden="true">B</div>
         <div>
@@ -118,6 +130,7 @@
         <button type="button" class="tab" id="tab-code" data-panel="code" aria-selected="true">Code</button>
         <button type="button" class="tab" id="tab-history" data-panel="history" aria-selected="false">History</button>
         <button type="button" class="tab" id="tab-decision" data-panel="decision" aria-selected="false">Access inspector</button>
+        <button type="button" class="tab" id="tab-credentials" data-panel="credentials" aria-selected="false">Credentials</button>
         <button type="button" class="tab" id="tab-permissions" data-panel="permissions" aria-selected="false" hidden>People &amp; permissions</button>
         <button type="button" class="tab" id="tab-profile" data-panel="profile" aria-selected="false">Profile</button>
       </nav>
@@ -148,6 +161,7 @@
 
     <section id="panel-history" class="workspace-panel" role="tabpanel" aria-labelledby="tab-history" hidden></section>
     <section id="panel-decision" class="workspace-panel narrow-panel" role="tabpanel" aria-labelledby="tab-decision" hidden></section>
+    <section id="panel-credentials" class="workspace-panel narrow-panel" role="tabpanel" aria-labelledby="tab-credentials" hidden></section>
     <section id="panel-permissions" class="workspace-panel narrow-panel" role="tabpanel" aria-labelledby="tab-permissions" hidden></section>
     <section id="panel-profile" class="workspace-panel" role="tabpanel" aria-labelledby="tab-profile" hidden></section>
   </section>
@@ -158,7 +172,8 @@
   <p class="hint">This URL serves only the repository projection assigned to your identity.</p>
   <label for="clone-url">Clone URL</label>
   <div class="copy-field"><code id="clone-url"></code><button id="copy-clone" type="button">Copy</button></div>
-  <div class="clone-note"><strong>Authentication required</strong><p>When Git prompts for a password, use a Bastion token with fetch access. Keep <code>credential.useHttpPath</code> enabled when using multiple views on the same host.</p></div>
+  <div class="clone-note"><strong>Authentication required</strong><p>When Git prompts for a password, use a token created in the <strong>Credentials</strong> tab. Keep <code>credential.useHttpPath</code> enabled when using multiple views on the same host.</p></div>
+  <p id="clone-author-note" class="hint"></p>
 </dialog>
 
 <footer class="site-footer"><a class="footer-brand" href="/">bastion</a><span>Purpose-built access for shared code.</span><span class="prototype-label"><span class="status-dot"></span> Experimental prototype</span></footer>

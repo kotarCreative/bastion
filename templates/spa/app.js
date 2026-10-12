@@ -9,16 +9,30 @@
 
 (function () {
   var credential = null;
+  var hostCredential = null;
+  var hostAccount = null;
+  var hostMode = false;
+  var repositories = [];
+  var hostRun = 0;
+  var selectionRun = 0;
+  var createRequestId = null;
+  var createPending = false;
+  var authGeneration = 0;
   var session = null;
   var clerk = null;
   var clerkHadSession = false;
   var clerkExchangePending = false;
+  var clerkExchangeRun = 0;
   var clerkUserButtonMounted = false;
   var historyRendered = false;
   var treeState = { stack: [], entries: [], cursor: null, loading: false };
   var fullTree = true;
   var treeRun = 0;
   var invitationRun = 0;
+  // Monotonic run tokens: a late response for a superseded preview is
+  // discarded so the newest click always wins.
+  var previewRun = 0;
+  var readmeRun = 0;
 
   var ELEMENTS = {
     homepage: document.getElementById("homepage"),
@@ -52,6 +66,14 @@
     readmeContent: document.getElementById("readme-content"),
     cloneDialog: document.getElementById("clone-dialog"),
     cloneUrl: document.getElementById("clone-url"),
+    cloneAuthorNote: document.getElementById("clone-author-note"),
+    hostDashboard: document.getElementById("host-dashboard"),
+    repositoryList: document.getElementById("repository-list"),
+    hostMessage: document.getElementById("host-message"),
+    createForm: document.getElementById("create-repository"),
+    createName: document.getElementById("new-repository-name"),
+    createError: document.getElementById("create-error"),
+    repositoryListNav: document.getElementById("repository-list-nav"),
   };
 
   function visibleText(value) {
@@ -77,12 +99,19 @@
 
   function request(path, options) {
     options = options || {};
+    var route = path;
+    var externalAuth = options.skipCredential || path === "/api/v1/auth/clerk";
+    var hostRoute = options.host || externalAuth || path === "/api/v1/auth/config" || (path === "/api/v1/session" && !credential);
+    var scoped = hostMode && session && credential && !hostRoute && path.indexOf("/api/v1/repos") !== 0;
+    var requestRepoId = scoped && session.repo ? session.repo.repo_id : null;
+    var requestSelection = selectionRun;
+    if (scoped) route = "/api/v1/repos/" + encodeURIComponent(requestRepoId) + path.slice("/api/v1".length);
     var headers = Object.assign({}, options.headers || {});
-    var requestCredential = credential && !options.skipCredential ? credential : null;
-    if (credential && !options.skipCredential) {
-      headers.Authorization = "Bearer " + credential;
+    var requestCredential = externalAuth ? null : (hostRoute ? hostCredential : (scoped ? credential : (credential && !options.skipCredential ? credential : null)));
+    if (requestCredential && !options.skipCredential) {
+      headers.Authorization = "Bearer " + requestCredential;
     }
-    return fetch(path, {
+    return fetch(route, {
       method: options.method || "GET",
       headers: headers,
       body: options.body,
@@ -90,13 +119,22 @@
       credentials: "omit",
       referrerPolicy: "no-referrer",
     }).then(function (response) {
-      if (requestCredential && requestCredential !== credential) throw new Error("stale-session");
-      if (response.status === 401 && !options.optionalAuth) {
-        clearBastionSession();
+      if (scoped && (requestSelection !== selectionRun || requestRepoId !== (session && session.repo && session.repo.repo_id) || requestCredential !== credential)) throw new Error("stale-session");
+      if (hostRoute && requestCredential && requestCredential !== hostCredential && !options.allowStaleAuthResponse) throw new Error("stale-session");
+      if (response.status === 401 && options.allowStaleAuthResponse && requestCredential && requestCredential !== hostCredential) throw new Error("stale-session");
+      // Sign-in attempts have their own generation/error handling; an invalid
+      // supplied JWT/token must not invalidate a different active session.
+      if (response.status === 401 && !options.optionalAuth && !externalAuth) {
+        if (requestCredential && requestCredential === hostCredential && (options.host || !scoped)) clearBastionSession();
+        else if (requestCredential === credential) {
+          if (hostMode) { clearRepositorySession(); if (hostCredential) renderRepositories(); }
+          else clearBastionSession();
+        }
         throw new Error("auth-required");
       }
       return response.json().then(function (body) {
-        if (requestCredential && requestCredential !== credential) throw new Error("stale-session");
+        if (scoped && (requestSelection !== selectionRun || requestRepoId !== (session && session.repo && session.repo.repo_id) || requestCredential !== credential)) throw new Error("stale-session");
+        if (hostRoute && requestCredential && requestCredential !== hostCredential && !options.allowStaleAuthResponse) throw new Error("stale-session");
         return { status: response.status, body: body };
       });
     });
@@ -138,9 +176,15 @@
   }
 
   function clearBastionSession() {
+    authGeneration += 1;
+    hostRun += 1; selectionRun += 1;
     invitationRun += 1;
+    previewRun += 1; readmeRun += 1;
     credential = null;
+    hostCredential = null;
+    hostAccount = null;
     session = null;
+    repositories = []; createRequestId = null; createPending = false;
     historyRendered = false;
     treeRun += 1;
     treeState = { stack: [], entries: [], cursor: null, loading: false };
@@ -150,13 +194,22 @@
     ELEMENTS.homeNav.hidden = false;
     ELEMENTS.sessionNav.hidden = true;
     ELEMENTS.workspace.hidden = true;
+    ELEMENTS.hostDashboard.hidden = true;
+    ELEMENTS.hostMessage.textContent = ""; clearChildren(ELEMENTS.repositoryList); ELEMENTS.createError.textContent = "";
+    ELEMENTS.createName.value = "";
+    if (ELEMENTS.createForm.querySelector) { var createButton = ELEMENTS.createForm.querySelector("button[type=submit]"); if (createButton) createButton.disabled = false; }
     ELEMENTS.identity.hidden = true;
     ELEMENTS.identity.textContent = "";
+    ELEMENTS.repositoryListNav.hidden = true; ELEMENTS.cloneUrl.textContent = ""; ELEMENTS.cloneAuthorNote.textContent = "";
+    ELEMENTS.repoOwner.textContent = ""; ELEMENTS.repoName.textContent = ""; ELEMENTS.branchName.textContent = ""; ELEMENTS.tipLabel.textContent = "";
+    ELEMENTS.entryCount.textContent = ""; ELEMENTS.readmeName.textContent = "";
+    ELEMENTS.sessionNote.textContent = "Account authentication is managed by Clerk.";
+    if (ELEMENTS.cloneDialog.open) ELEMENTS.cloneDialog.close();
     ELEMENTS.manageAccount.hidden = true;
     ELEMENTS.logout.hidden = true;
     ELEMENTS.clerkUserButton.hidden = true;
     document.getElementById("tab-permissions").hidden = true;
-    ["panel-history", "panel-decision", "panel-permissions", "panel-profile"].forEach(function (id) {
+    ["panel-history", "panel-decision", "panel-credentials", "panel-permissions", "panel-profile"].forEach(function (id) {
       clearChildren(document.getElementById(id));
     });
     clearChildren(ELEMENTS.treeList);
@@ -165,6 +218,120 @@
     clearChildren(ELEMENTS.readmeContent);
     ELEMENTS.fileViewer.hidden = true;
     ELEMENTS.readmePanel.hidden = true;
+  }
+
+  function clearRepositorySession() {
+    selectionRun += 1; invitationRun += 1; treeRun += 1; previewRun += 1; readmeRun += 1;
+    credential = null; session = null; historyRendered = false;
+    treeState = { stack: [], entries: [], cursor: null, loading: false };
+    ELEMENTS.workspace.hidden = true; ELEMENTS.sessionNav.hidden = true;
+    ELEMENTS.repositoryListNav.hidden = true; ELEMENTS.cloneUrl.textContent = ""; ELEMENTS.cloneAuthorNote.textContent = "";
+    ELEMENTS.repoOwner.textContent = ""; ELEMENTS.repoName.textContent = ""; ELEMENTS.branchName.textContent = ""; ELEMENTS.tipLabel.textContent = "";
+    ELEMENTS.entryCount.textContent = ""; ELEMENTS.readmeName.textContent = "";
+    ELEMENTS.sessionNote.textContent = "Account authentication is managed by Clerk.";
+    document.getElementById("tab-permissions").hidden = true;
+    if (ELEMENTS.cloneDialog.open) ELEMENTS.cloneDialog.close();
+    ELEMENTS.hostDashboard.hidden = false;
+    if (hostCredential) {
+      ELEMENTS.sessionNav.hidden = false; ELEMENTS.identity.hidden = false;
+      ELEMENTS.identity.textContent = hostAccount ? hostAccount.owner_name : "Account";
+      ELEMENTS.logout.hidden = false;
+    }
+    clearChildren(ELEMENTS.treeList); clearChildren(ELEMENTS.fileViewer); clearChildren(ELEMENTS.readmeContent);
+    clearChildren(ELEMENTS.breadcrumb);
+    ELEMENTS.fileViewer.hidden = true; ELEMENTS.readmePanel.hidden = true;
+    ["panel-history", "panel-decision", "panel-credentials", "panel-permissions", "panel-profile"].forEach(function (id) { clearChildren(document.getElementById(id)); });
+  }
+
+  function revokeAndClear(signOutClerk) {
+    var hostToken = hostCredential;
+    var repoToken = credential;
+    var repoId = session && session.repo && session.repo.repo_id;
+    if (hostToken) fetch("/api/v1/logout", { method: "POST", headers: { Authorization: "Bearer " + hostToken }, credentials: "omit", cache: "no-store" }).catch(function () {});
+    if (repoToken && repoId) fetch("/api/v1/repos/" + encodeURIComponent(repoId) + "/logout", { method: "POST", headers: { Authorization: "Bearer " + repoToken }, credentials: "omit", cache: "no-store" }).catch(function () {});
+    else if (repoToken) fetch("/api/v1/logout", { method: "POST", headers: { Authorization: "Bearer " + repoToken }, credentials: "omit", cache: "no-store" }).catch(function () {});
+    clearBastionSession();
+    if (signOutClerk && clerk) Promise.resolve(clerk.signOut()).catch(function () {});
+  }
+
+  function currentClerkIdentity() {
+    if (!clerk || !clerk.session) return "";
+    return visibleText(clerk.session.id || "") + "|" + visibleText(clerk.session.user && clerk.session.user.id || clerk.user && clerk.user.id || "");
+  }
+
+  function revokeLateLogin(result, token, repoId) {
+    if (result && result.body && result.body.mode === "host" && result.body.access_token) {
+      fetch("/api/v1/logout", { method: "POST", headers: { Authorization: "Bearer " + result.body.access_token }, credentials: "omit", cache: "no-store" }).catch(function () {});
+    } else if (result && result.body && result.body.access_token) {
+      var path = repoId ? "/api/v1/repos/" + encodeURIComponent(repoId) + "/logout" : "/api/v1/logout";
+      fetch(path, { method: "POST", headers: { Authorization: "Bearer " + result.body.access_token }, credentials: "omit", cache: "no-store" }).catch(function () {});
+    } else if (token) {
+      fetch("/api/v1/logout", { method: "POST", headers: { Authorization: "Bearer " + token }, credentials: "omit", cache: "no-store" }).catch(function () {});
+    }
+  }
+
+  function renderRepositories() {
+    if (!hostCredential) return;
+    var run = ++hostRun, selection = selectionRun;
+    ELEMENTS.hostDashboard.hidden = false; ELEMENTS.workspace.hidden = true;
+    ELEMENTS.homepage.hidden = true; ELEMENTS.login.hidden = true; ELEMENTS.sessionNav.hidden = false;
+    ELEMENTS.hostMessage.textContent = "Loading your repositories…"; clearChildren(ELEMENTS.repositoryList);
+    request("/api/v1/repos", { host: true }).then(function (result) {
+      if (run !== hostRun || selection !== selectionRun || !hostCredential || session) return;
+      if (result.status !== 200) throw new Error("repos");
+      repositories = result.body.repos || []; ELEMENTS.hostMessage.textContent = repositories.length ? "Choose a repository to continue." : "No repositories yet. Create your first repository.";
+      repositories.forEach(function (repo) {
+        var card = element("article", "repository-card");
+        card.appendChild(element("h3", null, repo.owner_name + " / " + repo.name));
+        card.appendChild(element("p", "hint", repo.branch || "main"));
+        var open = textButton("primary-button", "Open repository"); open.addEventListener("click", function () { openHostedRepository(repo); });
+        card.appendChild(open); ELEMENTS.repositoryList.appendChild(card);
+      });
+    }).catch(function () { if (run === hostRun && selection === selectionRun && hostCredential && !session) {
+      ELEMENTS.hostMessage.textContent = "Repositories are unavailable. ";
+      var retry = textButton("quiet-button", "Retry"); retry.addEventListener("click", renderRepositories); ELEMENTS.hostMessage.appendChild(retry);
+    } });
+  }
+
+  function showViewSelection(repo, viewIds, run) {
+    if (run !== selectionRun) return;
+    ELEMENTS.hostDashboard.hidden = false; ELEMENTS.workspace.hidden = true; ELEMENTS.sessionNav.hidden = false;
+    ELEMENTS.hostMessage.textContent = "Select a view for " + repo.owner_name + " / " + repo.name + ".";
+    var form = element("form", "view-selection");
+    var select = element("select"); select.id = "repository-view-choice";
+    viewIds.forEach(function (viewId) { var option = element("option", null, viewId); option.value = viewId; select.appendChild(option); });
+    var label = element("label", null, "Repository view"); label.setAttribute("for", select.id);
+    var submit = element("button", "primary-button", "Open selected view"); submit.type = "submit";
+    form.appendChild(label); form.appendChild(select); form.appendChild(submit);
+    form.addEventListener("submit", function (event) { event.preventDefault(); if (run === selectionRun) openHostedRepository(repo, select.value); });
+    clearChildren(ELEMENTS.repositoryList); ELEMENTS.repositoryList.appendChild(form);
+  }
+
+  function openHostedRepository(repo, viewId) {
+    var old = credential;
+    var previousRepoId = session && session.repo && session.repo.repo_id;
+    if (old && previousRepoId) fetch("/api/v1/repos/" + encodeURIComponent(previousRepoId) + "/logout", { method: "POST", headers: { Authorization: "Bearer " + old }, cache: "no-store", credentials: "omit" }).catch(function () {});
+    clearRepositorySession();
+    var run = ++selectionRun;
+    var body = {}; if (viewId) body.view_id = viewId;
+    request("/api/v1/repos/" + encodeURIComponent(repo.repo_id) + "/auth/session", { host: true, allowStaleAuthResponse: true, method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
+      .then(function (result) {
+        if (run !== selectionRun || !hostCredential) {
+          if (result.status === 200 && result.body && result.body.access_token) fetch("/api/v1/repos/" + encodeURIComponent(repo.repo_id) + "/logout", { method: "POST", headers: { Authorization: "Bearer " + result.body.access_token }, cache: "no-store", credentials: "omit" }).catch(function () {});
+          return;
+        }
+        if (result.status === 409 && Array.isArray(result.body.view_ids)) {
+          showViewSelection(repo, result.body.view_ids, run);
+          return;
+        }
+        if (result.status !== 200) throw new Error("open");
+        if (run !== selectionRun || !hostCredential) {
+          fetch("/api/v1/repos/" + encodeURIComponent(repo.repo_id) + "/logout", { method: "POST", headers: { Authorization: "Bearer " + result.body.access_token }, cache: "no-store", credentials: "omit" }).catch(function () {});
+          return;
+        }
+        ELEMENTS.repositoryListNav.hidden = false;
+        openSession(result.body.access_token, result.body.session);
+      }).catch(function () { if (run === selectionRun) { ELEMENTS.hostDashboard.hidden = false; ELEMENTS.sessionNav.hidden = false; ELEMENTS.hostMessage.textContent = "Repository could not be opened. "; var retry = textButton("quiet-button", "Retry"); retry.addEventListener("click", function () { openHostedRepository(repo, viewId); }); ELEMENTS.hostMessage.appendChild(retry); } });
   }
 
   function prefixList(prefixes, emptyText) {
@@ -257,12 +424,16 @@
 
   function loadDirectory(reset) {
     if (fullTree) { loadFullTree(); return; }
-    if (treeState.loading) return;
+    // A fresh directory load (navigation) supersedes any request in flight:
+    // the stale response is discarded by the treeRun guard below. Only a
+    // pagination load waits, so pages append to the list in order.
+    if (!reset && treeState.loading) return;
     if (reset) {
       treeState.entries = [];
       treeState.cursor = null;
       ELEMENTS.fileViewer.hidden = true;
       ELEMENTS.readmePanel.hidden = true;
+      ELEMENTS.treeMore.hidden = true;
       clearChildren(ELEMENTS.treeList);
       ELEMENTS.treeList.appendChild(element("div", "tree-loading", "Loading visible files…"));
     }
@@ -377,6 +548,7 @@
   }
 
   function openFile(entry) {
+    var run = ++previewRun;
     clearChildren(ELEMENTS.fileViewer);
     ELEMENTS.fileViewer.hidden = false;
     var header = element("header");
@@ -390,6 +562,7 @@
     ELEMENTS.fileViewer.appendChild(header);
     ELEMENTS.fileViewer.appendChild(element("div", "tree-loading", "Loading file…"));
     blobRequest(entry).then(function (result) {
+      if (run !== previewRun) return;
       while (ELEMENTS.fileViewer.children.length > 1) ELEMENTS.fileViewer.removeChild(ELEMENTS.fileViewer.lastChild);
       if (result.status !== 200) {
         ELEMENTS.fileViewer.appendChild(element("div", "binary-message", "This file cannot be previewed."));
@@ -400,6 +573,7 @@
       }
       ELEMENTS.fileViewer.scrollIntoView({ behavior: "smooth", block: "start" });
     }).catch(function () {
+      if (run !== previewRun) return;
       while (ELEMENTS.fileViewer.children.length > 1) ELEMENTS.fileViewer.removeChild(ELEMENTS.fileViewer.lastChild);
       ELEMENTS.fileViewer.appendChild(element("div", "binary-message", "This file cannot be previewed."));
     });
@@ -445,22 +619,28 @@
   }
 
   function loadReadme(entry) {
+    var run = ++readmeRun;
     ELEMENTS.readmeName.textContent = entry.path_display.split("/").pop();
     clearChildren(ELEMENTS.readmeContent);
     ELEMENTS.readmeContent.appendChild(element("p", "hint", "Loading documentation…"));
     ELEMENTS.readmePanel.hidden = false;
     blobRequest(entry).then(function (result) {
+      if (run !== readmeRun) return;
       if (result.status !== 200 || result.body.binary) {
         ELEMENTS.readmePanel.hidden = true;
         return;
       }
       clearChildren(ELEMENTS.readmeContent);
       appendMarkdown(ELEMENTS.readmeContent, result.body.text);
-    }).catch(function () { ELEMENTS.readmePanel.hidden = true; });
+    }).catch(function () {
+      if (run !== readmeRun) return;
+      ELEMENTS.readmePanel.hidden = true;
+    });
   }
 
   function renderHistory() {
-    historyRendered = true;
+    var version = selectionRun, token = credential, repoId = session && session.repo && session.repo.repo_id;
+    function active() { return version === selectionRun && token === credential && (!repoId || (session && session.repo && session.repo.repo_id === repoId)); }
     var panel = document.getElementById("panel-history");
     clearChildren(panel);
     var shell = element("div", "history-shell");
@@ -479,7 +659,12 @@
       more.disabled = true;
       var query = "limit=25" + (cursor ? "&cursor=" + encodeURIComponent(cursor) : "");
       request("/api/v1/history?" + query).then(function (result) {
+        if (!active()) return;
         if (result.status !== 200) throw new Error("history-unavailable");
+        // Mark rendered only after a page succeeds, so a transient failure
+        // leaves the tab retryable on the next visit instead of stuck on the
+        // error message for the rest of the session.
+        historyRendered = true;
         result.body.commits.forEach(function (commit) {
           var row = element("div", "commit");
           row.appendChild(element("span", "commit-avatar", initials(commit.author_name_display)));
@@ -495,6 +680,7 @@
         more.disabled = false;
         if (!list.firstChild) list.appendChild(element("div", "tree-empty", "No visible commits."));
       }).catch(function () {
+        if (!active()) return;
         more.hidden = true;
         list.appendChild(element("div", "tree-empty", "History is temporarily unavailable."));
       });
@@ -504,6 +690,8 @@
   }
 
   function renderDecision() {
+    var token = credential, version = selectionRun, repoId = session && session.repo && session.repo.repo_id;
+    function active() { return token === credential && version === selectionRun && (!repoId || (session && session.repo && session.repo.repo_id === repoId)); }
     var panel = document.getElementById("panel-decision");
     clearChildren(panel);
     var card = element("div", "inspector-card");
@@ -545,6 +733,7 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ capability: capability.value, path_b64: encodePath(normalized) }),
       }).then(function (result) {
+        if (!active()) return;
         if (result.status !== 200) throw new Error("decision-failed");
         outcome.appendChild(element("p", result.body.allowed ? "verdict-allow" : "verdict-deny", result.body.allowed ? "Allowed" : "Denied"));
         outcome.appendChild(definitionList([
@@ -552,6 +741,7 @@
           ["Longest matching restriction", result.body.longest_deny ? result.body.longest_deny.prefix_display || "/" : "No match"],
         ]));
       }).catch(function () {
+        if (!active()) return;
         outcome.appendChild(element("p", "error", "The decision could not be evaluated."));
       });
     });
@@ -559,6 +749,8 @@
 
   function renderPermissions(initialBody) {
     var invitationVersion = ++invitationRun;
+    var contextToken = credential, contextSelection = selectionRun, contextRepo = session && session.repo && session.repo.repo_id;
+    function activeContext() { return contextToken === credential && contextSelection === selectionRun && (!contextRepo || (session && session.repo && session.repo.repo_id === contextRepo)); }
     var panel = document.getElementById("panel-permissions");
     clearChildren(panel);
     var card = element("div", "permission-card");
@@ -629,11 +821,17 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ view_id: target.value, path_b64: encodePath(normalized), private: action.value === "private" }),
         }).then(function (result) {
+          if (!activeContext() || invitationVersion !== invitationRun) return;
           if (result.status !== 200) throw new Error("permission-failed");
-          outcome.className = "ok";
-          outcome.textContent = "Permissions updated. A new projection is active.";
+          // renderPermissions rebuilds the panel (wiping `outcome`), so the
+          // confirmation is re-attached to the fresh panel, mirroring the
+          // invitation flow.
           renderPermissions();
+          var notice = element("p", "ok", "Permissions updated. A new projection is active.");
+          notice.setAttribute("role", "status");
+          document.getElementById("panel-permissions").prepend(notice);
         }).catch(function () {
+          if (!activeContext() || invitationVersion !== invitationRun) return;
           outcome.className = "error";
           outcome.textContent = "The permission change could not be applied.";
         });
@@ -648,13 +846,15 @@
     else request("/api/v1/permissions").then(function (result) {
       if (result.status !== 200) throw new Error("permissions-unavailable");
       populate(result.body);
-    }).catch(function () { content.appendChild(element("p", "error", "Permissions are unavailable.")); });
+    }).catch(function () { if (activeContext() && invitationVersion === invitationRun) content.appendChild(element("p", "error", "Permissions are unavailable.")); });
   }
 
   function renderInvitation(card, pickerEnabled, version) {
+    var tokenAtRender = credential, selectionAtRender = selectionRun, repoAtRender = session && session.repo && session.repo.repo_id;
+    function activeContext() { return version === invitationRun && tokenAtRender === credential && selectionAtRender === selectionRun && (!repoAtRender || (session && session.repo && session.repo.repo_id === repoAtRender)); }
     var section = element("section", "invitation-section");
     section.appendChild(element("h2", null, "Invite a collaborator"));
-    section.appendChild(element("p", "hint", "Select an existing Clerk account or invite someone by email, then set their permissions. Share this site's URL with them; no email is sent."));
+    section.appendChild(element("p", "hint", "Collaborators must already have an approved Bastion account. Select an existing account or enter the verified email on that account, then set repository permissions. Share this site's URL with them; no email is sent."));
     var form = element("form");
     var id = element("input");
     id.id = "invite-id";
@@ -722,7 +922,11 @@
             selectedAccount = account;
             email.value = account.email;
             selection.textContent = "Selected: " + account.name + " · " + account.email;
-            if (!id.value) id.value = account.email.split("@")[0].replace(/[^A-Za-z0-9._-]/g, "-").replace(/^[^A-Za-z0-9]+/, "").slice(0, 64);
+            // Always re-derive the identifier from the account just selected.
+            // Keeping a previously suggested or hand-typed value would submit
+            // one account's identifier with another account's Clerk identity,
+            // provisioning the wrong principal.
+            id.value = account.email.split("@")[0].replace(/[^A-Za-z0-9._-]/g, "-").replace(/^[^A-Za-z0-9]+/, "").slice(0, 64);
           });
           results.appendChild(button);
         });
@@ -783,7 +987,7 @@
       form.appendChild(label);
       form.appendChild(item[1]);
     });
-    form.appendChild(element("p", "hint", "All other paths are hidden. Contributors cannot manage permissions or invite people. Git credentials are issued separately."));
+    form.appendChild(element("p", "hint", "Only already-approved Bastion accounts can be added. All other paths are hidden. Contributors cannot manage permissions or invite people. Git credentials are issued separately."));
     var submit = element("button", null, "Invite with these permissions");
     submit.type = "submit";
     var outcome = element("p");
@@ -811,9 +1015,10 @@
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       }).then(function (result) {
+        if (!activeContext()) return;
         if (result.status !== 201) {
           outcome.className = "error";
-          outcome.textContent = result.status === 409 ? "That identifier, email, or Clerk account is already invited. Choose a unique collaborator." : result.body.error === "account-unavailable" ? "That account is no longer available or has no verified email. Search again." : "Invitation failed. Check the account, identifier, email, and existing repository paths.";
+          outcome.textContent = result.status === 409 ? "That identifier, email, or Clerk account is already invited. Choose a unique collaborator." : result.body.error === "account-unavailable" ? "The account is unavailable for this repository. Collaborators must already have an approved Bastion account; ask them to contact an administrator." : "Invitation failed. Check the account, identifier, email, and existing repository paths.";
           return;
         }
         renderPermissions();
@@ -821,10 +1026,158 @@
         notice.setAttribute("role", "status");
         document.getElementById("panel-permissions").prepend(notice);
       }).catch(function () {
+        if (!activeContext()) return;
         outcome.className = "error";
         outcome.textContent = "The invitation could not be created.";
-      }).then(function () { submit.disabled = false; });
+      }).then(function () { if (activeContext()) submit.disabled = false; });
     });
+  }
+
+  function renderCredentials(initialBody) {
+    var contextToken = credential, contextSelection = selectionRun, contextRepo = session && session.repo && session.repo.repo_id;
+    function activeContext() { return contextToken === credential && contextSelection === selectionRun && (!contextRepo || (session && session.repo && session.repo.repo_id === contextRepo)); }
+    var panel = document.getElementById("panel-credentials");
+    clearChildren(panel);
+    var card = element("div", "permission-card");
+    card.appendChild(element("h2", null, "Git credentials"));
+    card.appendChild(element("p", "hint", "Create a token to clone, fetch, and push with an unmodified Git client. The secret is shown once; revoke any token you no longer need."));
+    var content = element("div");
+    card.appendChild(content);
+    panel.appendChild(card);
+
+    function populate(body) {
+      if (!activeContext()) return;
+      var canPush = {};
+      body.views.forEach(function (item) { canPush[item.view_id] = item.can_push; });
+
+      var form = element("form");
+      form.setAttribute("autocomplete", "off");
+      var viewLabel = element("label", null, "Repository view");
+      var view = element("select");
+      view.id = "credential-view";
+      body.views.forEach(function (item) {
+        var option = element("option", null, item.view_id + (item.can_push ? "" : " (read-only)"));
+        option.value = item.view_id;
+        view.appendChild(option);
+      });
+      viewLabel.setAttribute("for", view.id);
+      var accessLabel = element("label", null, "Access");
+      var access = element("select");
+      access.id = "credential-access";
+      var pushOption = null;
+      [["fetch", "Read-only — clone and fetch"], ["fetch,push", "Read and write — clone, fetch, and push"]].forEach(function (item) {
+        var option = element("option", null, item[1]);
+        option.value = item[0];
+        if (item[0] === "fetch,push") pushOption = option;
+        access.appendChild(option);
+      });
+      var expiryLabel = element("label", null, "Expires");
+      var expiry = element("select");
+      expiry.id = "credential-expiry";
+      [["7d", "In 7 days"], ["30d", "In 30 days"], ["90d", "In 90 days"]].forEach(function (item) {
+        var option = element("option", null, item[1]);
+        option.value = item[0];
+        expiry.appendChild(option);
+      });
+      expiry.value = "30d";
+      function syncAccess() {
+        var writable = Boolean(canPush[view.value]);
+        if (pushOption) pushOption.disabled = !writable;
+        if (!writable && access.value === "fetch,push") access.value = "fetch";
+      }
+      view.addEventListener("change", syncAccess);
+
+      var submit = element("button", null, "Create token");
+      submit.type = "submit";
+      var outcome = element("p");
+      outcome.setAttribute("role", "status");
+      [["Repository view", view], ["Access", access], ["Expires", expiry]].forEach(function (item) {
+        var label = element("label", null, item[0]);
+        label.setAttribute("for", item[1].id);
+        form.appendChild(label);
+        form.appendChild(item[1]);
+      });
+      form.appendChild(submit);
+      form.appendChild(outcome);
+      content.appendChild(form);
+      syncAccess();
+
+      form.addEventListener("submit", function (event) {
+        event.preventDefault();
+        var scopes = access.value.split(",");
+        submit.disabled = true;
+        outcome.className = "hint";
+        outcome.textContent = "Creating token…";
+        request("/api/v1/credentials", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ view_id: view.value, scopes: scopes, expires_in: expiry.value }),
+        }).then(function (result) {
+          if (!activeContext()) return;
+          if (result.status !== 201) {
+            outcome.className = "error";
+            outcome.textContent = result.status === 403 ? "That access level is not available for this view." : "The token could not be created.";
+            return;
+          }
+          renderCredentials();
+          var created = element("div", "credential-secret");
+          created.appendChild(element("p", "ok", "Token created. Copy it now — it is shown only once."));
+          var field = element("div", "copy-field");
+          field.appendChild(element("code", null, result.body.credential));
+          var copy = textButton("copy-credential", "Copy");
+          copy.addEventListener("click", function () {
+            if (!navigator.clipboard) { copy.textContent = "Copy unavailable"; return; }
+            navigator.clipboard.writeText(result.body.credential).then(function () {
+              copy.textContent = "Copied";
+              window.setTimeout(function () { copy.textContent = "Copy"; }, 1600);
+            }, function () { copy.textContent = "Copy failed"; });
+          });
+          field.appendChild(copy);
+          created.appendChild(field);
+          document.getElementById("panel-credentials").prepend(created);
+        }).catch(function () {
+          if (!activeContext()) return;
+          outcome.className = "error";
+          outcome.textContent = "The token could not be created.";
+        }).then(function () { if (activeContext()) submit.disabled = false; });
+      });
+
+      var heading = element("h3", null, "Existing tokens");
+      content.appendChild(heading);
+      if (!body.tokens.length) {
+        content.appendChild(element("p", "hint", "No Git tokens yet."));
+        return;
+      }
+      body.tokens.forEach(function (token) {
+        var row = element("div", "credential-row");
+        row.appendChild(element("span", "credential-id", token.token_id.slice(0, 8) + "…"));
+        row.appendChild(element("span", "credential-scope", token.scopes.join(", ")));
+        row.appendChild(element("span", "credential-expiry", token.expires_at ? "expires " + shortDate(token.expires_at) : "no expiry"));
+        var revoked = Boolean(token.revoked_at);
+        var expired = Boolean(token.expires_at && token.expires_at * 1000 <= Date.now());
+        row.appendChild(element("span", "credential-state", revoked ? "Revoked" : expired ? "Expired" : "Active"));
+        var revoke = textButton("revoke-credential", "Revoke");
+        revoke.disabled = revoked;
+        revoke.addEventListener("click", function () {
+          request("/api/v1/credentials/" + encodeURIComponent(token.token_id), { method: "DELETE" })
+            .then(function (result) {
+              if (!activeContext()) return;
+              if (result.status !== 200) throw new Error("revoke-failed");
+              renderCredentials();
+            }).catch(function () {
+              if (!activeContext()) return;
+              row.appendChild(element("p", "error", "The token could not be revoked."));
+            });
+        });
+        row.appendChild(revoke);
+        content.appendChild(row);
+      });
+    }
+
+    if (initialBody) populate(initialBody);
+    else request("/api/v1/credentials").then(function (result) {
+      if (result.status !== 200) throw new Error("credentials-unavailable");
+      populate(result.body);
+    }).catch(function () { if (activeContext()) content.appendChild(element("p", "error", "Credentials are unavailable.")); });
   }
 
   function renderProfile() {
@@ -834,7 +1187,7 @@
     hero.appendChild(element("div", "profile-avatar", initials(session.principal.id)));
     var heading = element("div");
     heading.appendChild(element("h2", null, session.principal.id));
-    heading.appendChild(element("p", null, "Bastion " + session.principal.kind + " · active on " + session.view_id));
+    heading.appendChild(element("p", null, "Bastion " + session.principal.kind + " · " + (session.repo ? session.repo.owner_name + " / " + session.repo.name + " · " : "") + "view " + session.view_id));
     hero.appendChild(heading);
     var account = textButton(null, clerk ? "Manage account" : "Account managed by token");
     account.disabled = !clerk;
@@ -871,6 +1224,12 @@
     columns.appendChild(grants);
     columns.appendChild(restrictions);
     accessCard.appendChild(columns);
+    if (session.principal.emails && session.principal.emails.length) {
+      var authorCard = element("article", "profile-card profile-card-wide");
+      authorCard.appendChild(element("h3", null, "Approved commit author emails"));
+      authorCard.appendChild(element("p", null, session.principal.emails.join(", ")));
+      grid.appendChild(authorCard);
+    }
     grid.appendChild(identityCard);
     grid.appendChild(viewCard);
     grid.appendChild(accessCard);
@@ -878,12 +1237,19 @@
   }
 
   function configureClone() {
-    ELEMENTS.cloneUrl.textContent = window.location.protocol + "//" + encodeURIComponent(session.view_id) + "@" + window.location.host + "/" + encodeURIComponent(session.view_id) + ".git";
+    if (session.repo && session.repo.git_url) {
+      try { var git = new URL(session.repo.git_url, window.location.href); git.username = session.view_id; ELEMENTS.cloneUrl.textContent = git.toString(); }
+      catch (_) { ELEMENTS.cloneUrl.textContent = session.repo.git_url; }
+    } else ELEMENTS.cloneUrl.textContent = window.location.protocol + "//" + encodeURIComponent(session.view_id) + "@" + window.location.host + "/" + encodeURIComponent(session.view_id) + ".git";
   }
 
   function openSession(token, envelope) {
     credential = token;
     session = envelope;
+    ELEMENTS.hostDashboard.hidden = true;
+    ELEMENTS.homepage.hidden = true; ELEMENTS.login.hidden = true; ELEMENTS.sessionNav.hidden = false;
+    ELEMENTS.identity.hidden = false; ELEMENTS.identity.textContent = session.repo ? session.repo.owner_name + " / " + session.repo.name + " · view " + session.view_id : session.principal.id + " / " + session.view_id;
+    ELEMENTS.logout.hidden = false;
     historyRendered = false;
     treeState = { stack: [], entries: [], cursor: null, loading: false };
     ELEMENTS.loginError.hidden = true;
@@ -893,23 +1259,29 @@
     ELEMENTS.sessionNav.hidden = false;
     ELEMENTS.workspace.hidden = false;
     ELEMENTS.identity.hidden = false;
-    ELEMENTS.identity.textContent = session.principal.id + " / " + session.view_id;
+    ELEMENTS.identity.textContent = session.repo ? session.repo.owner_name + " / " + session.repo.name + " · view " + session.view_id : session.principal.id + " / " + session.view_id;
     ELEMENTS.manageAccount.hidden = !clerk;
     ELEMENTS.logout.hidden = false;
-    ELEMENTS.repoOwner.textContent = session.principal.id;
-    ELEMENTS.repoName.textContent = session.view_id;
+    ELEMENTS.repoOwner.textContent = session.repo ? session.repo.owner_name : session.principal.id;
+    ELEMENTS.repoName.textContent = session.repo ? session.repo.name : session.view_id;
     var refParts = session.descriptor.projected_ref.split("/");
     ELEMENTS.branchName.textContent = refParts[refParts.length - 1] || "main";
     document.getElementById("tab-permissions").hidden = true;
     configureClone();
+    ELEMENTS.cloneAuthorNote.textContent = session.principal.emails && session.principal.emails.length ? "New commits must use an approved author email: " + session.principal.emails.join(", ") : "New commits must use an email approved for your account.";
+    ELEMENTS.repositoryListNav.hidden = !hostMode;
+    if (session.principal && session.principal.emails) ELEMENTS.sessionNote.textContent = "Git commits must use one of your approved author emails: " + session.principal.emails.join(", ");
     renderDecision();
+    renderCredentials();
     renderProfile();
+    var token = credential, selectedRepo = session.repo && session.repo.repo_id;
     request("/api/v1/permissions").then(function (result) {
+      if (token !== credential || selectedRepo !== (session && session.repo && session.repo.repo_id)) return;
       if (result.status === 200) {
         document.getElementById("tab-permissions").hidden = false;
         renderPermissions(result.body);
       }
-    });
+    }).catch(function () {});
     showPanel("code");
     loadDirectory(true);
     window.scrollTo({ top: 0, behavior: "smooth" });
@@ -944,19 +1316,27 @@
 
   function exchangeClerkSession(view) {
     if (!clerk || !clerk.session || clerkExchangePending) return;
+    var generation = ++authGeneration;
+    var identity = currentClerkIdentity();
+    var clerkSession = clerk.session;
+    var exchangeRun = ++clerkExchangeRun;
     clerkExchangePending = true;
     ELEMENTS.loginError.hidden = true;
-    clerk.session.getToken().then(function (token) {
+    clerkSession.getToken().then(function (token) {
+      if (generation !== authGeneration || identity !== currentClerkIdentity()) throw new Error("stale-auth");
       var payload = {};
       if (view) payload.view_id = view;
       return request("/api/v1/auth/clerk", {
         method: "POST",
         headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
         body: JSON.stringify(payload),
-        optionalAuth: true,
         skipCredential: true,
       });
     }).then(function (result) {
+      if (generation !== authGeneration || identity !== currentClerkIdentity()) {
+        if (result.status === 200) revokeLateLogin(result, null, null);
+        return;
+      }
       if (result.status === 409 && Array.isArray(result.body.view_ids)) {
         clearChildren(ELEMENTS.clerkView);
         result.body.view_ids.forEach(function (viewId) {
@@ -969,17 +1349,25 @@
         return;
       }
       if (result.status !== 200) {
-        showClerkError(result.status === 403 ? "Your account has not been invited to this repository." : "Your sign-in could not be verified.");
+        showClerkError(result.status === 403 ? "Your account has not been approved for this workspace." : "Your sign-in could not be verified.");
         return;
       }
       mountClerkUserButton();
+      if (hostMode && result.body.account) {
+        hostCredential = result.body.access_token;
+        hostAccount = result.body.account;
+        ELEMENTS.identity.textContent = result.body.account.owner_name;
+        ELEMENTS.identity.hidden = false; ELEMENTS.logout.hidden = false; ELEMENTS.login.hidden = true; ELEMENTS.homepage.hidden = true; ELEMENTS.homeNav.hidden = true; ELEMENTS.sessionNav.hidden = false;
+        renderRepositories(); return;
+      }
       openSession(result.body.access_token, result.body.session);
     }).catch(function () {
-      showClerkError("Sign-in failed. Please try again.");
-    }).then(function () { clerkExchangePending = false; });
+      if (generation === authGeneration && identity === currentClerkIdentity()) showClerkError("Sign-in failed. Please try again.");
+    }).then(function () { if (exchangeRun === clerkExchangeRun) clerkExchangePending = false; });
   }
 
   function configureClerk(config) {
+    hostMode = config.mode === "host";
     if (!config.enabled) return Promise.resolve();
     ELEMENTS.clerkAuth.hidden = false;
     ELEMENTS.sessionNote.textContent = "Authentication, recovery, MFA, and account security are managed by Clerk.";
@@ -993,15 +1381,22 @@
       })
       .then(function () {
         clerkHadSession = Boolean(clerk.session);
+        var listenerIdentity = currentClerkIdentity();
         clerk.addListener(function (state) {
           var hasSession = Boolean(state.session);
-          if (!clerkHadSession && hasSession && !session) {
+          var identity = currentClerkIdentity();
+          if (clerkHadSession && hasSession && identity !== listenerIdentity) revokeAndClear(false);
+          if (hasSession && (!clerkHadSession || identity !== listenerIdentity) && !session) {
+            authGeneration += 1;
+            clerkExchangePending = false; clerkExchangeRun += 1;
             mountClerkUserButton();
             exchangeClerkSession();
           }
-          if (clerkHadSession && !hasSession && credential) {
-            request("/api/v1/logout", { method: "POST", optionalAuth: true }).then(clearBastionSession, clearBastionSession);
+          if (clerkHadSession && !hasSession) {
+            clerkExchangePending = false; clerkExchangeRun += 1;
+            revokeAndClear(false);
           }
+          listenerIdentity = identity;
           clerkHadSession = hasSession;
         });
         if (clerk.isSignedIn) {
@@ -1014,14 +1409,20 @@
   }
 
   function authenticate(token) {
-    request("/api/v1/session", { headers: { Authorization: "Bearer " + token } }).then(function (result) {
+    var generation = ++authGeneration;
+    request("/api/v1/session", { headers: { Authorization: "Bearer " + token }, skipCredential: true }).then(function (result) {
+      if (generation !== authGeneration) { if (result.status === 200) revokeLateLogin(result, token, null); return; }
       ELEMENTS.tokenInput.value = "";
       if (result.status !== 200) {
         showClerkError(result.status === 403 ? "This token cannot open the browser interface." : "Sign-in failed.");
         return;
       }
+      if (hostMode && result.body.account) {
+        hostCredential = token; hostAccount = result.body.account; ELEMENTS.tokenInput.value = ""; ELEMENTS.identity.textContent = result.body.account.owner_name; ELEMENTS.identity.hidden = false; ELEMENTS.logout.hidden = false; ELEMENTS.login.hidden = true; ELEMENTS.homepage.hidden = true; ELEMENTS.homeNav.hidden = true; ELEMENTS.sessionNav.hidden = false; renderRepositories(); return;
+      }
       openSession(token, result.body);
     }).catch(function (error) {
+      if (generation !== authGeneration) return;
       ELEMENTS.tokenInput.value = "";
       if (!error || error.message !== "auth-required") showClerkError("Sign-in failed.");
     });
@@ -1040,18 +1441,39 @@
   });
   ELEMENTS.manageAccount.addEventListener("click", function () { if (clerk) clerk.openUserProfile(); });
   ELEMENTS.logout.addEventListener("click", function () {
-    request("/api/v1/logout", { method: "POST", optionalAuth: true }).then(function () {
-      clearBastionSession();
-      return clerk ? clerk.signOut() : null;
-    }, function () {
-      clearBastionSession();
-      return clerk ? clerk.signOut() : null;
-    });
+    revokeAndClear(true);
   });
   document.querySelectorAll(".tab").forEach(function (tab) {
     tab.addEventListener("click", function () { showPanel(tab.dataset.panel); });
   });
   document.getElementById("repository-nav").addEventListener("click", function () { showPanel("code"); });
+  ELEMENTS.repositoryListNav.addEventListener("click", function () { var repoId = session && session.repo && session.repo.repo_id, token = credential; if (repoId && token) fetch("/api/v1/repos/" + encodeURIComponent(repoId) + "/logout", { method: "POST", headers: { Authorization: "Bearer " + token }, credentials: "omit", cache: "no-store" }).catch(function () {}); clearRepositorySession(); renderRepositories(); });
+  ELEMENTS.createForm.addEventListener("submit", function (event) {
+    event.preventDefault(); if (!hostCredential || createPending) return;
+    var name = ELEMENTS.createName.value.trim();
+    if (!createRequestId || createRequestId.name !== name) {
+      try {
+        var bytes = new Uint8Array(16);
+        if (window.crypto && window.crypto.randomUUID) createRequestId = { name: name, id: window.crypto.randomUUID() };
+        else if (window.crypto && window.crypto.getRandomValues) {
+          window.crypto.getRandomValues(bytes);
+          createRequestId = { name: name, id: Array.prototype.map.call(bytes, function (byte) { return byte.toString(16).padStart(2, "0"); }).join("") };
+        } else throw new Error("secure-random-unavailable");
+      } catch (_) { ELEMENTS.createError.textContent = "Secure request IDs are unavailable in this browser. Use a current browser to create a repository."; return; }
+    }
+    var selection = selectionRun, creatingHost = hostCredential; createPending = true;
+    var createButton = ELEMENTS.createForm.querySelector ? ELEMENTS.createForm.querySelector("button[type=submit]") : null;
+    if (createButton) createButton.disabled = true;
+    ELEMENTS.createError.textContent = "Creating repository…";
+    request("/api/v1/repos", { host: true, method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: name, request_id: createRequestId.id }) }).then(function (result) {
+      if (!hostCredential || hostCredential !== creatingHost) return;
+      if (result.status !== 201 && result.status !== 200) throw new Error("create");
+      createRequestId = null; ELEMENTS.createName.value = ""; ELEMENTS.createError.textContent = "";
+      if (selection === selectionRun && !session && !ELEMENTS.hostDashboard.hidden) renderRepositories();
+      else if (hostCredential) repositories.push(result.body.repo);
+    }).catch(function () { if (hostCredential === creatingHost && !session && !ELEMENTS.hostDashboard.hidden) ELEMENTS.createError.textContent = "Repository creation failed. Retry safely; the same request will be reused."; })
+      .then(function () { if (hostCredential === creatingHost) { createPending = false; if (createButton) createButton.disabled = false; } });
+  });
   document.getElementById("profile-nav").addEventListener("click", function () { showPanel("profile"); });
   ELEMENTS.treeMore.addEventListener("click", function () { loadDirectory(false); });
   document.getElementById("tree-mode").addEventListener("click", function (event) {

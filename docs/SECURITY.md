@@ -133,13 +133,29 @@ then applies to future projections and pushes, while data already projected or
 downloaded is explicitly non-revocable.
 
 The browser permission editor requires the authenticated view's active
-descriptor to grant root `admin`. It can only edit another active principal's
-visibility and only for a path that exists at the current canonical tip. The
-edit creates a new immutable managed role and publishes a policy transition
-for every active view of the target principal. Managed folder privacy mirrors
-every nested read grant as an equal-specificity denial, preserving privacy
-even when another role grants a narrower descendant. If the WAL ownership
-fence rejects publication, the catalog edit is rolled back before returning.
+descriptor to grant root `admin`. It can only edit another active `user`
+principal's visibility and only for a path that exists at the current
+canonical tip. The edit creates a new immutable managed role and publishes a
+policy transition for every active view of the target principal. Managed folder
+privacy mirrors every nested read grant as an equal-specificity denial,
+preserving privacy even when another role grants a narrower descendant.
+
+Root `admin` at `b""` is the repository-owner proof and authorizes the *act* of
+inviting a collaborator, including assigning the documented Contributor level.
+It is not a licence to disclose content the owner cannot see: an invitation is
+refused when the granter's own active descriptor does not grant `read` over a
+requested path, so an owner restricted to a subtree cannot mint a collaborator
+whose view reaches outside it and leaks hidden paths or their contents. Write
+delegation remains under owner authority, so a read-only owner can still assign
+a Contributor within the paths that owner may read.
+
+Every refusal raised before the manifest CAS — including `limits` budget
+exhaustion such as `MAX_WAL_SEQUENCE` — rolls the catalog edit back before
+returning, so a rejected edit cannot persist as a dormant policy. Only a
+`storage` fault is retained, because it can have an ambiguous commit outcome.
+Idempotency is resolved against committed WAL truth rather than by comparing the
+catalog with itself, so a repeated request re-drives publication instead of
+reporting success for an edit that never reached an active view.
 
 ## Write Authorization
 
@@ -210,10 +226,13 @@ view (`forge.py add-token`, `forge.py serve`). Authorization happens before any
 repository replay, materialization, or Git process starts. Unknown views and
 unauthorized views return identical 404 responses, so view existence is not
 enumerable. Unknown or malformed credentials return 401; a valid credential
-without the required scope returns 403. Required scopes are enforced through
-one shared predicate (`tokens.has_scope`) across browser, API, advertisement,
-and Git RPC routes: fetch routes require `fetch`, receive routes require `push`,
-and every demo API route requires `ui`.
+without the required scope returns 403. Credential resolution never leaks its
+failure mode: an unknown id, a malformed credential, and a token row that is
+corrupt or unreadable all resolve to the same 401, so a distinguishable error
+cannot be used to enumerate which token ids exist. Required scopes are enforced
+through one shared predicate (`tokens.has_scope`) across browser, API,
+advertisement, and Git RPC routes: fetch routes require `fetch`, receive routes
+require `push`, and every demo API route requires `ui`.
 
 The endpoint is a testing boundary, not a production service: there is no TLS
 and no production identity beyond digest tokens. Resource behavior is bounded
@@ -229,11 +248,32 @@ grace period and reaped on timeout, client disconnect, or shutdown (504 before
 response headers; a streamed 200 that hits a child failure simply terminates
 the connection because its status can no longer change).
 
+Both HTTP surfaces enforce the same budgets, and admission is always taken
+before intake materialization and before any request body is buffered, so a
+client cannot force unbounded replay work or per-request memory ahead of the
+checks. In the browser app the concurrency cap covers every route rather than
+only the Git RPCs, so the unauthenticated Clerk exchange (which makes blocking
+outbound calls) and the tree/blob readers (which spawn Git subprocesses) are
+bounded too. A resolved client address is either the socket peer or, when
+`BASTION_TRUSTED_PROXY` matches that peer, the single rightmost
+`X-Forwarded-For` entry — the one the trusted proxy appended — validated as an
+IP literal and normalized. A client therefore cannot rotate its admission
+bucket by supplying its own header entries, and no attacker-chosen text can
+reach the `BASTION_REMOTE_ADDR` value committed to the WAL.
+
 Receive admission also enforces the aggregate expanded-object budget, the
 volume free-space floor plus receive reserve, and the WAL sequence budget
 (exhausted budgets surface as `[limits]` rejections through the receive hook,
 or `503 demo-read-only` on the receive advertisement). Startup fails closed on
 invalid or unsafe limit overrides.
+
+`git receive-pack` relays this hook's stderr to the pushing client as sideband
+ERR packets. Hand-written policy text is the designed client-facing message and
+is relayed unchanged. Failures raised from raw subprocess output — the full argv
+with absolute server paths, plus git stderr with object ids — are marked
+`operator_detail` and relayed only to a local operator of the forge root;
+for a remote client only the stable rejection category is printed. The full
+diagnostic is always written to the audit log.
 
 Intake admission performs strict pre-publication object checks: every intake
 runs with `receive.fsckObjects=true`, and `prepare_submission` re-applies the
@@ -258,6 +298,38 @@ The following are not production-proven:
 - indistinguishable hidden-conflict error behavior.
 
 See [ROADMAP.md](../ROADMAP.md) for the work required before production claims.
+
+## Multi-Repository Host Contract
+
+The explicit host profile is specified in
+[Multi-Repository Accounts](../.specs/017-multi-repo-accounts.md). It does not
+change the single-root authorization model or make the filesystem accessible to
+untrusted tenants. Deployment administration and host account approval remain
+operator responsibilities; root administrator rights on a repository are not
+host administrator rights.
+
+Host sessions authorize account discovery and creation, not Git or repository
+data reads. Repository UI and Git credentials authenticate only in the selected
+repository's token store. A membership record is a discovery index: the host
+must independently verify the mapped user's stable identity and active WAL view
+before exposing a repository or exchanging a UI session. A corrupted mapping to
+another account's `owner` principal must not mint an owner credential.
+Delegation checks cover the entire requested subtree: an allowed directory
+boundary cannot be used to bypass a hidden descendant by inviting a new user.
+
+Namespaced routing must retain per-view fetch/push scope checks, author binding,
+and hidden-object isolation. Request, Git, receive, and provisioning admission
+must cover the host across repository apps rather than restarting at each URL.
+Cached app instances must not turn stale approval or membership into permanent
+authority. Browser switching must clear old data and credentials and prevent
+late responses from repopulating the new repository's interface.
+
+Host-session revocation and suspension are not substitutes for repository-token
+revocation. Already issued Git credentials require explicit revocation in their
+repository stores. Coordinated account deprovisioning, distributed admission,
+production storage adapters, and whole-host backup/restore remain production
+rollout requirements. Existing per-root backup commands do not, by themselves,
+produce a consistent backup of a multi-repository host catalog and all roots.
 
 ## Backups
 

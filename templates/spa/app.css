@@ -340,3 +340,16 @@ summary { color: var(--muted); font-size: 11px; cursor: pointer; }
 .account-selection { color: var(--ok); font-weight: 600; }
 .code-toolbar { flex-wrap: wrap; }
 .code-toolbar button { padding: 6px 10px; border: 1px solid var(--line-strong); border-radius: 5px; background: var(--panel); color: var(--ink); cursor: pointer; font-size: 11px; }
+/* Self-service Git credentials. */
+.credential-secret { margin-bottom: 18px; }
+.credential-row { display: flex; align-items: center; gap: 12px; padding: 9px 0; border-top: 1px solid var(--line); flex-wrap: wrap; }
+.credential-id, .credential-expiry { font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; color: var(--muted); }
+.credential-scope { flex: 1; }
+.credential-state { font-weight: 650; }
+.revoke-credential { padding: 5px 10px; border: 1px solid var(--line-strong); border-radius: 5px; background: var(--panel); color: var(--ink); cursor: pointer; font-size: 10px; }
+.revoke-credential:disabled { opacity: .5; cursor: default; }
+.copy-credential { padding: 0 14px; border: 0; border-left: 1px solid var(--line-strong); background: var(--panel); color: var(--ink); font-size: 10px; cursor: pointer; }
+.host-dashboard { max-width: 1120px; margin: 3rem auto; padding: 0 2rem; }
+.repository-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 1rem; margin: 1.5rem 0 3rem; }
+.repository-card, .create-repository { padding: 1.5rem; border: 1px solid var(--line, #dce2df); border-radius: 12px; background: var(--surface, #fff); }
+.create-repository { max-width: 520px; display: grid; gap: .75rem; }

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from errors import ForgeError
 from identity import normalize_emails
-from state import audit_event, locked, save_state
+from state import audit_event, load_state, locked, save_state
 
 
 class AccountLinkError(ForgeError):
@@ -22,8 +22,30 @@ def link_clerk_account(root, clerk_user_id: str, verified_emails: list[str]) -> 
     emails = set(normalize_emails(verified_emails))
     if not emails:
         raise ForgeError("Clerk account has no verified email")
+
+    # Fast path: an identity that is already linked needs no catalog write, so
+    # resolve it under a read-only load instead of taking the global lease.
+    # Without this, every routine browser sign-in by any invited user -
+    # including the lowest-privileged collaborator - contends for the lease
+    # that invitations, privacy edits, transitions, and backups require.
+    existing = load_state(root).get("principals", {})
+    already = [
+        principal
+        for principal in existing.values()
+        if principal.get("clerk_user_id") == clerk_user_id
+    ]
+    if len(already) > 1:
+        raise ForgeError("Clerk identity is linked more than once", "integrity")
+    if already:
+        principal = already[0]
+        if principal.get("kind") != "user":
+            raise ForgeError("Clerk identity is linked to a non-user", "integrity")
+        return principal["id"]
+
     with locked(root) as state:
         principals = state["principals"]
+        # Re-check under the lease: another sign-in may have linked this
+        # identity, or claimed the matching principal, while we waited.
         linked = [
             principal
             for principal in principals.values()

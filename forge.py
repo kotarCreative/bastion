@@ -169,6 +169,10 @@ def parser() -> argparse.ArgumentParser:
     serve_demo.add_argument("root", type=Path)
     serve_demo.add_argument("--host", default="127.0.0.1")
     serve_demo.add_argument("--port", type=int, default=8000)
+    serve_host = commands.add_parser("serve-host")
+    serve_host.add_argument("host_root", type=Path)
+    serve_host.add_argument("--host", default="127.0.0.1")
+    serve_host.add_argument("--port", type=int, default=8000)
     stats = commands.add_parser("stats")
     stats.add_argument("root", type=Path)
     backup = commands.add_parser("backup")
@@ -206,6 +210,29 @@ def parser() -> argparse.ArgumentParser:
     heartbeat.add_argument("--scope", action="append", default=[], dest="scopes")
     audit_command = commands.add_parser("audit")
     audit_command.add_argument("root", type=Path)
+    approve = commands.add_parser("approve-host-account")
+    approve.add_argument("host", type=Path)
+    approve.add_argument("owner")
+    approve.add_argument("--email", action="append", required=True)
+    approve.add_argument("--repo-limit", type=int, default=None,
+                         help="optional per-account repository capacity (no default limit)")
+    link = commands.add_parser("link-host-account")
+    link.add_argument("host", type=Path)
+    link.add_argument("clerk_user_id")
+    link.add_argument("--email", action="append", required=True,
+                      help="verified Clerk email; repeat for additional verified addresses")
+    create_repo = commands.add_parser("create-repo")
+    create_repo.add_argument("host", type=Path)
+    create_repo.add_argument("owner")
+    create_repo.add_argument("name")
+    create_repo.add_argument("--request-id", required=True)
+    source_group = create_repo.add_mutually_exclusive_group(required=True)
+    source_group.add_argument("--source", type=Path)
+    source_group.add_argument("--seed-empty", action="store_true")
+    create_repo.add_argument("--branch", default="main")
+    list_repos = commands.add_parser("list-repos")
+    list_repos.add_argument("host", type=Path)
+    list_repos.add_argument("--owner")
     return result
 
 
@@ -292,6 +319,10 @@ def main() -> int:
             from demo_server import serve
 
             serve(args.root, args.host, args.port)
+        elif args.command == "serve-host":
+            from host_server import serve
+
+            serve(args.host_root, args.host, args.port)
         elif args.command == "stats":
             import json as _json
 
@@ -346,6 +377,25 @@ def main() -> int:
                     )
             finally:
                 store.close()
+        elif args.command == "approve-host-account":
+            from host import Host
+            print(Host(args.host).approve_account(args.owner, args.email, repo_limit=args.repo_limit))
+        elif args.command == "link-host-account":
+            from host import Host
+            print(Host(args.host, initialize=False).link_clerk_account(args.clerk_user_id, args.email))
+        elif args.command == "create-repo":
+            import json as _json
+            from host import Host
+            result = Host(args.host).create_repo(
+                args.owner, args.name, request_id=args.request_id,
+                source=args.source, seed_empty=args.seed_empty, branch=args.branch,
+            )
+            print(_json.dumps(result, sort_keys=True))
+        elif args.command == "list-repos":
+            import json as _json
+            from host import Host
+            for record in Host(args.host, initialize=False).list_repos(args.owner):
+                print(_json.dumps(record, sort_keys=True))
         return 0
     except ForgeError as error:
         print(f"bastion: {error}", file=sys.stderr)

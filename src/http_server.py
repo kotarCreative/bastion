@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import ipaddress
 import os
 import re
 import select
@@ -316,6 +317,12 @@ def authenticate_token(root: Path, credential: str | None) -> dict | None:
     store = open_store(root)
     try:
         record = store.load_http_token(token_id)
+    except ForgeError:
+        # A corrupt row or a backend fault must be indistinguishable from an
+        # unknown token id. Returning the storage/integrity error instead
+        # would surface as a 500 and turn "this token id exists" into a
+        # single-request enumeration oracle against the generic 401.
+        return None
     finally:
         store.close()
     presented = _tokens.digest(token_id, secret)
@@ -836,14 +843,26 @@ class BastionRequestHandler(BaseHTTPRequestHandler):
         return active["principal_id"]
 
     def _client_address(self) -> str:
-        """Client address, trusting forwarded addresses only from the proxy."""
+        """Client address, trusting forwarded addresses only from the proxy.
+
+        The rightmost forwarded entry is the one the trusted proxy itself
+        appended and is the only value the client cannot choose, so it is the
+        sole accepted entry. Every candidate must parse as an IP literal;
+        anything else is discarded rather than used as an admission bucket key.
+        """
         peer = self.client_address[0] if self.client_address else ""
         trusted = os.environ.get("BASTION_TRUSTED_PROXY", "")
         if trusted and peer == trusted:
             forwarded = self.headers.get("X-Forwarded-For", "")
-            first = forwarded.split(",", 1)[0].strip()
-            if first:
-                return first
+            # Rightmost entry = last proxy hop the trusted proxy appended.
+            candidate = forwarded.rsplit(",", 1)[-1].strip()
+            if candidate:
+                try:
+                    parsed = ipaddress.ip_address(candidate)
+                except ValueError:
+                    return peer
+                # Normalize so equivalent spellings share one bucket.
+                return str(parsed)
         return peer
 
     def _check_deadline(self, deadline: float) -> None:

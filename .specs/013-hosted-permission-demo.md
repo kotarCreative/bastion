@@ -76,8 +76,18 @@ Public routes disclose no view, principal, policy, ref, or repository existence.
 - `GET /api/v1/tree?path_b64=<bytes>&cursor=<cursor>&limit=<n>`: paginated entries reachable from the current projected ref.
 - `GET /api/v1/history?cursor=<cursor>&limit=<n>`: paginated commits reachable from the current projected ref.
 - `POST /api/v1/decisions`: evaluate one normalized capability and path against the current descriptor.
+- `GET /api/v1/credentials`: the authenticated principal's own Git tokens (metadata only) and its views with a `can_push` flag.
+- `POST /api/v1/credentials`: mint a `fetch`/`push` token for one of the caller's own views, with an expiry of at most 365 days; returns the secret once.
+- `DELETE /api/v1/credentials/<token_id>`: revoke one of the caller's own Git tokens.
 
 Every `/api/v1/*` route requires `ui` scope. Missing, malformed, expired, or revoked credentials return the same `401` JSON error and bearer challenge. A valid credential without `ui` returns `403`; it does not reveal whether another token scope would succeed.
+
+Git credentials are self-service but strictly bounded to the caller's own
+principal: a request may only name a view belonging to the authenticated
+principal, a `push` scope requires that view's policy to grant a write
+capability, and an expired or revoked token is indistinguishable from an unknown
+one (`404`) so the route cannot probe for other principals' token ids. The
+browser `ui` session token is never offered as a Git credential.
 
 API authentication resolves the token to exactly one view before repository work begins. The trusted materialization layer may reconstruct a missing or stale view from repository truth before the API opens it. After successful materialization, API traversal reads only the completed authorization-safe projected repository. It must never traverse `canonical.git` directly, use canonical object storage as an API alternate, return canonical-only refs or commit IDs, or enumerate another view. A materialization failure returns generic `503` and is logged internally.
 

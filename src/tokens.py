@@ -89,14 +89,14 @@ DUMMY_DIGEST = "00" * 32
 def normalize_scopes(values: object) -> list[str]:
     if not isinstance(values, (list, tuple)) or not values:
         raise ForgeError("token scopes must be a nonempty list")
-    unique = sorted(set(values))
-    if set(unique) != set(values) or any(
-        not isinstance(item, str) or item not in SCOPES for item in values
-    ):
+    # Type-check before hashing: set() calls __hash__ on every element, so a
+    # non-string entry would raise an unhandled TypeError and surface as a
+    # 500 instead of the intended generic authentication failure.
+    if any(not isinstance(item, str) or item not in SCOPES for item in values):
         raise ForgeError("token scopes must be a unique subset of fetch, push, ui")
-    if not unique or any(item not in SCOPES for item in unique):
+    if len(set(values)) != len(values):
         raise ForgeError("token scopes must be a unique subset of fetch, push, ui")
-    return unique
+    return sorted(set(values))
 
 
 def has_scope(record: object, scope: str) -> bool:

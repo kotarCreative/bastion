@@ -19,6 +19,36 @@ Bastion currently provides:
 - smart HTTP with per-view tokens and isolated intake repositories;
 - integration, adversarial, concurrency, and failpoint coverage.
 
+## Multi-User Forge Priority
+
+The product goal is a multi-user Git hosting alternative with stronger
+repository- and path-level permissions, not just a single-repository demo.
+Track the implementation contract in
+[Multi-Repository Accounts](.specs/017-multi-repo-accounts.md).
+
+1. **Independent repositories:** approved accounts own multiple forge roots,
+   with isolated catalogs, histories, permissions, and credentials. The local
+   operator foundation is implemented.
+2. **Usable hosted workflow:** account sessions independent of repository views,
+   private repository discovery, creation and switching in the browser, scoped
+   collaborator discovery, and namespaced HTTPS clone/push. This is the current
+   served slice is implemented on persistent local storage; production rollout
+   and distributed admission remain gated on the operations milestone.
+3. **Bring existing code:** bounded, recoverable self-service history import,
+   with clear author/branch constraints. Seeded-empty creation must not pretend
+   to accept an unrelated existing local history by a normal first push.
+4. **Operate safely:** isolated production catalogs/object stores, TLS,
+   distributed quotas, deprovisioning and credential revocation, auditability,
+   and tested backup/restore and migration for the whole host.
+5. **Review and integration workflows:** permission-aware code review, protected
+   branches, status checks, and authorized CI/artifact access. These remain
+   necessary work before claiming broad GitHub workflow compatibility.
+
+At every stage, repository discovery is not authorization, cached identity is
+not permanent authority, and a policy must restrict both Git objects and browser
+metadata. Administrative rights on one repository must never grant host-wide
+rights or access to another owner's private repositories.
+
 ## Git Compatibility
 
 - Maintain the [Git compatibility matrix](docs/GIT_COMPATIBILITY.md) for repack,

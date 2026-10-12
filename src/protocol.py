@@ -337,9 +337,23 @@ def prepare_submission(
     return transition
 
 
+# Transports whose client is the operator of this same filesystem, and so is
+# already trusted with repository paths and object ids. Any other value
+# (including an unrecognised one) is treated as remote.
+LOCAL_TRANSPORTS = frozenset({"local", "test"})
+
+
 def hook_pre_receive(root: Path, name: str, updates: bytes) -> int:
     """CLI hook entry: rejections become a stable category plus the
-    client-safe message, and are recorded in the audit log."""
+    client-safe message, and are recorded in the audit log.
+
+    ``git receive-pack`` relays this hook's stderr straight to the pushing
+    client as sideband ERR packets. Hand-written policy text is the designed
+    client-facing message and is relayed as before. Failures flagged
+    ``operator_detail`` are built from the full subprocess argv (absolute
+    server paths) plus raw git stderr (object ids); those reach only a local
+    operator and are otherwise confined to the audit log.
+    """
     try:
         pre_receive(root, name, updates)
     except ForgeError as error:
@@ -353,12 +367,19 @@ def hook_pre_receive(root: Path, name: str, updates: bytes) -> int:
                 root,
                 "receive.reject",
                 f"{name}/-",
-                f"{transport} {remote} {category}",
+                f"{transport} {remote} {category}: {error}",
             )
         except Exception:
             pass
         print(f"bastion: push rejected [{category}]", file=sys.stderr)
-        print(f"bastion: {error}", file=sys.stderr)
+        # Hand-written policy explanations are the designed client-facing
+        # message and reach every client. Failures flagged operator_detail
+        # are built from raw subprocess output (full argv with absolute
+        # server paths, plus git stderr with object ids); those are relayed
+        # only to a local operator of this filesystem and are otherwise
+        # confined to the audit log above.
+        if not getattr(error, "operator_detail", False) or transport in LOCAL_TRANSPORTS:
+            print(f"bastion: {error}", file=sys.stderr)
         return 1
     return 0
 

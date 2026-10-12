@@ -118,6 +118,25 @@ class DemoServerTest(unittest.TestCase):
         self.assertIn("text/css", css.content_type)
         self.assertIn("javascript", js.content_type)
 
+    def test_assets_revalidate_with_etag(self) -> None:
+        """A stale shell must never be served from an unconditional cache."""
+        page = self.client.get("/")
+        asset = self.client.get("/assets/app.js")
+        for response in (page, asset):
+            with self.subTest(path=response.request.path):
+                self.assertEqual(response.headers.get("Cache-Control"), "no-cache")
+                self.assertTrue(response.headers.get("ETag"))
+        # A matching validator yields an empty 304, so the browser reuses its
+        # copy without a second download.
+        etag = asset.headers["ETag"]
+        cached = self.client.get("/assets/app.js", headers={"If-None-Match": etag})
+        self.assertEqual(cached.status_code, 304)
+        self.assertEqual(cached.data, b"")
+        # A changed asset changes the validator, forcing a fresh body.
+        stale = self.client.get("/assets/app.js", headers={"If-None-Match": '"stale"'})
+        self.assertEqual(stale.status_code, 200)
+        self.assertTrue(stale.data)
+
     def test_application_never_persists_credentials(self) -> None:
         js = self.client.get("/assets/app.js").data.decode()
         self.assertNotIn("document.cookie", js)
@@ -390,6 +409,102 @@ class DemoServerTest(unittest.TestCase):
         self.assertTrue(commits)
         self.assertIn("oid", commits[0])
         self.assertIn("message_display", commits[0])
+
+    # -- Git credentials ------------------------------------------------------
+
+    def test_git_credential_lifecycle_and_authorization(self) -> None:
+        import tokens as _tokens
+        from identity import empty_capability_map
+        from service import add_principal, add_role, add_view, bind_role
+
+        owner = self._owner_token()      # read=[""], admin=[""], no write
+        headers = self._bearer(owner)
+
+        # A read-only principal for cross-principal checks.
+        add_principal(self.forge, "reader", ["reader@example.test"])
+        allow = empty_capability_map()
+        allow["read"] = ["visible"]
+        add_role(self.forge, "reader-role", allow, empty_capability_map())
+        bind_role(self.forge, "reader-role", "principal", "reader")
+        add_view(self.forge, "reader", "reader", "main")
+        reader = add_token(self.forge, "reader", ["ui"], "1h")
+
+        self.assertEqual(self.client.get("/api/v1/credentials").status_code, 401)
+        listing = self.client.get("/api/v1/credentials", headers=headers)
+        self.assertEqual(listing.status_code, 200)
+        body = listing.get_json()
+        self.assertEqual(body["principal_id"], "owner")
+        self.assertEqual(body["views"], [{"view_id": "owner", "can_push": False}])
+        # The browser ui session token is not offered as a Git credential.
+        self.assertEqual(body["tokens"], [])
+
+        # push requires a write capability the owner does not hold
+        response = self.client.post("/api/v1/credentials", headers=headers, json={
+            "view_id": "owner", "scopes": ["fetch", "push"], "expires_in": "30d"})
+        self.assertEqual(response.status_code, 403)
+
+        # fetch is allowed; the secret is returned exactly once
+        response = self.client.post("/api/v1/credentials", headers=headers, json={
+            "view_id": "owner", "scopes": ["fetch"], "expires_in": "30d"})
+        self.assertEqual(response.status_code, 201)
+        credential = response.get_json()["credential"]
+        self.assertRegex(credential, _tokens.TOKEN_RE)
+        token_id = credential.split(".")[1]
+        # A fetch credential authenticates Git, not the browser API (no ui scope).
+        basic = base64.b64encode(f"owner:{credential}".encode()).decode()
+        self.assertEqual(self.client.get(
+            "/owner.git/info/refs?service=git-upload-pack",
+            headers={"Authorization": f"Basic {basic}"},
+        ).status_code, 200)
+        self.assertEqual(self.client.get(
+            "/api/v1/session", headers={"Authorization": f"Bearer {credential}"}
+        ).status_code, 403)
+        listed = self.client.get("/api/v1/credentials", headers=headers).get_json()["tokens"]
+        self.assertEqual([item["token_id"] for item in listed], [token_id])
+        self.assertEqual(listed[0]["scopes"], ["fetch"])
+
+        # a write-capable principal may mint a push credential
+        add_principal(self.forge, "writer", ["writer@example.test"])
+        allow = empty_capability_map()
+        allow["read"] = ["visible"]
+        allow["create"] = ["visible"]
+        allow["modify"] = ["visible"]
+        add_role(self.forge, "writer-role", allow, empty_capability_map())
+        bind_role(self.forge, "writer-role", "principal", "writer")
+        add_view(self.forge, "writer", "writer", "main")
+        writer = add_token(self.forge, "writer", ["ui"], "1h")
+        self.assertEqual(self.client.post("/api/v1/credentials", headers=self._bearer(writer), json={
+            "view_id": "writer", "scopes": ["fetch", "push"], "expires_in": "7d",
+        }).status_code, 201)
+        self.assertTrue(self.client.get(
+            "/api/v1/credentials", headers=self._bearer(writer)
+        ).get_json()["views"][0]["can_push"])
+
+        # a principal cannot mint for a view it does not own
+        self.assertEqual(self.client.post("/api/v1/credentials", headers=self._bearer(writer), json={
+            "view_id": "owner", "scopes": ["fetch"], "expires_in": "30d",
+        }).status_code, 403)
+
+        for change in ({"scopes": []}, {"scopes": ["admin"]}, {"scopes": ["ui"]},
+                       {"expires_in": "forever"}, {"expires_in": "400d"}, {"view_id": "nope"}):
+            payload = {"view_id": "owner", "scopes": ["fetch"], "expires_in": "30d"} | change
+            with self.subTest(change=change):
+                self.assertIn(self.client.post(
+                    "/api/v1/credentials", headers=headers, json=payload
+                ).status_code, {400, 403})
+
+        # revoke: another principal's id and an unknown id are one 404
+        self.assertEqual(self.client.delete(
+            f"/api/v1/credentials/{token_id}", headers=self._bearer(reader)).status_code, 404)
+        self.assertEqual(self.client.delete(
+            "/api/v1/credentials/" + "A" * 22, headers=headers).status_code, 404)
+        self.assertEqual(self.client.delete(
+            f"/api/v1/credentials/{token_id}", headers=headers).status_code, 200)
+        self.assertEqual(self.client.get(
+            "/owner.git/info/refs?service=git-upload-pack",
+            headers={"Authorization": f"Basic {basic}"},
+        ).status_code, 401)
+        forge.check_invariants(self.forge)
 
     # -- Git routes ----------------------------------------------------------
 
