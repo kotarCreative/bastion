@@ -23,6 +23,16 @@ closures, not to hostile users sharing the server filesystem.
 
 ## Protected Assets
 
+Canonical branch inventory is trusted-operator-only: listing refs is a local
+filesystem/server operator operation, not a repository-user capability or
+public API. Creating a canonical ref additionally verifies that the specified
+principal has a root-administrator descriptor. Ordinary repository read
+permission does not expose non-default branch names or refs; browser browsing
+and Git clone/fetch/push remain default-branch-only. This internal inventory
+does not activate the reserved public branch capability or grant clients
+branch access. Branch-scoped viewing and transport authorization require a
+separate design and implementation.
+
 - unauthorized blob contents;
 - hidden filenames and tree structure where practical;
 - hidden refs and canonical object IDs;

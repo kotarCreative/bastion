@@ -57,6 +57,17 @@ rights or access to another owner's private repositories.
 
 ## Git Compatibility
 
+### Branching foundation
+
+The initial multi-branch slice is intentionally operator-only: canonical
+branch refs and tips are WAL truth, and a root administrator may create a
+branch at an already-canonical tip and inspect the canonical inventory. Public
+clone/fetch/push and browser projection remain default-branch-only. This is not
+forge/client feature branching. Next work must separately define authorized
+repo viewing, branch-scoped projections and transport, lifecycle operations,
+and a review/PR model before presenting branches to end users. See
+[spec 018](.specs/018-multi-branch-foundation.md).
+
 - Maintain the [Git compatibility matrix](docs/GIT_COMPATIBILITY.md) for repack,
   garbage collection, commit graphs, bitmaps, multi-pack-index, protocol
   versions, exact OID wants, and shallow history.

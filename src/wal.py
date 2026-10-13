@@ -16,11 +16,12 @@ from errors import ForgeError
 
 OBJECT_FORMAT = "sha1"
 PROJECTION_ALGORITHM = "projection-v2"
+MAX_BRANCH_REFS = 1024
 OID_RE = re.compile(r"^[0-9a-f]{40}$")
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 UUID_RE = re.compile(r"^[0-9a-f]{32}$")
 DESCRIPTOR_RE = re.compile(r"^vdesc-[0-9a-f]{64}$")
-KINDS = {"import", "view_create", "submission", "canonical_update", "policy_transition"}
+KINDS = {"import", "view_create", "submission", "canonical_update", "policy_transition", "branch_create"}
 
 
 def canonical_json(value: object) -> bytes:
@@ -127,6 +128,23 @@ def _ref(value: object, subject: str) -> str:
     if not reference.startswith("refs/heads/"):
         _fail(f"{subject} must be a branch ref")
     return reference
+
+
+def validate_branch_ref(value: object) -> str:
+    """Validate a user-created branch with Git's check-ref-format rules."""
+    ref = _string(value, "branch ref")
+    try:
+        ref.encode("utf-8", "strict")
+    except UnicodeEncodeError:
+        _fail("branch ref is not valid UTF-8")
+    if (not ref.startswith("refs/heads/") or ref.endswith("/") or ref.endswith(".")
+        or ".." in ref or "@{" in ref or "\\" in ref or "//" in ref
+        or ref == "@" or any(ord(c) < 32 or ord(c) == 127 or c in " ~^:?*[" for c in ref)):
+        _fail("branch ref is not a valid Git branch ref")
+    parts = ref.split("/")
+    if any(not part or part.startswith(".") or part.endswith(".lock") for part in parts):
+        _fail("branch ref is not a valid Git branch ref")
+    return ref
 
 
 def _pack_ref(value: object, expected_kind: str | None = None) -> dict:
@@ -240,6 +258,14 @@ class Manifest:
     writer: str
     object_format: str = OBJECT_FORMAT
     projection_algorithm: str = PROJECTION_ALGORITHM
+    canonical_refs: dict | None = None
+
+    def __post_init__(self):
+        refs = dict(self.canonical_refs) if self.canonical_refs is not None else {
+            self.canonical_ref: self.canonical_tip
+        }
+        _validate_canonical_refs(refs, self.canonical_ref, self.canonical_tip)
+        object.__setattr__(self, "canonical_refs", MappingProxyType(refs))
 
     def to_dict(self) -> dict:
         return {
@@ -254,6 +280,7 @@ class Manifest:
             "revision": self.revision,
             "updated_at": self.updated_at,
             "writer": self.writer,
+            "canonical_refs": dict(self.canonical_refs),
         }
 
     @classmethod
@@ -271,6 +298,8 @@ class Manifest:
             "updated_at",
             "writer",
         }
+        if _is_mapping(value) and "canonical_refs" in value:
+            fields.add("canonical_refs")
         record = _exact(value, fields, "manifest")
         repository_id = _uuid(record["repository_id"], "manifest repository_id")
         if record["object_format"] != OBJECT_FORMAT:
@@ -300,17 +329,42 @@ class Manifest:
         validated_packs = tuple(_pack_ref(item, "canonical") for item in packs)
         if len({item["pack_key"] for item in validated_packs}) != len(validated_packs):
             _fail("manifest canonical packs are duplicated")
+        canonical_ref = _ref(record["canonical_ref"], "manifest canonical_ref")
+        canonical_tip = _oid(record["canonical_tip"], "manifest canonical_tip") or ""
+        refs = record.get("canonical_refs", {canonical_ref: canonical_tip})
+        if not _is_mapping(refs):
+            _fail("manifest canonical_refs must be a nonempty bounded object")
+        normalized_refs = _validate_canonical_refs(refs, canonical_ref, canonical_tip)
         return cls(
             repository_id,
-            _ref(record["canonical_ref"], "manifest canonical_ref"),
-            _oid(record["canonical_tip"], "manifest canonical_tip") or "",
+            canonical_ref,
+            canonical_tip,
             head_seq,
             wal_head,
             validated_packs,
             _integer(record["revision"], "manifest revision", 1),
             _integer(record["updated_at"], "manifest updated_at", 0),
             _uuid(record["writer"], "manifest writer"),
+            canonical_refs=normalized_refs,
         )
+
+
+def _validate_canonical_refs(refs: object, canonical_ref: str, canonical_tip: str) -> dict[str, str]:
+    if not _is_mapping(refs) or not refs or len(refs) > MAX_BRANCH_REFS:
+        _fail("manifest canonical_refs must be a nonempty bounded object")
+    result: dict[str, str] = {}
+    for ref, tip in refs.items():
+        validate_branch_ref(ref)
+        oid = _oid(tip, "manifest branch tip") or ""
+        if oid == "0" * 40:
+            _fail("manifest branch tip cannot be the zero OID")
+        result[ref] = oid
+    for ref in result:
+        if any(other != ref and other.startswith(ref + "/") for other in result):
+            _fail("manifest branch refs have a namespace conflict")
+    if result.get(canonical_ref) != canonical_tip:
+        _fail("manifest canonical aliases differ from canonical_refs")
+    return result
 
 
 @dataclass
@@ -320,6 +374,7 @@ class ReplayState:
     head_record: dict | None = None
     canonical_ref: str | None = None
     canonical_tip: str | None = None
+    canonical_refs: dict[str, str] = field(default_factory=dict)
     canonical_packs: list[dict] = field(default_factory=list)
     active_views: dict[str, dict] = field(default_factory=dict)
     change_claims: dict[str, dict] = field(default_factory=dict)
@@ -346,6 +401,7 @@ class ReplayState:
         result.head_record = dict(self.head_record) if self.head_record else None
         result.canonical_ref = self.canonical_ref
         result.canonical_tip = self.canonical_tip
+        result.canonical_refs = dict(self.canonical_refs)
         result.canonical_packs = list(self.canonical_packs)
         result.active_views = {
             view_id: dict(view) for view_id, view in self.active_views.items()
@@ -397,6 +453,7 @@ class ReplaySnapshot:
         "head_record",
         "canonical_ref",
         "canonical_tip",
+        "canonical_refs",
         "canonical_packs",
         "active_views",
         "change_claims",
@@ -413,6 +470,7 @@ class ReplaySnapshot:
         self.head_record = _freeze_value(state.head_record)
         self.canonical_ref = state.canonical_ref
         self.canonical_tip = state.canonical_tip
+        self.canonical_refs = MappingProxyType(dict(state.canonical_refs))
         self.canonical_packs = tuple(
             _freeze_value(pack) for pack in state.canonical_packs
         )
@@ -500,6 +558,12 @@ def record_fingerprint(repository_id: str, kind: str, payload: dict) -> dict:
             "canonical_frontier": payload.get("canonical_frontier"),
             "views": views,
         }
+    elif kind == "branch_create":
+        result = {"kind": kind, "repository_id": repository_id, **{
+            key: payload.get(key) for key in (
+                "principal_id", "descriptor_id", "source_ref", "branch_ref", "canonical_tip"
+            )
+        }}
     else:
         _fail("record has an unknown kind")
     return result
@@ -694,6 +758,30 @@ def _validate_payload(
                 _string(commit["change_id"], "canonical update Change-Id")
         _require_descriptor(descriptor_id, loader, value["principal_id"], value["canonical_ref"])
         return
+    if kind == "branch_create":
+        value = _exact(payload, {
+            "principal_id", "descriptor_id", "source_ref", "branch_ref", "canonical_tip", "received_at"
+        }, "branch_create payload")
+        _string(value["principal_id"], "branch principal")
+        descriptor_id = _descriptor_id(value["descriptor_id"], "branch descriptor_id")
+        validate_branch_ref(value["source_ref"])
+        validate_branch_ref(value["branch_ref"])
+        _oid(value["canonical_tip"], "branch canonical_tip")
+        if value["canonical_tip"] == "0" * 40:
+            _fail("branch canonical_tip cannot be the zero OID")
+        _integer(value["received_at"], "branch received_at", 0)
+        if value["source_ref"] == value["branch_ref"]:
+            _fail("branch destination already exists")
+        if loader is None:
+            _fail("branch creation requires its captured descriptor")
+        descriptor = validate_descriptor(loader(descriptor_id))
+        if (descriptor["id"] != descriptor_id or descriptor["principal_id"] != value["principal_id"]
+            or descriptor["canonical_ref"] != state.canonical_ref):
+            _fail("branch descriptor does not match default-branch principal")
+        from validation import capability_allowed
+        if not capability_allowed(descriptor["capabilities"]["admin"], descriptor["restrictions"]["admin"], b""):
+            _fail("branch creation requires root admin capability")
+        return
     fields = {"principal_id", "canonical_frontier", "views"}
     value = _exact(payload, fields, "policy_transition payload")
     _string(value["principal_id"], "policy principal")
@@ -750,6 +838,7 @@ def apply_record(
             _fail("import is not the first record")
         state.canonical_ref = payload["canonical_ref"]
         state.canonical_tip = payload["canonical_tip"]
+        state.canonical_refs = {state.canonical_ref: state.canonical_tip}
         state.canonical_packs = [copy.deepcopy(payload["canonical_pack"])]
         for claim in _claims(payload["change_claims"]):
             state.change_claims[claim["change_id"]] = {
@@ -817,6 +906,7 @@ def apply_record(
                 }
         state.canonical_packs.append(copy.deepcopy(payload["canonical_pack"]))
         state.canonical_tip = payload["canonical_new"]
+        state.canonical_refs[state.canonical_ref] = state.canonical_tip
         for active in state.active_views.values():
             active["canonical_frontier"] = payload["canonical_new"]
         state.requests.setdefault(request, []).append(record["event_id"])
@@ -833,6 +923,7 @@ def apply_record(
             _fail("canonical update commits do not end at new tip")
         state.canonical_packs.append(copy.deepcopy(payload["canonical_pack"]))
         state.canonical_tip = payload["canonical_new"]
+        state.canonical_refs[state.canonical_ref] = state.canonical_tip
         for active in state.active_views.values():
             active["canonical_frontier"] = payload["canonical_new"]
         for commit in commits:
@@ -842,6 +933,16 @@ def apply_record(
                     "owner_principal_id": None,
                     "canonical_ref": payload["canonical_ref"],
                 }
+    elif kind == "branch_create":
+        ref = payload["branch_ref"]
+        source = payload["source_ref"]
+        if state.canonical_refs.get(source) != payload["canonical_tip"]:
+            _fail("branch source does not exist at the pinned tip")
+        if ref in state.canonical_refs or any(existing.startswith(ref + "/") or ref.startswith(existing + "/") for existing in state.canonical_refs):
+            _fail("branch destination conflicts with an existing ref")
+        if len(state.canonical_refs) >= MAX_BRANCH_REFS:
+            _fail("repository branch ref quota is exhausted")
+        state.canonical_refs[ref] = payload["canonical_tip"]
     else:
         if payload["canonical_frontier"] != state.canonical_tip:
             _fail("policy transition is not at the current canonical tip")
@@ -898,6 +999,9 @@ def validate_record_objects(record: dict, canonical_repo, view_repo=None) -> Non
     if kind == "import":
         if git(canonical_repo, "cat-file", "-e", f"{payload['canonical_tip']}^{{commit}}", check=False).returncode:
             _fail("import canonical tip is missing from canonical packs")
+    elif kind == "branch_create":
+        if git(canonical_repo, "cat-file", "-e", f"{payload['canonical_tip']}^{{commit}}", check=False).returncode:
+            _fail("branch tip is missing from canonical packs")
     elif kind == "submission":
         canonical = first_parent_commits(canonical_repo, payload["canonical_old"], payload["canonical_new"])
         mappings = payload["mappings"]

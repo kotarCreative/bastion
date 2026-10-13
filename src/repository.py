@@ -536,6 +536,7 @@ class Repository:
             state.head_seq != manifest.head_seq
             or state.canonical_ref != manifest.canonical_ref
             or state.canonical_tip != manifest.canonical_tip
+            or dict(state.canonical_refs) != dict(manifest.canonical_refs or {})
             or list(state.canonical_packs) != list(manifest.canonical_packs)
             or head_record != manifest.wal_head.to_dict()
         ):
@@ -668,6 +669,7 @@ class Repository:
             previous.revision + 1,
             int(time.time()),
             writer,
+            canonical_refs=dict(state.canonical_refs),
         )
 
     def _resolve_ambiguous(self, old_head: int, publication_id: str) -> int | None:
@@ -827,6 +829,7 @@ class Repository:
                 1,
                 int(time.time()),
                 self.writer,
+                canonical_refs=dict(state.canonical_refs),
             )
             try:
                 checkpoint(self.root, "wal.manifest_cas_sending")

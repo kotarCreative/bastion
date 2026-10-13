@@ -23,7 +23,9 @@ from service import (
     add_team as _add_team,
     add_view as _add_view,
     bind_role as _bind_role,
+    create_branch as _create_branch,
     init_forge,
+    list_branches as _list_branches,
     sync_view,
     transition_principal,
     update_canonical_ref,
@@ -119,6 +121,18 @@ def parser() -> argparse.ArgumentParser:
     add.add_argument("name")
     add.add_argument("--principal", required=True)
     add.add_argument("--branch", default="main")
+    create_branch = commands.add_parser("create-branch")
+    create_branch.add_argument("root", type=Path)
+    create_branch.add_argument("branch")
+    create_branch.add_argument("--principal", required=True)
+    create_branch.add_argument(
+        "--from", dest="source_branch", help="source branch (default: configured default branch)"
+    )
+    list_branches = commands.add_parser(
+        "list-branches",
+        help="operator-only inventory of canonical branches (not a public authorization API)",
+    )
+    list_branches.add_argument("root", type=Path)
     sync = commands.add_parser("sync")
     sync.add_argument("root", type=Path)
     sync.add_argument("name")
@@ -266,6 +280,13 @@ def main() -> int:
                 _bind_role(args.root, args.role, "team", args.team)
         elif args.command == "add-view":
             add_view(args.root, args.name, args.principal, args.branch)
+        elif args.command == "create-branch":
+            import json as _json
+            print(_json.dumps(_create_branch(args.root, args.branch, args.principal, args.source_branch), sort_keys=True))
+        elif args.command == "list-branches":
+            import json as _json
+            for record in _list_branches(args.root):
+                print(_json.dumps(record, sort_keys=True))
         elif args.command == "sync":
             sync_view(args.root, args.name)
         elif args.command == "check":

@@ -24,8 +24,11 @@ The event fingerprint makes retries deterministic. An optional HTTP idempotency 
 - `submission`: canonical transition, exact submitted evidence, mappings, transport identity, and optional idempotency hash.
 - `canonical_update`: authorized administrative fast-forward, captured descriptor identity, canonical pack, and received-at timestamp.
 - `policy_transition`: atomic descriptor and projection-epoch changes for all active views of one principal.
+- `branch_create`: root-administrator creation of an internal canonical ref at an existing canonical tip, capturing principal, descriptor, source ref, destination ref, tip, and receipt time. It does not upload a pack or claim `Change-Id` ownership.
 
-Each record has an exact validated shape, contiguous sequence, previous-record pointer, publication ID, event fingerprint, and event ID. This greenfield implementation intentionally omits format-version fields because no legacy formats exist.
+Each record has an exact validated shape, contiguous sequence, previous-record pointer, publication ID, event fingerprint, and event ID. Existing immutable records are unchanged. Manifests now carry a plain-dict `canonical_refs` mapping of full branch refs to SHA-1 tips; `canonical_ref` and `canonical_tip` remain default-branch aliases. Legacy manifests synthesize a singleton mapping when read and are upgraded on the next publication.
+
+The branch foundation is internal/operator-only. Public clone, fetch, push, and browser projection continue to expose only the default branch. Feature branch transport/projection, deletion, merge, and PR workflows are not implemented. End-user branching requires explicit repository viewing permissions and a separately designed branch-scoped authorization/projection contract before clients can discover or access non-default refs.
 
 ## Descriptor Capture
 

@@ -653,6 +653,121 @@ def update_canonical_ref(root: Path, expected: str, new: str, principal_id: str)
     repository.publish(build)
 
 
+def list_branches(root: Path) -> list[dict]:
+    """Return canonical branch inventory from durable WAL-backed truth."""
+    repository = Repository.open(root)
+    manifest, _version, _replay = repository.load()
+    default = manifest.canonical_ref
+    return [
+        {
+            "branch": reference.removeprefix("refs/heads/"),
+            "ref": reference,
+            "tip": tip,
+            "default": reference == default,
+        }
+        for reference, tip in sorted(manifest.canonical_refs.items())
+    ]
+
+
+def create_branch(
+    root: Path, branch: str, principal_id: str, source_branch: str | None = None
+) -> dict:
+    """Create a pinned canonical branch, authorized only by root-admin policy."""
+    from wal import validate_branch_ref
+
+    if not isinstance(branch, str):
+        raise ForgeError("invalid branch name: expected text")
+    try:
+        branch_ref = validate_branch_ref(
+            branch if branch.startswith("refs/") else f"refs/heads/{branch}"
+        )
+    except (ForgeError, ValueError, TypeError) as error:
+        raise ForgeError(f"invalid branch name: {branch}") from error
+    source_name = source_branch
+    if source_name is None:
+        state = load_state(root)
+        source_name = state.get("canonical_branch")
+    if not isinstance(source_name, str):
+        raise ForgeError("invalid source branch: expected text")
+    try:
+        source_ref = validate_branch_ref(
+            source_name if source_name.startswith("refs/") else f"refs/heads/{source_name}"
+        )
+    except (ForgeError, ValueError, TypeError) as error:
+        raise ForgeError(f"invalid source branch: {source_name}") from error
+    if branch_ref == source_ref:
+        raise ForgeError("branch already exists", "conflict")
+    repository = Repository.open(root)
+    with locked(root) as state:
+        if state.get("repository_state") != "ready":
+            raise ForgeError("forge initialization is incomplete")
+        # Capture the immutable descriptor from one locked catalog snapshot.
+        descriptor = identity.effective_descriptor(
+            state, principal_id, f"refs/heads/{state['canonical_branch']}"
+        )
+        if not capability_allowed(
+            descriptor["capabilities"]["admin"], descriptor["restrictions"]["admin"], b""
+        ):
+            raise ForgeError("repository owner permission is required", "policy")
+    manifest, _version, replay = repository.load()
+    # A prior matching commit is authoritative even if the source has since
+    # moved. A destination is never silently re-pointed by a retry.
+    prior = [
+        event
+        for event in replay.records
+        if event.get("kind") == "branch_create"
+        and event.get("payload", {}).get("branch_ref") == branch_ref
+    ]
+    if prior:
+        payload = prior[-1]["payload"]
+        if (
+            payload.get("principal_id") == principal_id
+            and payload.get("descriptor_id") == descriptor["id"]
+            and payload.get("source_ref") == source_ref
+        ):
+            return {
+                "branch": branch_ref.removeprefix("refs/heads/"),
+                "ref": branch_ref,
+                "tip": payload["canonical_tip"],
+                "created": False,
+            }
+        raise ForgeError("branch already exists", "conflict")
+    source_tip = manifest.canonical_refs.get(source_ref)
+    if source_tip is None:
+        raise ForgeError("source branch does not exist", "conflict")
+    received_at = int(time.time())
+    fingerprint_payload = {
+        "principal_id": principal_id, "descriptor_id": descriptor["id"],
+        "source_ref": source_ref, "branch_ref": branch_ref, "canonical_tip": source_tip,
+    }
+    fingerprint = record_fingerprint(
+        repository.repository_id, "branch_create", fingerprint_payload
+    )
+
+    def build(current_manifest, current_replay):
+        existing = current_replay.events.get(event_id(fingerprint))
+        if existing is not None:
+            return AlreadyCommitted(existing["seq"])
+        if current_manifest.canonical_refs.get(source_ref) != source_tip:
+            raise ForgeError("source branch changed before branch creation", "conflict")
+        if branch_ref in current_manifest.canonical_refs:
+            raise ForgeError("branch already exists", "conflict")
+        payload = {**fingerprint_payload, "received_at": received_at}
+        return Candidate(
+            fingerprint,
+            payload,
+            (lambda target: target.put_descriptor(descriptor),),
+        )
+
+    repository.publish(build)
+    return {
+        "branch": branch_ref.removeprefix("refs/heads/"),
+        "ref": branch_ref,
+        "tip": source_tip,
+        "created": True,
+    }
+
+
 def transition_principal(root: Path, principal_id: str) -> None:
     """Publish one epoch transition for every active view of a principal."""
     with locked(root) as state:

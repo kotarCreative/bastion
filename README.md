@@ -45,6 +45,33 @@ short-lived view-scoped API tokens.
 - [Alchemy deployment evaluation](docs/ALCHEMY_EVALUATION.md)
 - [Roadmap](ROADMAP.md)
 
+### Canonical branch foundation (operator-only)
+
+Bastion provides an internal, WAL-backed inventory of canonical branches.
+Trusted local/server operators can list the canonical inventory; creating a
+branch at an existing canonical tip additionally verifies the specified
+principal's root-administrator descriptor. This is an operator foundation
+only: Git clients, browser
+views, and clone/fetch/push still expose the default branch only. Review/PR
+workflows are not implemented. It does not implement client-created feature
+branches, branch deletion or merging, or GitHub-compatible branching. The
+canonical inventory is limited to 1,024 branches including the default.
+
+For a hosted repository, run from the host CLI but pass the **repository root**
+(not the host root); `owner` is the configured owner principal:
+
+```sh
+python forge.py create-branch /path/to/host/repos/OWNER/REPO feature/login --principal owner
+python forge.py create-branch /path/to/host/repos/OWNER/REPO release/v1 --principal owner --from main
+python forge.py list-branches /path/to/host/repos/OWNER/REPO
+```
+
+For a locally initialized single-repository forge, substitute its root path and
+the actual configured root-administrator principal ID. These are operator
+commands, not end-user Git branch commands. See
+[Transactions](docs/TRANSACTIONS.md) and the
+[branch foundation spec](.specs/018-multi-branch-foundation.md).
+
 ## Multi-repository hosting
 
 The primary hosted application uses [Cloudflare](deployment/cloudflare/README.md):

@@ -251,16 +251,20 @@ def _install_intake_hooks(root: Path, view_id: str, intake: Path) -> None:
 
 
 def _canonical_cursor(manifest: Manifest) -> dict:
-    """Canonical content identity: the projected tip, not the WAL head.
+    """Canonical content identity across all advertised branches.
 
-    Canonical materialization is a pure function of ``canonical_tip``;
-    unrelated WAL appends (view creation, policy transitions, hidden-only
-    canonical commits) do not change canonical content and must not
-    invalidate the generation.
+    Canonical materialization is a pure function of the advertised ref map;
+    unrelated WAL appends (view creation and policy transitions) do not
+    change canonical content. Canonical commits, including hidden-only ones,
+    do change the advertised tip/ref map and invalidate this generation.
     """
+    refs = dict(manifest.canonical_refs)
+    # Manifests written before multi-branch support normalize to the default
+    # singleton in Manifest.__post_init__/from_dict.
     return {
         "canonical_ref": manifest.canonical_ref,
         "canonical_tip": manifest.canonical_tip,
+        "canonical_refs": refs,
     }
 
 
@@ -268,7 +272,7 @@ def _valid_canonical(path: Path, manifest: Manifest) -> bool:
     cursor = _read_cursor(path)
     if cursor != _canonical_cursor(manifest):
         return False
-    if ref(path, manifest.canonical_ref) != manifest.canonical_tip or not _uses_repository_hooks(path):
+    if not _canonical_refs_match(path, manifest) or not _uses_repository_hooks(path):
         return False
     hook = path / "hooks" / "pre-receive"
     try:
@@ -284,7 +288,7 @@ def _light_valid_canonical(path: Path, manifest: Manifest) -> bool:
     cursor = _read_cursor(path)
     if cursor != _canonical_cursor(manifest):
         return False
-    if ref(path, manifest.canonical_ref) != manifest.canonical_tip:
+    if not _canonical_refs_match(path, manifest):
         return False
     if not _uses_repository_hooks(path):
         return False
@@ -294,6 +298,26 @@ def _light_valid_canonical(path: Path, manifest: Manifest) -> bool:
             return False
     except OSError:
         return False
+    return True
+
+
+def _canonical_refs_match(path: Path, manifest: Manifest) -> bool:
+    expected = dict(manifest.canonical_refs)
+    refs = git(path, "for-each-ref", "--format=%(refname)", check=False)
+    if refs.returncode:
+        return False
+    advertised = refs.stdout.decode().splitlines()
+    if advertised != sorted(expected):
+        return False
+    head = git(path, "symbolic-ref", "HEAD", check=False)
+    if head.returncode or head.stdout.decode().strip() != manifest.canonical_ref:
+        return False
+    for name, tip in expected.items():
+        if ref(path, name) != tip:
+            return False
+        object_type = git(path, "cat-file", "-t", tip, check=False)
+        if object_type.returncode or object_type.stdout.decode().strip() != "commit":
+            return False
     return True
 
 
@@ -352,8 +376,11 @@ def ensure_canonical_materialized(
                 required = list(manifest.canonical_packs)
             for pack in required:
                 install_pack(repository, pack, generation / "objects")
-            git(generation, "update-ref", manifest.canonical_ref, manifest.canonical_tip)
+            for canonical_ref, tip in manifest.canonical_refs.items():
+                git(generation, "update-ref", canonical_ref, tip)
             git(generation, "symbolic-ref", "HEAD", manifest.canonical_ref)
+            if not _canonical_refs_match(generation, manifest):
+                raise ForgeError("canonical materialization has an invalid ref inventory", "integrity")
             if git(generation, "fsck", "--full", "--strict", check=False).returncode:
                 raise ForgeError("canonical materialization failed Git fsck", "integrity")
             _write_cursor(generation, _canonical_cursor(manifest))

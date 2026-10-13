@@ -2545,6 +2545,8 @@ def _backup_repository(
             pack_refs.append(payload["canonical_pack"])
         elif record["kind"] == "view_create":
             descriptor_ids.add(payload["descriptor_id"])
+        elif record["kind"] == "branch_create":
+            descriptor_ids.add(payload["descriptor_id"])
         elif record["kind"] == "submission":
             descriptor_ids.add(payload["descriptor_id"])
             pack_refs.extend((payload["canonical_pack"], payload["submission_pack"]))
@@ -2647,7 +2649,7 @@ def _backup_repository(
             raise ForgeError(
                 "backup database belongs to a different repository", "integrity"
             )
-        if fence["canonical_branch"] != manifest.canonical_ref.split("/")[-1]:
+        if fence["canonical_branch"] != manifest.canonical_ref.removeprefix("refs/heads/"):
             raise ForgeError(
                 "backup database branch differs from the pinned manifest", "integrity"
             )

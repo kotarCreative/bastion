@@ -466,8 +466,11 @@ def check_invariants(root: Path) -> None:
     try:
         with _temp_repository(root, manifest.canonical_ref.split("/")[-1]) as canonical:
             _install_canonical_packs(repository, replay, canonical)
-            git(canonical, "update-ref", manifest.canonical_ref, manifest.canonical_tip)
+            for canonical_ref, tip in manifest.canonical_refs.items():
+                git(canonical, "update-ref", canonical_ref, tip)
             git(canonical, "symbolic-ref", "HEAD", manifest.canonical_ref)
+
+            running_refs: dict[str, str] = {}
 
             running_views: dict[str, dict] = {}
             for record in replay.records:
@@ -532,6 +535,8 @@ def check_invariants(root: Path) -> None:
                         _fail("AUTHORIZATION", record["seq"], "submission descriptor generation does not match active view")
                     if payload["projection_epoch"] != active["projection_epoch"]:
                         _fail("AUTHORIZATION", record["seq"], "submission projection epoch does not match active view")
+                    if running_refs.get(payload["canonical_ref"]) != payload["canonical_old"]:
+                        _fail("GRAPH", record["seq"], "submission does not extend the independently replayed branch tip")
                     view_temp = active["_temp_repo"]
                     with _temp_repository(root, payload["projected_ref"].split("/")[-1]) as sub:
                         (sub / "objects" / "info").mkdir(parents=True, exist_ok=True)
@@ -550,7 +555,10 @@ def check_invariants(root: Path) -> None:
                     for view_id, active in running_views.items():
                         active["canonical_frontier"] = payload["canonical_new"]
                         _advance_view_for_record(record, view_id, active, canonical, repository)
+                    running_refs[payload["canonical_ref"]] = payload["canonical_new"]
                 elif kind == "canonical_update":
+                    if running_refs.get(payload["canonical_ref"]) != payload["canonical_old"]:
+                        _fail("GRAPH", record["seq"], "canonical update does not extend the independently replayed branch tip")
                     _validate_record_graph(record, canonical)
                     descriptor = _descriptor_for_record(repository, record)
                     _check_descriptor_provenance(
@@ -560,12 +568,46 @@ def check_invariants(root: Path) -> None:
                     for view_id, active in running_views.items():
                         active["canonical_frontier"] = payload["canonical_new"]
                         _advance_view_for_record(record, view_id, active, canonical, repository)
+                    running_refs[payload["canonical_ref"]] = payload["canonical_new"]
                 elif kind == "import":
                     _validate_record_graph(record, canonical)
+                    if running_refs:
+                        _fail("GRAPH", record["seq"], "import is not the first canonical event")
+                    running_refs[payload["canonical_ref"]] = payload["canonical_tip"]
+                elif kind == "branch_create":
+                    source = payload["source_ref"]
+                    destination = payload["branch_ref"]
+                    tip = payload["canonical_tip"]
+                    descriptor = _descriptor_for_record(repository, record)
+                    _check_descriptor_provenance(
+                        record, descriptor, payload["principal_id"], manifest.canonical_ref
+                    )
+                    if not capability_allowed(
+                        descriptor["capabilities"]["admin"],
+                        descriptor["restrictions"]["admin"], b"",
+                    ):
+                        _fail("AUTHORIZATION", record["seq"], "branch creation requires root admin capability")
+                    if running_refs.get(source) != tip:
+                        _fail("GRAPH", record["seq"], "branch source does not match its pinned tip")
+                    if destination in running_refs or any(
+                        existing.startswith(destination + "/")
+                        or destination.startswith(existing + "/")
+                        for existing in running_refs
+                    ):
+                        _fail("AUTHORIZATION", record["seq"], "branch destination conflicts with an existing ref")
+                    if not destination.startswith("refs/heads/") or git(
+                        canonical, "check-ref-format", destination, check=False
+                    ).returncode:
+                        _fail("AUTHORIZATION", record["seq"], "branch destination is not a valid Git branch ref")
+                    _require_object_type(canonical, tip, "commit")
+                    running_refs[destination] = tip
 
             recomputed_claims = _recompute_change_claims(replay)
             if recomputed_claims != replay.change_claims:
                 _fail("METADATA", "change_claims", "replayed Change-Id ownership differs from record")
+
+            if running_refs != dict(manifest.canonical_refs):
+                _fail("GRAPH", "canonical_refs", "replayed branch map differs from manifest")
 
             for view_id, temp in view_temp_repos.items():
                 active = replay.active_views[view_id]
