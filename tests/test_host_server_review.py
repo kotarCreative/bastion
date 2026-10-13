@@ -59,7 +59,7 @@ def test_serve_migrates_existing_v1_without_initializing_unknown_roots(tmp_path)
     host = Host(tmp_path / "host")
     aid = host.approve_account("alice", ["alice@example.test"])
     with host._connect() as con:
-        for table in ("host_sessions", "host_settings", "membership_intents"):
+        for table in ("host_sessions", "host_settings", "membership_intents", "import_tokens"):
             con.execute(f"DROP TABLE {table}")
         con.execute("UPDATE schema_info SET version=1")
     assert create_app(host.root).test_client().get("/api/v1/auth/config").status_code == 200
@@ -106,7 +106,7 @@ def test_scoped_credential_revocation_preserves_token_id_grammar(hosted):
 
 
 def test_shared_git_and_source_admission_cannot_be_reset_by_repository_url(hosted, monkeypatch):
-    import demo_server
+    import repository_server
     import limits
     from http_server import add_token
     host, alice, bob, repo, app, client, at, bt, ui = hosted
@@ -130,7 +130,7 @@ def test_shared_git_and_source_admission_cannot_be_reset_by_repository_url(hoste
         entered.set()
         assert release.wait(10)
         return subprocess.CompletedProcess([], 0, b"", b"")
-    monkeypatch.setattr(demo_server, "run_service", blocked_service)
+    monkeypatch.setattr(repository_server, "run_service", blocked_service)
     monkeypatch.setattr(limits, "MAX_ACTIVE_PER_IP", 1)
     def first_request():
         with app.test_client() as threaded_client:

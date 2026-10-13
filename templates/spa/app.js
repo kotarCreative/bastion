@@ -17,6 +17,11 @@
   var selectionRun = 0;
   var createRequestId = null;
   var createPending = false;
+  var importRequest = null;
+  var importRun = 0;
+  var importPending = false;
+  var importLimits = null;
+  var loadPendingImports = null;
   var authGeneration = 0;
   var session = null;
   var clerk = null;
@@ -73,6 +78,24 @@
     createForm: document.getElementById("create-repository"),
     createName: document.getElementById("new-repository-name"),
     createError: document.getElementById("create-error"),
+    approveForm: document.getElementById("approve-account"),
+    approveOwner: document.getElementById("approve-owner"),
+    approveEmail: document.getElementById("approve-email"),
+    approveStatus: document.getElementById("approve-status"),
+    importForm: document.getElementById("import-repository"),
+    importName: document.getElementById("import-repository-name"),
+    importBranch: document.getElementById("import-branch"),
+    importStatus: document.getElementById("import-status"),
+    importError: document.getElementById("import-error"),
+    importRetry: document.getElementById("import-retry"),
+    importInstructions: document.getElementById("import-instructions"),
+    importCommands: document.getElementById("import-commands"),
+    importSecret: document.getElementById("import-secret"),
+    importCopy: document.getElementById("import-copy"),
+    importReveal: document.getElementById("import-reveal"),
+    importCheck: document.getElementById("import-check"),
+    importRotate: document.getElementById("import-rotate"),
+    importList: document.getElementById("import-list"),
     repositoryListNav: document.getElementById("repository-list-nav"),
   };
 
@@ -183,8 +206,15 @@
     credential = null;
     hostCredential = null;
     hostAccount = null;
+    if (ELEMENTS.approveForm) {
+      ELEMENTS.approveForm.hidden = true;
+      ELEMENTS.approveOwner.value = ""; ELEMENTS.approveEmail.value = ""; ELEMENTS.approveStatus.textContent = "";
+      var approvalButton = ELEMENTS.approveForm.querySelector && ELEMENTS.approveForm.querySelector("button[type=submit]");
+      if (approvalButton) approvalButton.disabled = false;
+    }
     session = null;
     repositories = []; createRequestId = null; createPending = false;
+    clearImportState();
     historyRendered = false;
     treeRun += 1;
     treeState = { stack: [], entries: [], cursor: null, loading: false };
@@ -218,6 +248,22 @@
     clearChildren(ELEMENTS.readmeContent);
     ELEMENTS.fileViewer.hidden = true;
     ELEMENTS.readmePanel.hidden = true;
+  }
+
+  function clearImportState() {
+    importRun += 1; importRequest = null; importPending = false;
+    if (ELEMENTS.importName) ELEMENTS.importName.value = "";
+    if (ELEMENTS.importBranch) ELEMENTS.importBranch.value = "main";
+    if (ELEMENTS.importSecret) { ELEMENTS.importSecret.value = ""; ELEMENTS.importSecret.type = "password"; }
+    if (ELEMENTS.importReveal) ELEMENTS.importReveal.textContent = "Show credential";
+    if (ELEMENTS.importCopy) ELEMENTS.importCopy.textContent = "Copy import credential";
+    if (ELEMENTS.importCommands) ELEMENTS.importCommands.textContent = "";
+    if (ELEMENTS.importInstructions) ELEMENTS.importInstructions.hidden = true;
+    if (ELEMENTS.importList) clearChildren(ELEMENTS.importList);
+    if (ELEMENTS.importStatus) { ELEMENTS.importStatus.textContent = ""; clearChildren(ELEMENTS.importStatus); }
+    if (ELEMENTS.importError) ELEMENTS.importError.textContent = "";
+    if (ELEMENTS.importRetry) ELEMENTS.importRetry.hidden = true;
+    if (ELEMENTS.importForm) { var button = ELEMENTS.importForm.querySelector && ELEMENTS.importForm.querySelector("button[type=submit]"); if (button) button.disabled = false; }
   }
 
   function clearRepositorySession() {
@@ -271,6 +317,7 @@
   }
 
   function renderRepositories() {
+    if (ELEMENTS.approveForm) ELEMENTS.approveForm.hidden = !(hostAccount && hostAccount.is_host_admin);
     if (!hostCredential) return;
     var run = ++hostRun, selection = selectionRun;
     ELEMENTS.hostDashboard.hidden = false; ELEMENTS.workspace.hidden = true;
@@ -287,6 +334,7 @@
         var open = textButton("primary-button", "Open repository"); open.addEventListener("click", function () { openHostedRepository(repo); });
         card.appendChild(open); ELEMENTS.repositoryList.appendChild(card);
       });
+      if (importLimits && loadPendingImports) loadPendingImports(run, selection);
     }).catch(function () { if (run === hostRun && selection === selectionRun && hostCredential && !session) {
       ELEMENTS.hostMessage.textContent = "Repositories are unavailable. ";
       var retry = textButton("quiet-button", "Retry"); retry.addEventListener("click", renderRepositories); ELEMENTS.hostMessage.appendChild(retry);
@@ -1368,6 +1416,9 @@
 
   function configureClerk(config) {
     hostMode = config.mode === "host";
+    importLimits = hostMode && config.import_mode === "first-push" && config.import_limits && Number.isSafeInteger(config.import_limits.pack_bytes) && config.import_limits.pack_bytes > 0 ? config.import_limits : null;
+    if (ELEMENTS.importForm) ELEMENTS.importForm.hidden = !hostMode || !importLimits;
+    if (hostMode && !importLimits) ELEMENTS.importStatus.textContent = "First-push import is unavailable on this server.";
     if (!config.enabled) return Promise.resolve();
     ELEMENTS.clerkAuth.hidden = false;
     ELEMENTS.sessionNote.textContent = "Authentication, recovery, MFA, and account security are managed by Clerk.";
@@ -1418,6 +1469,7 @@
         return;
       }
       if (hostMode && result.body.account) {
+        if (hostCredential && hostCredential !== token) clearImportState();
         hostCredential = token; hostAccount = result.body.account; ELEMENTS.tokenInput.value = ""; ELEMENTS.identity.textContent = result.body.account.owner_name; ELEMENTS.identity.hidden = false; ELEMENTS.logout.hidden = false; ELEMENTS.login.hidden = true; ELEMENTS.homepage.hidden = true; ELEMENTS.homeNav.hidden = true; ELEMENTS.sessionNav.hidden = false; renderRepositories(); return;
       }
       openSession(token, result.body);
@@ -1474,6 +1526,151 @@
     }).catch(function () { if (hostCredential === creatingHost && !session && !ELEMENTS.hostDashboard.hidden) ELEMENTS.createError.textContent = "Repository creation failed. Retry safely; the same request will be reused."; })
       .then(function () { if (hostCredential === creatingHost) { createPending = false; if (createButton) createButton.disabled = false; } });
   });
+  if (ELEMENTS.approveForm) ELEMENTS.approveForm.addEventListener("submit", function (event) {
+    event.preventDefault();
+    if (!hostCredential || !hostAccount || !hostAccount.is_host_admin) return;
+    var token = hostCredential, generation = authGeneration;
+    var owner = ELEMENTS.approveOwner.value.trim(), email = ELEMENTS.approveEmail.value.trim();
+    var button = ELEMENTS.approveForm.querySelector && ELEMENTS.approveForm.querySelector("button[type=submit]");
+    if (button && button.disabled) return;
+    if (button) button.disabled = true;
+    ELEMENTS.approveStatus.textContent = "Approving account…";
+    function active() { return hostCredential === token && authGeneration === generation; }
+    request("/api/v1/host/accounts", { host: true, method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ owner_name: owner, email: email }) }).then(function (result) {
+      if (!active()) return;
+      ELEMENTS.approveStatus.textContent = result.status === 201 ? "Account approved. They can sign in; repository access still requires an invitation." : "Approval failed. Check the name and email, then retry.";
+    }).catch(function () { if (active()) ELEMENTS.approveStatus.textContent = "Approval unavailable. Retry with the same name and email."; })
+      .then(function () { if (active() && button) button.disabled = false; });
+  });
+  if (ELEMENTS.importForm) {
+    ELEMENTS.importName.addEventListener("input", invalidateImportIntent);
+    ELEMENTS.importBranch.addEventListener("input", invalidateImportIntent);
+    function invalidateImportIntent() {
+      importRun += 1; importRequest = null; importPending = false;
+      ELEMENTS.importSecret.value = ""; ELEMENTS.importCommands.textContent = ""; ELEMENTS.importInstructions.hidden = true;
+      ELEMENTS.importSecret.type = "password"; ELEMENTS.importReveal.textContent = "Show credential";
+      ELEMENTS.importCopy.textContent = "Copy import credential";
+      setImport("", "");
+    }
+    function importActive(run, token, auth) { return run === importRun && token === hostCredential && auth === authGeneration && Boolean(token); }
+    function setImport(status, error) {
+      clearChildren(ELEMENTS.importStatus); ELEMENTS.importStatus.textContent = status || ""; ELEMENTS.importError.textContent = error || "";
+      ELEMENTS.importRetry.hidden = !error;
+      var submit = ELEMENTS.importForm.querySelector && ELEMENTS.importForm.querySelector("button[type=submit]");
+      if (submit) submit.disabled = importPending;
+      ELEMENTS.importCheck.disabled = importPending;
+      ELEMENTS.importRotate.disabled = importPending;
+    }
+    function showPushInstructions(op) {
+      ELEMENTS.importInstructions.hidden = false;
+      var remote = new URL(op.git_url, window.location.href);
+      if (remote.origin !== new URL(window.location.href).origin || !/^https?:$/.test(remote.protocol)) throw new Error("invalid-remote");
+      var branchArg = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(op.branch) ? op.branch : "'" + op.branch.replace(/'/g, "'\\''") + "'";
+      ELEMENTS.importCommands.textContent = "git config --global credential.useHttpPath true\ngit remote add bastion " + remote.href + "\ngit push bastion " + branchArg;
+      setImport("Awaiting first push: " + op.name + " / " + op.branch, "");
+    }
+    function importAction(action) {
+      if (!hostCredential || !hostMode || !importLimits || importPending) return;
+      var name = ELEMENTS.importName.value.trim(), branch = ELEMENTS.importBranch.value.trim();
+      if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(name)) return setImport("", "Use a lowercase repository name with letters, numbers, and hyphens.");
+      if (!/^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/.test(branch) || branch.includes("..") || branch.endsWith("/") || branch.includes("//")) return setImport("", "Enter a valid Git branch name (up to 128 characters).");
+      var token = hostCredential, auth = authGeneration, run = ++importRun;
+      var intent = importRequest && importRequest.name === name && importRequest.branch === branch
+        ? importRequest : { name: name, branch: branch, requestId: null, importId: null, operation: null, retry: "reserve" };
+      importRequest = intent;
+      function active() { return importActive(run, token, auth) && importRequest === intent && ELEMENTS.importName.value.trim() === name && ELEMENTS.importBranch.value.trim() === branch; }
+      importPending = true; setImport("Preparing first push…", "");
+      function fail(message, retry) { if (!active()) return; importPending = false; intent.retry = retry; setImport("", message); }
+      function done(op) {
+        if (!active() || !op || typeof op.state !== "string") throw new Error("invalid-operation");
+        intent.operation = op; importPending = false;
+        if (op.state === "ready" && op.repo) {
+          ELEMENTS.importSecret.value = ""; ELEMENTS.importInstructions.hidden = true;
+          ELEMENTS.importCommands.textContent = ""; importRequest = null;
+          setImport("Ready: " + (op.repo.owner_name || "") + " / " + op.repo.name, "");
+          if (!session && !ELEMENTS.hostDashboard.hidden) renderRepositories();
+        } else {
+          showPushInstructions(op);
+          if (op.state === "failed") setImport("Initial push was rejected.", "Correct the source and retry the Git push. If validation already pinned the source, retry that same branch tip.");
+          else if (["uploaded", "validating", "provisioning"].includes(op.state)) setImport("First push is processing. Check status or retry the same Git push after a lost response.", "");
+          intent.retry = "status";
+        }
+      }
+      function issue() {
+        if (!active()) return;
+        importPending = true; ELEMENTS.importSecret.value = ""; setImport("Issuing import credential…", "");
+        ELEMENTS.importSecret.type = "password"; ELEMENTS.importReveal.textContent = "Show credential";
+        request("/api/v1/imports/" + encodeURIComponent(intent.importId) + "/credentials", { host: true, method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }).then(function (r) {
+          if (!active()) return;
+          if (r.status !== 201 || !r.body || typeof r.body.credential !== "string") throw new Error("credential");
+          importPending = false; intent.retry = "status"; ELEMENTS.importSecret.value = r.body.credential;
+          showPushInstructions(intent.operation);
+        }).catch(function () { fail("Credential issuance failed or its response was lost. Retry to generate a replacement; the old credential will be invalidated.", "credential"); });
+      }
+      if (intent.importId) {
+        if (action === "credential" || action === "retry" && intent.retry === "credential") { issue(); return; }
+        request("/api/v1/imports/" + encodeURIComponent(intent.importId), { host: true }).then(function (r) {
+          if (!active()) return;
+          if (r.status !== 200 || !r.body || !r.body.import) throw new Error("status");
+          done(r.body.import);
+        }).catch(function () { fail("Import status is unavailable. Retry safely without creating another repository.", "status"); });
+        return;
+      }
+      if (!intent.requestId) {
+        try {
+          if (window.crypto && window.crypto.randomUUID) intent.requestId = window.crypto.randomUUID();
+          else if (window.crypto && window.crypto.getRandomValues) { var random = new Uint8Array(16); window.crypto.getRandomValues(random); intent.requestId = Array.prototype.map.call(random, function (b) { return b.toString(16).padStart(2, "0"); }).join(""); }
+          else throw new Error("secure-random-unavailable");
+        } catch (_) { fail("Secure request IDs are unavailable. Use a current browser over HTTPS.", "reserve"); return; }
+      }
+      request("/api/v1/imports", { host: true, method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: name, branch: branch, request_id: intent.requestId }) }).then(function (r) {
+        if (!active()) return;
+        if (r.status !== 201 || !r.body || !r.body.import || !r.body.import.import_id) throw new Error("reserve");
+        intent.importId = r.body.import.import_id;
+        done(r.body.import);
+        if (active() && intent.operation.state !== "ready") issue();
+      }).catch(function () { fail("Repository reservation failed. Retry safely to reuse the same request.", "reserve"); });
+    }
+    ELEMENTS.importForm.addEventListener("submit", function (event) { event.preventDefault(); importAction("prepare"); });
+    ELEMENTS.importRetry.addEventListener("click", function () { importAction("retry"); });
+    ELEMENTS.importCheck.addEventListener("click", function () { importAction("status"); });
+    ELEMENTS.importRotate.addEventListener("click", function () { importAction("credential"); });
+    ELEMENTS.importCopy.addEventListener("click", function () {
+      var secret = ELEMENTS.importSecret.value, token = hostCredential, run = importRun, auth = authGeneration;
+      if (!secret || !token || !navigator.clipboard) return;
+      navigator.clipboard.writeText(secret).then(function () {
+        if (importActive(run, token, auth)) ELEMENTS.importCopy.textContent = "Copied";
+      }).catch(function () { if (importActive(run, token, auth)) ELEMENTS.importCopy.textContent = "Copy unavailable"; });
+    });
+    ELEMENTS.importReveal.addEventListener("click", function () {
+      if (!hostCredential || !importRequest || !ELEMENTS.importSecret.value) return;
+      var reveal = ELEMENTS.importSecret.type === "password";
+      ELEMENTS.importSecret.type = reveal ? "text" : "password";
+      ELEMENTS.importReveal.textContent = reveal ? "Hide credential" : "Show credential";
+    });
+    loadPendingImports = function (listRun, selection) {
+      var token = hostCredential, auth = authGeneration;
+      function activeList() { return token === hostCredential && auth === authGeneration && listRun === hostRun && selection === selectionRun && !session && !ELEMENTS.hostDashboard.hidden; }
+      clearChildren(ELEMENTS.importList);
+      request("/api/v1/imports", { host: true }).then(function (r) {
+        if (!activeList()) return;
+        if (r.status !== 200 || !Array.isArray(r.body.imports)) throw new Error("imports");
+        r.body.imports.forEach(function (op) {
+          var card = element("article", "repository-card");
+          card.appendChild(element("h3", null, "Pending import: " + op.name));
+          card.appendChild(element("p", "hint", op.branch + " · " + op.state));
+          var resume = textButton("quiet-button", "Resume first push");
+          resume.addEventListener("click", function () {
+            if (!activeList()) return;
+            invalidateImportIntent(); ELEMENTS.importName.value = op.name; ELEMENTS.importBranch.value = op.branch;
+            importRequest = { name: op.name, branch: op.branch, requestId: null, importId: op.import_id, operation: op, retry: "status" };
+            showPushInstructions(op);
+          });
+          card.appendChild(resume); ELEMENTS.importList.appendChild(card);
+        });
+      }).catch(function () { if (activeList()) ELEMENTS.importList.textContent = "Pending imports are unavailable. Refresh the repository list to retry."; });
+    };
+  }
   document.getElementById("profile-nav").addEventListener("click", function () { showPanel("profile"); });
   ELEMENTS.treeMore.addEventListener("click", function () { loadDirectory(false); });
   document.getElementById("tree-mode").addEventListener("click", function (event) {

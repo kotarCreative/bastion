@@ -71,6 +71,21 @@ STDERR_KEEP_BYTES = 64 << 10
 BLOB_BATCH_OBJECTS = _limit("BASTION_BLOB_BATCH_OBJECTS", 50)
 BLOB_BATCH_BYTES = _limit("BASTION_BLOB_BATCH_BYTES", 8 << 20)
 
+# Self-service first-push imports. The internal envelope adds a bounded ref header.
+IMPORT_PACK_BYTES = _limit("BASTION_IMPORT_PACK_BYTES", 32 << 20)
+IMPORT_BUNDLE_BYTES = IMPORT_PACK_BYTES + 4096
+IMPORT_EXPANDED_BYTES = _limit("BASTION_IMPORT_EXPANDED_BYTES", 128 << 20)
+IMPORT_OBJECT_BYTES = _limit("BASTION_IMPORT_OBJECT_BYTES", 4 << 20)
+IMPORT_MAX_OBJECTS = _limit("BASTION_IMPORT_MAX_OBJECTS", 50000)
+IMPORT_MAX_COMMITS = _limit("BASTION_IMPORT_MAX_COMMITS", 10000)
+IMPORT_MAX_TREE_ENTRIES = _limit("BASTION_IMPORT_MAX_TREE_ENTRIES", 250000)
+IMPORT_VALIDATION_SECONDS = _limit("BASTION_IMPORT_VALIDATION_SECONDS", 120)
+IMPORT_UPLOAD_SECONDS = _limit("BASTION_IMPORT_UPLOAD_SECONDS", 120)
+IMPORT_STAGING_BYTES = _limit("BASTION_IMPORT_STAGING_BYTES", 512 << 20)
+MAX_ACTIVE_IMPORTS = _limit("BASTION_MAX_ACTIVE_IMPORTS", 2)
+MAX_ACTIVE_IMPORTS_PER_ACCOUNT = _limit("BASTION_MAX_ACTIVE_IMPORTS_PER_ACCOUNT", 1)
+MAX_IMPORTS_PER_IP = _limit("BASTION_MAX_IMPORTS_PER_IP", 2)
+
 
 def validate() -> None:
     """Cross-check limits so unsafe combinations fail startup."""
@@ -88,6 +103,24 @@ def validate() -> None:
         raise ForgeError(
             "BASTION_MAX_RECEIVES_PER_TOKEN exceeds the per-token request limit"
         )
+    if IMPORT_BUNDLE_BYTES + 3 * IMPORT_EXPANDED_BYTES > IMPORT_STAGING_BYTES:
+        raise ForgeError("import bundle and validation space exceed import staging budget")
+    if IMPORT_OBJECT_BYTES > IMPORT_EXPANDED_BYTES:
+        raise ForgeError("BASTION_IMPORT_OBJECT_BYTES exceeds expanded import budget")
+    if IMPORT_PACK_BYTES > (32 << 20):
+        raise ForgeError("BASTION_IMPORT_PACK_BYTES exceeds the hard pack parser limit")
+    hard_import_bounds = {
+        "BASTION_IMPORT_EXPANDED_BYTES": (IMPORT_EXPANDED_BYTES, 2 << 30),
+        "BASTION_IMPORT_OBJECT_BYTES": (IMPORT_OBJECT_BYTES, 64 << 20),
+        "BASTION_IMPORT_MAX_OBJECTS": (IMPORT_MAX_OBJECTS, 100000),
+        "BASTION_IMPORT_MAX_COMMITS": (IMPORT_MAX_COMMITS, 100000),
+        "BASTION_IMPORT_MAX_TREE_ENTRIES": (IMPORT_MAX_TREE_ENTRIES, 1000000),
+        "BASTION_IMPORT_VALIDATION_SECONDS": (IMPORT_VALIDATION_SECONDS, 600),
+        "BASTION_IMPORT_UPLOAD_SECONDS": (IMPORT_UPLOAD_SECONDS, 600),
+        "BASTION_IMPORT_STAGING_BYTES": (IMPORT_STAGING_BYTES, 4 << 30),
+    }
+    if any(value > maximum for value, maximum in hard_import_bounds.values()):
+        raise ForgeError("configured import limit exceeds its hard safety bound")
 
 
 def free_below_floor(path: os.PathLike | str) -> bool:

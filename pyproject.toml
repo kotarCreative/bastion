@@ -14,6 +14,12 @@ psycopg = {extras = ["binary"], version = "^3.2"}
 boto3 = "^1.35"
 clerk-backend-api = "^7.0.0"
 
+[tool.poetry.group.dev.dependencies]
+pytest = "^9.0"
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "tests", "."]
+
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"

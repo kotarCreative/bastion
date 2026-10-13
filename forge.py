@@ -165,10 +165,6 @@ def parser() -> argparse.ArgumentParser:
     serve.add_argument("root", type=Path)
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
-    serve_demo = commands.add_parser("serve-demo")
-    serve_demo.add_argument("root", type=Path)
-    serve_demo.add_argument("--host", default="127.0.0.1")
-    serve_demo.add_argument("--port", type=int, default=8000)
     serve_host = commands.add_parser("serve-host")
     serve_host.add_argument("host_root", type=Path)
     serve_host.add_argument("--host", default="127.0.0.1")
@@ -313,10 +309,6 @@ def main() -> int:
                 raise SystemExit(f"unknown token: {args.token_id}")
         elif args.command == "serve":
             from http_server import serve
-
-            serve(args.root, args.host, args.port)
-        elif args.command == "serve-demo":
-            from demo_server import serve
 
             serve(args.root, args.host, args.port)
         elif args.command == "serve-host":

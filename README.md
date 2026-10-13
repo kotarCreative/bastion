@@ -45,11 +45,20 @@ short-lived view-scoped API tokens.
 - [Alchemy deployment evaluation](docs/ALCHEMY_EVALUATION.md)
 - [Roadmap](ROADMAP.md)
 
-## Local multi-repository hosting
+## Multi-repository hosting
+
+The primary hosted application uses [Cloudflare](deployment/cloudflare/README.md):
+a durable host catalog, one isolated Durable Object catalog per repository,
+and separate Artifacts storage branches. Container disk is disposable. Startup
+approves the configured administrator but creates **no demo repository**.
+Sign in, create or import repositories, approve additional host accounts, and
+invite collaborators with repository-scoped permissions and credentials.
+
+### Local alternative
 
 The explicit local host commands provide operator-managed account approval and
 independent per-repository forge roots. `serve-host` adds account sign-in,
-repository discovery, browser creation/switching, scoped permissions and
+repository discovery, browser creation/import/switching, scoped permissions and
 credentials, and namespaced HTTPS Git routing. This is a persistent-local-storage
 prototype, not a production multi-tenant deployment.
 The host catalog must live on persistent local storage; remote database and
@@ -75,7 +84,8 @@ make commits on top of that history. Pushing unrelated local history is not
 supported. Imports pin the selected local source branch tip; a changed source
 requires a new request. Owner view `owner` has all currently supported
 capabilities and the account's approved email identities. Existing direct-root
-commands and `serve-demo <root>` are unchanged.
+administration commands remain available; the single-repository browser demo
+and automatic sample-repository bootstrap have been removed.
 
 ### Serve multiple users and repositories
 
@@ -101,9 +111,10 @@ Failed/reserved operations count against both host and configured account limits
 transport limits still apply across the host's child apps.
 
 An approved account can sign in with no repositories, create its first one, and
-switch between owned/shared repositories. Browser creation is **seeded-empty
-only**: clone, commit, then push. Existing history still uses the operator's
-`create-repo --source` command, not a web upload or an unrelated first push.
+switch between owned/shared repositories. For new projects, browser creation is
+**seeded-empty**: clone, commit, then push. For existing history, use first-push
+import below or the operator's `create-repo --source` command—not a push of
+unrelated history into a seeded repository.
 
 Permissions and Credentials operate on the selected repository only. Invitations
 target already approved host accounts, selected from Clerk or by verified email;
@@ -125,9 +136,62 @@ authorize another.
 Without Clerk configured, the server supports operator-issued host sessions for
 local testing, but does not provide an open signup/login bypass. Do not expose
 the development HTTP server publicly without a TLS/authenticated deployment
-plan. Remote storage/catalog adapters, coordinated account deprovisioning,
+plan. The local profile intentionally rejects remote adapters; use the Cloudflare
+profile for hosted storage. Coordinated account deprovisioning,
 distributed admission, and consistent whole-host backup/restore remain rollout
 work; existing per-repository backup commands do not back up the host catalog.
+
+### Import an existing repository
+
+In the `serve-host` dashboard, choose **Import an existing repository**, enter
+a new name and its branch, then **Prepare first push**. The repository starts
+uninitialized—no seed commit or file upload. From your existing local clone:
+
+```sh
+git config --global credential.useHttpPath true
+git remote add bastion https://bastion.example/alice/project.git
+git push bastion main
+```
+
+Use username **`owner`** and the displayed import credential as the Git password;
+never put the credential in the remote URL. It expires after one hour and only
+authorizes that repository's initial push, not fetch, UI access, or later writes.
+The dashboard can check status and generate a replacement if its response was
+lost; a replacement invalidates the previous credential. Pending imports can be
+resumed after refreshing the page. The browser does not persist raw secrets.
+
+This slice accepts exactly one SHA-1 branch and its complete history over Git
+smart HTTP(S), not remote URL cloning, tags, multiple branches, SSH, or submodule
+history. Historical author emails need not match your account. LFS
+pointer files remain ordinary files; external LFS objects are not transferred.
+Canonical history is preserved, but projected views can have different commit
+IDs, so this is not an exact GitHub mirror. **After initial import, open the repo,
+issue normal repository credentials, and clone its Bastion view for ongoing
+work.** Replace the cached import credential in your Git credential helper.
+Later pushes retain ordinary author, ancestry, and path authorization checks.
+
+Default import limits are a **32 MiB pack**, 128 MiB expanded data, 4 MiB per
+object, 50,000 objects, 10,000 commits, and 250,000 distinct tree entries.
+Upload and validation budgets are each 120 seconds. The host stages at most
+512 MiB with conservative reservations; completed imports retain their source
+and intake for recovery, while releasing unused workspace capacity. Empty pending
+repos reserve repository capacity but no staged-byte budget; disk capacity is
+reserved before accepting the first push. Configure
+limits through `BASTION_IMPORT_*` in `src/limits.py`; unsafe overrides fail startup.
+Admission permits two active imports globally, one per account, and two per
+source address in a host process.
+
+Retry the same Git push after a failed or lost response. Server-side
+operations survive restarts and never reset a repository after later pushes.
+Leaving the browser or reloading the page does not cancel the server operation.
+Failed reservations continue to count against capacity; cancellation and garbage
+collection are not yet implemented. Keep the host on
+persistent local storage for the local profile. Cloudflare persists pinned
+intake in Artifacts and reconstructs validation work after container replacement.
+Upload deadlines are checked between stream reads;
+any externally reachable deployment also needs a proxy/server read timeout to
+interrupt stalled clients. Existing production multi-repository rollout gates
+still apply.
 
 ## Quick Start
 
@@ -139,7 +203,9 @@ Requirements:
 Run all tests:
 
 ```bash
-python3 -m unittest discover -v tests 'test_*.py'
+poetry install
+poetry run python -m pytest tests -q
+node --test tests/test_spa*.js
 ```
 
 Create a local forge, one principal, and one view:
@@ -175,19 +241,21 @@ python3 forge.py serve /tmp/bastion-forge --port 8000
 git clone http://alice:TOKEN@127.0.0.1:8000/alice.git alice
 ```
 
-Or run the invite-only browser demo (requires Poetry):
+For the browser application, initialize an empty multi-repository host:
 
 ```bash
 python3 -m venv .poetry
 .poetry/bin/pip install poetry
 .poetry/bin/poetry install
-python3 forge.py add-token /tmp/bastion-forge alice
-BASTION_DEMO_SECRET=$(openssl rand -hex 32) .poetry/bin/poetry run python forge.py serve-demo /tmp/bastion-forge --port 8000
+export BASTION_ROOT=/tmp/bastion-host
+export BASTION_BOOTSTRAP_ADMIN_EMAIL=alice@example.test
+# Set Clerk environment variables as described below.
+PYTHONPATH=src .poetry/bin/poetry run python deployment/bootstrap-host.py
+.poetry/bin/poetry run python forge.py serve-host "$BASTION_ROOT" --port 8000
 ```
 
-Then open `http://127.0.0.1:8000/`, enter the token, and browse the effective
-permissions, evaluate path decisions, view the projected tree and visible
-history, and clone the same view with an unmodified Git client.
+Then open `http://127.0.0.1:8000/`, sign in through Clerk, and create or import a
+repository. Approve other accounts before inviting them under People & permissions.
 
 ### Clerk authentication setup
 
@@ -229,36 +297,28 @@ The secret key is still required because Bastion retrieves the authenticated
 user's verified email addresses from Clerk's Backend API when claiming an
 invitation.
 
-4. Invite a user by creating a Bastion principal with the same verified email,
-   assigning its permissions, and creating a view. The earlier quick-start
-   commands already do this for `alice`:
+4. Initialize a host and approve an account with the same verified email:
 
 ```bash
-python3 forge.py add-principal /tmp/bastion-forge alice \
-  --email alice@example.test
-python3 forge.py add-role /tmp/bastion-forge alice-owner --allow admin=
-python3 forge.py bind-role /tmp/bastion-forge alice-owner --principal alice
-python3 forge.py add-view /tmp/bastion-forge alice \
-  --principal alice --branch main
+python3 forge.py approve-host-account /tmp/bastion-host alice --email alice@example.test
 ```
 
 5. Start the browser application with the Clerk environment present:
 
 ```bash
-.poetry/bin/poetry run python forge.py serve-demo \
-  /tmp/bastion-forge --port 8000
+.poetry/bin/poetry run python forge.py serve-host /tmp/bastion-host --port 8000
 ```
 
 Open `http://127.0.0.1:8000/` and create or sign in to the Clerk account. On
-first sign-in, Bastion atomically links the Clerk user ID to the one invited
-principal whose declared email matches a verified Clerk address. The link is
+first sign-in, Bastion atomically links the Clerk user ID to the approved host
+account whose declared email matches a verified Clerk address. The link is
 durable and does not change if the Clerk email is later edited. No match or an
 ambiguous match is denied, and creating a Clerk account alone never grants
 repository access.
 
 After sign-in, **Account** opens Clerk's profile and security management UI.
-Bastion exchanges the Clerk session for a one-hour, `ui`-only token bound to a
-specific repository view. Git and API tokens remain separately issued,
+Bastion exchanges Clerk authentication for a host session; opening a repository
+issues a separate one-hour, `ui`-only token bound to its view. Git tokens remain separately issued,
 revocable credentials; create them from the **Credentials** tab (or
 `forge.py add-token`).
 

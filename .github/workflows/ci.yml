@@ -25,7 +25,12 @@ jobs:
           python -m pip install --disable-pip-version-check poetry==2.4.3
           poetry install --no-interaction
       - name: Run full test suite
-        run: poetry run python -m unittest discover -s tests -t . -v
+        run: poetry run python -m pytest tests -q
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+      - name: Check browser workflows
+        run: node --test tests/test_spa.js tests/test_spa_host.js tests/test_spa_auth_races.js tests/test_spa_import.js
 
   cloudflare:
     name: Cloudflare catalog and recovery tests
@@ -52,7 +57,7 @@ jobs:
           npm test
           npx wrangler deploy --dry-run --containers-rollout=none
       - name: Check Python backend, migration, and cold recovery
-        run: poetry run python -m unittest tests.test_durable_objects -v
+        run: poetry run python -m pytest tests/test_durable_objects.py tests/test_cloudflare_host.py -q
 
   postgres:
     name: PostgreSQL storage tests
@@ -128,12 +133,15 @@ jobs:
       - name: Check deployment shell syntax
         run: |
           bash -n deployment/terraform/bootstrap-aws.sh
-          bash -n deployment/terraform/aws/deploy-dev.sh
-          bash -n deployment/terraform/aws/init-forge.sh
 
   container:
     name: Docker and Compose validation
     runs-on: ubuntu-latest
+    env:
+      BASTION_BOOTSTRAP_ADMIN_EMAIL: ci@example.test
+      CLERK_PUBLISHABLE_KEY: pk_test_ci
+      CLERK_SECRET_KEY: sk_test_ci
+      CLERK_AUTHORIZED_PARTIES: https://localhost:8443
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Build image

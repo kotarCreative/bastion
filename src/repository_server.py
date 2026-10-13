@@ -1,6 +1,6 @@
-"""Hosted permission-demo HTTP surface for Bastion (spec 013 final form).
+"""Repository-scoped browser/API and Git engine used by the host dispatcher.
 
-The demo serves the Git smart-HTTP endpoints and a small static browser
+The repository app serves Git smart-HTTP endpoints and a static browser
 application on a single port.  Bearer tokens live in page memory only:
 the server never receives, stores, or returns a credential outside the
 Authorization header of a single request, sets no cookies, and applies
@@ -13,7 +13,6 @@ import hashlib
 import json
 import os
 import secrets
-import sys
 import threading
 import time
 from pathlib import Path
@@ -60,8 +59,8 @@ SECURITY_HEADERS = {
 NO_STORE = {"Cache-Control": "no-store"}
 
 
-class DemoHttpError(HttpError):
-    """HTTP error raised by demo routes; handled like any transport HttpError."""
+class RepositoryHttpError(HttpError):
+    """Repository HTTP error; handled like any transport HttpError."""
 
 
 def _security_headers(clerk_origin: str | None = None) -> dict[str, str]:
@@ -94,33 +93,33 @@ def _preflight(root: Path) -> None:
     for descriptor in state.get("view_descriptors", {}).values():
         if descriptor.get("algorithm") != "capabilities-v3":
             raise ForgeError(
-                "hosted demo requires descriptor algorithm capabilities-v3"
+                "repository server requires descriptor algorithm capabilities-v3"
             )
 
 
 def _authenticate_git(root: Path, view: str, service: str) -> dict:
     parsed = parse_git_authorization(request.headers.get("Authorization"))
     if parsed is None:
-        raise DemoHttpError(
+        raise RepositoryHttpError(
             401,
             BODY_401,
             {"WWW-Authenticate": 'Basic realm="bastion"'},
         )
     username, credential = parsed
     if username is not None and username != view:
-        raise DemoHttpError(404, BODY_404)
+        raise RepositoryHttpError(404, BODY_404)
     record = authenticate_token(root, credential)
     if record is None:
-        raise DemoHttpError(
+        raise RepositoryHttpError(
             401,
             BODY_401,
             {"WWW-Authenticate": 'Basic realm="bastion"'},
         )
     if record["view_id"] != view:
-        raise DemoHttpError(404, BODY_404)
+        raise RepositoryHttpError(404, BODY_404)
     required = "fetch" if service == "git-upload-pack" else "push"
     if not has_scope(record, required):
-        raise DemoHttpError(403, b"forbidden")
+        raise RepositoryHttpError(403, b"forbidden")
     return record
 
 
@@ -160,16 +159,16 @@ def _read_bounded_body(maximum: int) -> bytes:
     try:
         while True:
             if time.monotonic() >= deadline:
-                raise DemoHttpError(400, b"bad request")
+                raise RepositoryHttpError(400, b"bad request")
             block = stream.read(min(65536, maximum - total + 1))
             if not block:
                 return b"".join(chunks)
             total += len(block)
             chunks.append(block)
             if total > maximum:
-                raise DemoHttpError(413, b"content too large")
+                raise RepositoryHttpError(413, b"content too large")
     except RequestEntityTooLarge as error:
-        raise DemoHttpError(413, b"content too large") from error
+        raise RepositoryHttpError(413, b"content too large") from error
 
 
 def create_app(root: Path) -> Flask:
@@ -1160,7 +1159,7 @@ def create_app(root: Path) -> Flask:
         root = _forge_root(app)
         service = parse_service(request.query_string.decode())
         if service is None:
-            raise DemoHttpError(404, BODY_404)
+            raise RepositoryHttpError(404, BODY_404)
 
         from repository import Repository as _Repository
 
@@ -1173,19 +1172,19 @@ def create_app(root: Path) -> Flask:
             request.remote_addr or "", receive, record["token_id"]
         )
         if throttled:
-            raise DemoHttpError(
+            raise RepositoryHttpError(
                 throttled, b"throttled" if throttled == 429 else b"server saturated"
             )
         try:
             try:
                 _repository, manifest, _active, materialized = _resolve_service(root, view)
             except ForgeError:
-                raise DemoHttpError(404, BODY_404)
+                raise RepositoryHttpError(404, BODY_404)
             if receive and (
                 manifest.head_seq >= limits.MAX_WAL_SEQUENCE
                 or limits.free_below_floor(root)
             ):
-                raise DemoHttpError(503, b"demo-read-only")
+                raise RepositoryHttpError(503, b"repository-read-only")
             repo_path = materialized.path if service == "git-upload-pack" else _git_repo(
                 root, view, service
             )[0]
@@ -1193,7 +1192,7 @@ def create_app(root: Path) -> Flask:
                 None if service == "git-upload-pack" else materialized.path / "objects"
             )
             if not app.config["GIT_SLOTS"].acquire(blocking=False):
-                raise DemoHttpError(503, b"server saturated")
+                raise RepositoryHttpError(503, b"server saturated")
             try:
                 protocol = request.headers.get("Git-Protocol")
                 completed = run_service(
@@ -1213,7 +1212,7 @@ def create_app(root: Path) -> Flask:
             )
         if completed.returncode:
             app.logger.error("git advertisement failed")
-            raise DemoHttpError(500, b"git advertisement failed")
+            raise RepositoryHttpError(500, b"git advertisement failed")
         body = pkt_line(f"# service={service}\n".encode()) + b"0000" + completed.stdout
         return make_response(
             body,
@@ -1225,7 +1224,7 @@ def create_app(root: Path) -> Flask:
     def git_service(view: str, service: str):
         root = _forge_root(app)
         if service not in SERVICES:
-            raise DemoHttpError(404, BODY_404)
+            raise RepositoryHttpError(404, BODY_404)
 
         # Admission precedes materialization and body buffering so a client
         # cannot force unbounded intake replay work or hold a large buffered
@@ -1236,12 +1235,12 @@ def create_app(root: Path) -> Flask:
             request.remote_addr or "", receive, record["token_id"]
         )
         if throttled:
-            raise DemoHttpError(
+            raise RepositoryHttpError(
                 throttled, b"throttled" if throttled == 429 else b"server saturated"
             )
         try:
             if receive and limits.free_below_floor(root):
-                raise DemoHttpError(503, b"demo-read-only")
+                raise RepositoryHttpError(503, b"repository-read-only")
             repo_path, alternates = _git_repo(root, view, service)
             protocol = request.headers.get("Git-Protocol")
             maximum = UPLOAD_MAX_BODY if service == "git-upload-pack" else RECEIVE_MAX_BODY
@@ -1251,7 +1250,7 @@ def create_app(root: Path) -> Flask:
             try:
                 _repository, _manifest, active, _materialized = _resolve_service(root, view)
             except ForgeError:
-                raise DemoHttpError(404, BODY_404)
+                raise RepositoryHttpError(404, BODY_404)
 
             extra_env = {
                 "BASTION_VIEW": view,
@@ -1263,11 +1262,11 @@ def create_app(root: Path) -> Flask:
             idempotency_key = request.headers.get("Idempotency-Key")
             if idempotency_key and service == "git-receive-pack":
                 if len(idempotency_key) > 256 or not idempotency_key.strip():
-                    raise DemoHttpError(400, b"invalid Idempotency-Key")
+                    raise RepositoryHttpError(400, b"invalid Idempotency-Key")
                 extra_env["BASTION_IDEMPOTENCY_KEY"] = idempotency_key
 
             if not app.config["GIT_SLOTS"].acquire(blocking=False):
-                raise DemoHttpError(503, b"server saturated")
+                raise RepositoryHttpError(503, b"server saturated")
             try:
                 completed = run_service(
                     repo_path,
@@ -1286,7 +1285,7 @@ def create_app(root: Path) -> Flask:
             )
         if completed.returncode:
             app.logger.error("git service failed")
-            raise DemoHttpError(500, b"git service failed")
+            raise RepositoryHttpError(500, b"git service failed")
         return make_response(
             completed.stdout,
             200,
@@ -1300,7 +1299,7 @@ def _git_repo(root: Path, view: str, service: str) -> tuple[Path, Path | None]:
     try:
         _repository, manifest, _active, materialized = _resolve_service(root, view)
     except ForgeError:
-        raise DemoHttpError(404, BODY_404)
+        raise RepositoryHttpError(404, BODY_404)
     if service == "git-upload-pack":
         return materialized.path, None
     from materialization import ensure_intake_materialized
@@ -1313,13 +1312,3 @@ def make_server(root: Path, host: str = "127.0.0.1", port: int = 8000):
     from werkzeug.serving import make_server as _make_server
 
     return _make_server(host, port, app, threaded=True)
-
-
-def serve(root: Path, host: str, port: int) -> None:
-    app = create_app(root)
-    print(
-        f"bastion: serving demo on http://{host}:{port}",
-        file=sys.stderr,
-        flush=True,
-    )
-    app.run(host=host, port=port, threaded=True)

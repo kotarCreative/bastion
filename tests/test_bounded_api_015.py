@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import api_v1
 import forge
 import store as store_module
-from demo_server import create_app
+from repository_server import create_app
 from http_server import add_token
 from state import load_state, recover
 from tests import identity_harness

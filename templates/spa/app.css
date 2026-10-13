@@ -353,3 +353,6 @@ summary { color: var(--muted); font-size: 11px; cursor: pointer; }
 .repository-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 1rem; margin: 1.5rem 0 3rem; }
 .repository-card, .create-repository { padding: 1.5rem; border: 1px solid var(--line, #dce2df); border-radius: 12px; background: var(--surface, #fff); }
 .create-repository { max-width: 520px; display: grid; gap: .75rem; }
+.import-repository { margin-top: 1.5rem; max-width: 680px; }
+.import-repository code { overflow-wrap: anywhere; }
+.import-repository input[type="file"] { max-width: 100%; }

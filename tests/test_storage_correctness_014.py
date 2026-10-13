@@ -1025,7 +1025,7 @@ class TargetedAccessTest(unittest.TestCase):
         )
 
     def test_browser_policy_loads_no_derived_history_or_jobs(self) -> None:
-        from demo_server import _active_descriptor
+        from repository_server import _active_descriptor
         from tests.tree_harness import TreeFixture
 
         fixture = TreeFixture()

@@ -14,14 +14,13 @@ WORKFLOWS = ROOT / ".github" / "workflows"
 
 
 class AwsDeploymentContractTest(unittest.TestCase):
-    def test_bootstrap_launcher_queries_the_defined_container(self) -> None:
+    def test_single_repository_bootstrap_is_retired(self) -> None:
         definition = json.loads(
             (AWS / "bootstrap_container_definition.json.tftpl").read_text()
         )
         self.assertEqual([container["name"] for container in definition], ["bastion-bootstrap"])
-        launcher = (AWS / "init-forge.sh").read_text()
-        self.assertIn("name==`bastion-bootstrap`", launcher)
-        self.assertNotIn("name==`bastion-web`", launcher)
+        self.assertIn("retired", definition[0]["command"][2])
+        self.assertFalse((AWS / "init-forge.sh").exists())
 
     def test_long_lived_tasks_receive_only_the_runtime_database_secret(self) -> None:
         definition = json.loads(
@@ -65,28 +64,20 @@ class AwsDeploymentContractTest(unittest.TestCase):
         self.assertNotIn("s3:DeleteBucket", qualification)
 
     def test_workflows_use_oidc_and_protected_environments(self) -> None:
-        deploy = (WORKFLOWS / "aws-deploy.yml").read_text()
+        self.assertFalse((WORKFLOWS / "aws-deploy.yml").exists())
         qualification = (WORKFLOWS / "aws-s3-qualification.yml").read_text()
-        for workflow in (deploy, qualification):
+        for workflow in (qualification,):
             self.assertIn("id-token: write", workflow)
             self.assertIn("aws-actions/configure-aws-credentials", workflow)
             self.assertNotIn("AWS_ACCESS_KEY_ID", workflow)
             self.assertNotIn("AWS_SECRET_ACCESS_KEY", workflow)
             self.assertNotRegex(workflow, r"uses: [^\s]+@v\d")
-        self.assertIn("environment: aws-dev", deploy)
-        self.assertIn("Require successful CI for this revision", deploy)
-        self.assertIn("deployment/terraform/aws/smoke-test.sh", deploy)
-        self.assertIn("uses: ./.github/workflows/aws-s3-qualification.yml", deploy)
         self.assertIn("environment: aws-s3-qualification", qualification)
         self.assertIn("workflow_call:", qualification)
 
-    def test_deploy_script_supports_automation_and_waits_for_stability(self) -> None:
-        launcher = (AWS / "deploy-dev.sh").read_text()
-        self.assertIn('var_file="${1:-}"', launcher)
-        self.assertIn("aws ecs wait services-stable", launcher)
-        self.assertIn("bootstrap_container_image", launcher)
-        self.assertIn("existing service remains available", launcher)
-        self.assertNotIn('var_file="${1:-dev.tfvars}"', launcher)
+    def test_demo_deploy_launchers_are_removed(self) -> None:
+        self.assertFalse((AWS / "deploy-dev.sh").exists())
+        self.assertFalse((AWS / "smoke-test.sh").exists())
 
 
 if __name__ == "__main__":

@@ -1,8 +1,28 @@
 # Multi-Repository Accounts
 
-Status: local operator foundation and the persistent-local served slice below
-are implemented. Self-service history import and production adapters remain
-unimplemented; production rollout is gated on milestone 4.
+Status: local hosting and the Cloudflare multi-repository adapter are implemented,
+including bounded single-branch first-push import and disk-independent recovery.
+Live deployment validation, whole-host backup/migration, distributed admission
+and coordinated deprovisioning remain rollout gates in milestone 4.
+
+### Cloudflare integration
+
+`CloudflareHost` uses the existing parameterized DO SQL bridge for a distinct host
+catalog and one scoped catalog per opaque repository ID. Repository objects/WAL
+are isolated in Artifacts branches. Initial intake is saved under a digest-pinned
+host key before source validation receipts, so cold recovery revalidates exactly
+the same bytes. Source identity is independent of the replacement disk's inode.
+Ready repositories recover from their own catalogs/WAL; retries never re-seed
+them. Host/admin sessions, repo UI tokens, Git tokens and import credentials are
+separate scopes. Only the persisted initial host administrator may approve
+accounts through the browser; repository owners cannot grant host privileges.
+
+The production entry point and local Docker example use the host dispatcher.
+The old single-repository browser demo and sample bootstrap are removed. Legacy
+Cloudflare catalog names/branches are not deleted or automatically adopted.
+Tests exercise actual workerd SQL and an authenticated Artifacts HTTPS fixture,
+not a live production deployment. All Artifacts branches currently share one
+backing repository quota; request serialization is single-host, not distributed.
 
 ## Contract
 
@@ -156,7 +176,8 @@ and reserved host route names. Names are unique in their respective namespace;
 repository uniqueness is `(owner_account_id, name)`, enforced in storage.
 Do not introduce rename semantics or case-folding aliases in the first release.
 
-Keep existing direct-root CLI commands and `serve-demo <root>` unchanged. A new
+Keep existing direct-root administration CLI commands. The single-repository
+browser demo entry point is retired by the Cloudflare multi-repo integration. A new
 host command is explicit; it must not guess whether an existing directory is a
 host or a forge. Legacy `/<view>.git` URLs remain supported in single-root mode;
 host mode does not ambiguously redirect them. A later explicit migration must
@@ -193,11 +214,12 @@ publication did not happen. Capacity reservations must count in admission.
 
 ## Empty Repositories And Existing History
 
-The current engine requires a real canonical commit and forbids branch creation
-and force/non-fast-forward updates. A truly unborn repository and first push of
-unrelated existing history are therefore **not** phase-1 behavior.
+The ordinary engine requires a real canonical commit and forbids branch creation
+and force/non-fast-forward updates. The local foundation originally offered only
+operator import and seeded-empty creation; normal pushes still cannot replace
+that seed with unrelated history.
 
-Phase 1 offers:
+Supported source modes:
 
 - **Import:** operator supplies a local Git source with a supported branch.
   Import preserves the canonical source history under existing `init_forge`
@@ -206,8 +228,12 @@ Phase 1 offers:
   configured branch, then use normal provisioning. Users clone that projection
   and commit/push on top of it. Documentation must state that pushing unrelated
   local history is not supported by this mode.
+- **First-push import:** reserve an uninitialized host operation, authenticate the
+  owner's initial Git push, and initialize from its validated complete history.
+  No unborn manifest/view or seed commit is published. The separate bootstrap
+  receiver creates an ordinary ready forge only after validation/provisioning.
 
-Later self-service upload/import must use private, bounded staging and validate
+Self-service first-push import uses private, bounded staging and validates
 object format, selected branch, object integrity, supported tree modes, Git
 execution environment, unpacked size, and time/disk limits before publication.
 Do not accept arbitrary server filesystem paths or user-controlled executable
@@ -216,9 +242,9 @@ Git configuration through the web interface.
 Existing history with multiple author emails goes through import, not a bypass
 of normal receive author binding. New pushed commits continue to require the
 principal's approved emails. UI clone instructions must surface this requirement.
-True unborn first-push support, if added, requires explicit changes to manifest,
-projection, receive, author-validation, and retry contracts with tests; a seed
-commit is not advertised as a substitute for that behavior.
+The implemented first-push contract below explicitly separates bootstrap from
+ordinary manifest/projection/receive author validation and tests its retries.
+Seeded creation is not advertised as a substitute for that behavior.
 
 ## Limits And Acceptance Tests
 
@@ -280,7 +306,7 @@ not itself verification of a remote Clerk session.
 The implemented budgets include optional per-account repository counts and a
 persisted total-host count (default 1000, configured with
 `BASTION_HOST_REPO_LIMIT` at catalog initialization/migration). Reservations and
-failed operations count. Served admission is process-wide; distributed/import
+failed operations count. Served admission is process-wide; distributed
 budgets remain rollout work. `tests/test_host.py` covers the local foundation;
 the remaining production acceptance cases apply when those interfaces arrive.
 
@@ -300,8 +326,8 @@ The first served vertical slice includes:
 - `POST /api/v1/repos` accepts `name`, `request_id`, and an optional `branch`
   (default `main`). The owner is always the authenticated account. This endpoint
   creates a seeded-empty repo only; filesystem paths, object-store/backend
-  settings, and arbitrary owner identifiers are not request fields. Imported
-  existing history remains operator CLI work until bounded upload is ready.
+   settings, and arbitrary owner identifiers are not request fields. Existing
+   history uses the separate bounded import routes below or the operator CLI.
 - `POST /api/v1/repos/<repo_id>/auth/session` accepts an optional `view_id` and
   exchanges a host session for a repository UI session. Multiple active views
   require explicit selection. The response includes the selected repository's
@@ -332,8 +358,10 @@ internal paths, storage diagnostics, Clerk secrets, or operation hashes through
 discovery/creation responses. App caching is bounded and does not cache approval
 or membership as permanent authority.
 
-`src/host_server.py` supplies the explicit local dispatcher. Host schema v3 adds
-digest-only sessions, persisted host capacity, and membership intents; supported
+`src/host_server.py` supplies the explicit local dispatcher. Host schema v5 retains
+digest-only sessions, persisted host capacity, and membership intents and adds
+durable import operations, staging reservations, ownership receipts, and digest-only
+first-push credentials; supported
 older schemas migrate atomically under the catalog lock. Serving does not create
 an unknown host root. Host sessions expire after one hour; repository UI exchange
 also issues one-hour `ui`-only tokens. Creation returns 201 on both first success
@@ -358,3 +386,109 @@ shared scoped collaborator view in exactly one repo, host/repo credential
 separation, expired/revoked/suspended host sessions, cross-repo Git/API rejection,
 seeded smart-HTTP clone/commit/push, invitation repair, stale browser responses
 across switches/logout, and existing single-root behavior.
+
+### Implemented Git-Native First-Push Import
+
+The dashboard accepts a new repository name and selected branch. It reserves an
+uninitialized repository and issues an expiring import credential. The owner
+then pushes directly from an existing local Git repository:
+
+```sh
+git remote add bastion https://bastion.example/alice/project.git
+git push bastion main
+```
+
+No client bundle, archive, or file upload is required. Only one SHA-1 branch
+and its complete reachable history are imported. Remote URL cloning, SSH,
+multiple branches/tags, SHA-256, submodule history, and external LFS objects are
+not part of this slice. Historical authors need not match the importer; this
+exception applies only to initialization. All subsequent writes use normal
+repository credentials, author binding, ancestry, and path permissions.
+
+Host-authenticated routes (never repository UI/Git/import credentials):
+
+- `POST /api/v1/imports`: JSON containing exactly `name`, `branch`, `request_id`.
+  Atomically reserve the approved actor's name/request and account/host capacity.
+  Return 201 `{import: {import_id, name, branch, state, repo, git_url, username}}`;
+  `repo` is null before ready and `username` is `owner`. Identical retries return
+  the same operation; changed inputs conflict with imports and seeded creation.
+- `POST /api/v1/imports/<id>/credentials`: bounded `{}`. Return 201
+  `{credential, expires_at, username}` once; only a domain-separated digest is
+  persisted. A replacement invalidates the previous credential. One credential
+  record per operation bounds rotation storage. Already-ready operations refuse
+  issuance. This is not a host session or a normal repository credential.
+- `GET /api/v1/imports/<id>`: owner-only status, unknown/foreign operations both
+  404. States: `awaiting-push`, `uploaded`, `validating`, `provisioning`, `ready`,
+  `failed`. Errors are generic; no internal paths, diagnostics, digests, or OIDs.
+- `GET /api/v1/imports`: the actor's pending/failed first-push operations, bounded
+  by the host repository count and a 1000-record response cap. The dashboard can
+  resume instructions/status after refresh and issue a replacement credential;
+  raw secrets are never recovered or stored in browser persistence.
+
+Git bootstrap routes use only `bsi1` import credentials and bind the account,
+repository namespace, and Basic username (`owner`; Bearer is also supported):
+
+- `GET /<owner>/<repo>.git/info/refs?service=git-receive-pack`: advertise an empty
+  ref set with bounded supported capabilities. A ready operation advertises
+  only its original imported ref for lost-response acknowledgements, never the
+  current canonical frontier. Current membership and owner read/admin policy
+  must still authorize the credential before returning that original ref.
+- `POST /<owner>/<repo>.git/git-receive-pack`: require exactly one create command
+  (`old=0`, selected branch, nonzero SHA-1 tip) and a full self-contained pack.
+  Reject deletes, updates, other refs, multi-ref pushes, unsupported capabilities,
+  incomplete packs, extra objects, or external delta bases before publication.
+  Return standard pkt-line report-status success/rejection without diagnostics.
+  The credential never authorizes upload-pack, UI APIs, or later mutations.
+
+Host config advertises `import_mode: "first-push"` and `import_limits.pack_bytes`.
+Browser instructions contain no embedded credential, and passwords are visible
+only on explicit reveal/copy. Status checks and credential issuance remain
+host-scoped even while another repository is open. Logout/account/intent changes
+invalidate pending callbacks and clear secrets. Completion never switches an
+already-open workspace. The bundle upload and completion HTTP routes are removed.
+
+Repository capacity is reserved before accepting a push. Disk workspace capacity
+is reserved transactionally under the operation lock before reading the receive
+body; empty pending repos consume no staged-byte reservation. An invalid command
+or preflight releases unused intake capacity only when no bytes/source were
+pinned. Conversion into a repository reservation counts exactly once, including
+failures. Known-invalid, unpublished sources can be corrected; once a source or
+repository is committed, retries may only initialize/acknowledge that same tip.
+Different pack compression/order for the same tip is not a different repository.
+
+Reuse the private pack/history validator and ordinary forge/owner provisioning.
+The server's internal ref envelope is a staging detail, not a bundle-upload
+feature. Pin source receipts, disk ownership/inodes, root identities, and uploaded
+bytes atomically. Restart/retry never adopts populated unknown roots, follows
+symlinks, deletes unfamiliar files, restores removed grants/memberships, or resets
+later pushes. Schema v4 staged data remains intact and is not silently converted
+to a first-push operation during v5 migration.
+
+Check compressed/expanded sizes and delta targets before Git sees the pack.
+Sanitized Git validation checks strict object integrity, full reachable closure,
+all historical commit/tree structures, supported modes, and no empty subtrees,
+hooks, external configuration, alternates, shallow state, or extra refs. Import
+and receive/provision/Git admission are shared across the host process. Credential
+expiry, rotation, or account suspension during validation blocks publication.
+
+Canonical source history is retained. Served history remains the existing
+permission projection and can have different commit IDs: after initial import,
+clone the Bastion view and issue normal Git credentials for ongoing work. This
+slice is not an exact mirror or a raw-history owner-view compatibility change.
+
+Defaults: 32 MiB pack, 128 MiB expanded data, 4 MiB per object, 50,000 objects,
+10,000 commits, 250,000 distinct tree entries, 120-second receive/validation
+budgets, and 512 MiB staging. Ready sources/intake remain available for recovery;
+unused workspace reservations are released. Failed reservations count;
+cancellation and garbage collection remain deferred. WSGI read deadlines are
+checked between reads, so a server/proxy read timeout remains required. Ordinary
+forge provisioning also retains per-command Git deadlines.
+
+`tests/test_first_push_import.py` covers real `git push`, discovery, normal clone
+and permitted/denied pushes; credential scoping/rotation/expiry; historical authors;
+malformed commands/refs/packs; pre-Git expansion checks; corrected sources; quota
+conversion; process/reply loss; disabled membership; and v4 data preservation.
+Private validator/recovery regressions remain in `tests/test_repository_import*.py`.
+`tests/test_spa_import.js` checks first-push instructions, status/credential retries,
+pending-list recovery, secret clearing, and auth/workspace races. Existing seeded
+creation, operator import, and single-root behavior remain unchanged.

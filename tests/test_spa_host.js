@@ -25,7 +25,8 @@ const sessionFor=r=>({repo:r,principal:{id:"owner",kind:"user",emails:["owner@ex
 const ctx={document:{getElementById:id=>nodes.get(id),createElement:t=>new Node(t),querySelectorAll:s=>s===".tab"?tabs:panels},window:{location:{protocol:"https:",host:"bastion.test",href:"https://bastion.test/"},scrollTo(){},setTimeout,clearTimeout,prompt(){return null},crypto:{randomUUID:()=>"request-"+(++requestSeq)}},URL,TextEncoder,btoa:s=>Buffer.from(s,"binary").toString("base64"),Intl,Date,
 fetch:async(path,opts={})=>{calls.push({path,opts});const method=opts.method||"GET";let b={},status=200;
  if(path==="/api/v1/auth/config")b={enabled:false,mode:"host"};
- else if(path==="/api/v1/session")b={mode:"host",access_token:"host-secret",account:{account_id:"acct",owner_name:hostIdentity}};
+  else if(path==="/api/v1/session")b={mode:"host",access_token:"host-secret",account:{account_id:"acct",owner_name:hostIdentity,is_host_admin:hostIdentity==="alice"}};
+  else if(path==="/api/v1/host/accounts"&&method==="POST"){assert.equal(opts.headers.Authorization,"Bearer manual-host");b={account:JSON.parse(opts.body)};status=201;}
  else if(path==="/api/v1/repos"&&method==="GET"){if(expireHost)status=401;else b={repos}}
  else if(path==="/api/v1/repos"&&method==="POST"){const payload=JSON.parse(opts.body);assert.deepEqual(Object.keys(payload).sort(),["name","request_id"].sort());if(failCreate){failCreate=false;throw Error("network failure")};const r=repo("r"+nextRepo++,payload.name,hostIdentity);repos.push(r);b={repo:r};status=201}
  else if(path.match(/^\/api\/v1\/repos\/[^/]+\/auth\/session$/)){const r=repos.find(x=>path.includes(x.repo_id));if(r.views.length>1&&!opts.body.includes('"view_id"')){status=409;b={view_ids:r.views}}else {b={access_token:"repo-secret-"+r.repo_id,session:{...sessionFor(r),view_id:r.views.length>1?JSON.parse(opts.body).view_id:"owner"}}}}
@@ -41,7 +42,10 @@ vm.runInNewContext(fs.readFileSync("templates/spa/app.js","utf8"),ctx);
 const settle=async()=>{for(let i=0;i<10;i++)await new Promise(r=>setImmediate(r))};
 (async()=>{
  await settle(); nodes.get("token").value="manual-host";nodes.get("login-form").fire("submit");await settle();
- assert.equal(nodes.get("host-dashboard").hidden,false);assert.match(rendered(nodes.get("host-message")),/No repositories yet/);
+  assert.equal(nodes.get("host-dashboard").hidden,false);assert.match(rendered(nodes.get("host-message")),/No repositories yet/);
+  assert.equal(nodes.get("approve-account").hidden,false);
+  nodes.get("approve-owner").value="bob";nodes.get("approve-email").value="bob@example.test";nodes.get("approve-account").fire("submit");await settle();
+  assert.match(nodes.get("approve-status").textContent,/Account approved/);
  nodes.get("new-repository-name").value="first";failCreate=true;nodes.get("create-repository").fire("submit");await settle();
  assert.match(nodes.get("create-error").textContent,/Retry safely/);
  nodes.get("create-repository").fire("submit");await settle();
@@ -92,7 +96,8 @@ const settle=async()=>{for(let i=0;i<10;i++)await new Promise(r=>setImmediate(r)
  late.release();await settle();assert.equal(nodes.get("host-dashboard").hidden,true);assert.ok(calls.length>=callsBefore);
  // A later account receives a fresh request id; a failed create retries with the same id.
  hostIdentity="charlie";nodes.get("token").value="second-host";nodes.get("login-form").fire("submit");await settle();
- assert.equal(nodes.get("identity").textContent,"charlie");assert.equal(nodes.get("logout").hidden,false);
+  assert.equal(nodes.get("identity").textContent,"charlie");assert.equal(nodes.get("logout").hidden,false);
+  assert.equal(nodes.get("approve-account").hidden,true);assert.equal(nodes.get("approve-email").value,"");
  nodes.get("new-repository-name").value="charlie-project";nodes.get("create-repository").fire("submit");await settle();
  const allCreates=calls.filter(c=>c.path==="/api/v1/repos"&&c.opts.method==="POST").map(c=>JSON.parse(c.opts.body));assert.notEqual(allCreates[allCreates.length-1].request_id,createPayloads[0].request_id,"new account starts with fresh idempotency key");
  expireHost=true;nodes.get("repository-list-nav").fire("click");await settle();

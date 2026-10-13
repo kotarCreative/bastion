@@ -6,7 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app/src \
     BASTION_DATA_DIR=/var/lib/bastion \
-    BASTION_ROOT=/var/lib/bastion/forge
+    BASTION_ROOT=/var/lib/bastion/host
 
 RUN apt-get update \
     && apt-get install --no-install-recommends -y ca-certificates git gosu \

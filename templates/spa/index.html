@@ -110,7 +110,37 @@
       <h3>Create a repository</h3><p>Creates a seeded-empty repository on <code id="default-branch">main</code>.</p>
       <label for="new-repository-name">Repository name</label><input id="new-repository-name" required maxlength="64" pattern="[a-z0-9][a-z0-9-]{0,63}" placeholder="my-project">
       <button class="primary-button" type="submit">Create repository</button><p id="create-error" class="error" role="status"></p>
-      <p class="hint">Importing existing history is not supported here yet. Clone then commit/push.</p>
+    </form>
+    <form id="import-repository" class="create-repository import-repository" autocomplete="off">
+      <h3>Import an existing repository</h3>
+      <p>Prepare a repository, then push one branch directly from your local Git clone. No archive or bundle is needed.</p>
+      <label for="import-repository-name">Repository name</label><input id="import-repository-name" required maxlength="64" pattern="[a-z0-9][a-z0-9-]{0,63}" placeholder="my-project">
+      <label for="import-branch">Source branch</label><input id="import-branch" value="main" required maxlength="255" autocomplete="off">
+      <p class="hint">Only the selected branch and its reachable history are imported—not tags or other branches. Historical authors may be different; new commits must use an email approved for your account.</p>
+      <p class="hint">After import, clone Bastion’s permission-aware view for ongoing work; its commit IDs may differ from the original history. Submodule history is unsupported; external Git LFS objects are not transferred.</p>
+      <button class="primary-button" type="submit">Prepare first push</button>
+      <p id="import-status" role="status" aria-live="polite"></p>
+      <p id="import-error" class="error" role="alert"></p>
+      <button id="import-retry" class="quiet-button" type="button" hidden>Retry safely</button>
+      <div id="import-instructions" hidden>
+        <pre id="import-commands"></pre>
+        <p>When Git asks, use username <code>owner</code> and the import credential as your password. This credential expires after one hour and only authorizes the initial push.</p>
+        <label for="import-secret">Import credential (shown once)</label><input id="import-secret" type="password" readonly autocomplete="off">
+        <button id="import-copy" class="quiet-button" type="button">Copy import credential</button>
+        <button id="import-reveal" class="quiet-button" type="button">Show credential</button>
+        <button id="import-check" class="quiet-button" type="button">Check import status</button>
+        <button id="import-rotate" class="quiet-button" type="button">Generate replacement credential</button>
+        <p class="hint">A replacement invalidates the previous credential. Never put credentials in the remote URL. Enable <code>credential.useHttpPath</code> so Git distinguishes repositories. After import, replace the cached import credential with normal repository credentials.</p>
+      </div>
+    </form>
+    <div id="import-list" class="repository-list" aria-live="polite"></div>
+    <form id="approve-account" class="create-repository" autocomplete="off" hidden>
+      <h3>Approve a host account</h3>
+      <p>Administrator only. Approve a verified Clerk email before inviting that person to a repository. This does not grant access to any existing code or send email.</p>
+      <label for="approve-owner">Account name</label><input id="approve-owner" required maxlength="64" pattern="[a-z0-9][a-z0-9-]{0,63}" placeholder="alice">
+      <label for="approve-email">Verified email</label><input id="approve-email" type="email" required maxlength="254" placeholder="alice@example.com">
+      <button class="primary-button" type="submit">Approve account</button>
+      <p id="approve-status" role="status" aria-live="polite"></p>
     </form>
   </section>
 

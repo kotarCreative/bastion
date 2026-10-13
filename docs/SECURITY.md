@@ -1,5 +1,17 @@
 # Security Model
 
+Cloudflare multi-repository hosting uses distinct host and per-repository DO
+catalogs and server-selected Artifacts branches. Private SQL routes exist only
+on the Container outbound binding. Host approval, discovery membership, repo UI
+tokens, Git tokens and first-push import credentials are independent authorities.
+Only the persisted bootstrap host administrator may approve more accounts;
+repo administrative capability does not confer host administration. Approval
+alone grants no existing repository access. Backing credentials never go to
+browsers. Container disk is disposable and pinned import bytes are verified
+against their durable digest before recovery. See the
+[deployment guide](../deployment/cloudflare/README.md) for topology and remaining
+whole-host recovery, deprovisioning and production rollout limitations.
+
 ## Status
 
 Bastion is an architecture and correctness prototype. Its local filesystem layout
@@ -330,6 +342,57 @@ repository stores. Coordinated account deprovisioning, distributed admission,
 production storage adapters, and whole-host backup/restore remain production
 rollout requirements. Existing per-root backup commands do not, by themselves,
 produce a consistent backup of a multi-repository host catalog and all roots.
+
+### Git-Native First-Push Import Contract
+
+The import slice uses an authenticated first Git push into an explicitly
+uninitialized repository, not a client bundle or server-side cloning of an
+arbitrary remote URL. The bootstrap receiver is separate from normal
+receive-pack and must not weaken its ancestry, author binding, or path checks.
+Its `bsi1` credential binds one approved owner, repository namespace, and selected
+branch; Basic uses view username `owner`. Only a domain-separated digest is
+stored, with a one-hour expiry and bounded replacement that invalidates the old
+secret. Host/repository sessions do not substitute for import credentials.
+Bootstrap credentials cannot fetch, use UI APIs, mutate a ready repository, or
+restore grants. A ready acknowledgement may advertise only the original imported
+ref and requires current owner membership and read/admin authorization.
+
+Treat all uploaded headers, pack data, object types, delta programs, trees,
+commit metadata, and declared sizes as untrusted. Reserve repository capacity
+before the push, and reserve disk work under the operation lock before reading
+its body. Empty pending repositories must not monopolize staging capacity.
+Bound receive framing to exactly one creation command and one self-contained
+pack; reject wrong refs, deletes, updates, extra commands, unsupported capabilities,
+and outside delta bases. Enforce compressed/expanded budgets before Git
+processes the pack. A small compressed file can contain a very large
+object or delta target, so checking only HTTP length or checking object size
+after an unbounded Git unpack is insufficient.
+
+Only a complete SHA-1 pack for the selected branch is accepted in this slice.
+Validation must cover its full reachable history, not just the final tree: a
+removed submodule or unsupported tree entry in an older commit still matters.
+No upload supplies executable configuration, hooks, alternates, source paths,
+or permission grants. Validation runs without network access through Git
+transports or access to another repository's objects. Symlinks represented as
+Git tree entries are data and are never followed by a staging checkout.
+
+Import operations, locks, ownership markers, uploaded bytes, and validated
+sources must remain confined to their server-generated opaque identities.
+Restart/retry cannot adopt unfamiliar directories, overwrite a different
+operation, regrant removed permissions, or reset a ready repository to its
+original imported tip. Operation status is private to the initiating account;
+HTTP errors never relay object IDs, server paths, Git diagnostics, or hashes.
+Failed reservations and staged sources require explicit lifecycle management;
+discarding a browser form does not cancel or delete a server-side operation.
+Expiry, rotation, or account suspension during validation must block publication.
+Invalid, unpublished sources may be corrected, but a validated or committed
+source stays pinned. Recompressed retries of the same tip do not reset its data.
+
+Historical authors are preserved as source evidence, not converted into host
+accounts or repository grants. Future pushes still use the importing owner's
+approved author identities. Served history is the existing permission-aware
+projection, not a promise of unchanged GitHub commit IDs or external signature
+validity in that projection.
 
 ## Backups
 

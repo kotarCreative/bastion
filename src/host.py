@@ -25,7 +25,7 @@ SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 OPAQUE = re.compile(r"^[0-9a-f]{32}$")
 RESERVED = {"api", "auth", "assets", "health", "static"}
 REMOTE_ENV = ("BASTION_DATABASE", "BASTION_ADMIN_DATABASE", "BASTION_OBJECT_STORE")
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 HOST_TOKEN_RE = re.compile(r"^bsh1\.([0-9a-f]{32})\.([A-Za-z0-9_-]{43})$")
 
 
@@ -90,13 +90,26 @@ class Host:
             raise ForgeError("host root must be a directory")
         self._root_identity = (self.root.stat().st_dev, self.root.stat().st_ino)
         self._check_local_config()
-        allowed = {"host.sqlite3", "host.sqlite3-wal", "host.sqlite3-shm", "host.sqlite3-journal", "repos", "locks"}
+        allowed = {"host.sqlite3", "host.sqlite3-wal", "host.sqlite3-shm", "host.sqlite3-journal", "repos", "locks", "imports"}
         unknown = [p.name for p in self.root.iterdir() if p.name not in allowed]
         if unknown:
             raise ForgeError("host root contains unrelated files", "integrity")
+        imports_path = self.root / "imports"
+        if imports_path.is_symlink() or (imports_path.exists() and not imports_path.is_dir()):
+            raise ForgeError("host imports path is unsafe", "integrity")
+        if imports_path.exists() and any(imports_path.iterdir()):
+            database = self.root / "host.sqlite3"
+            try:
+                probe = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True) if database.is_file() else None
+                has_import_table = bool(probe and probe.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='imports'").fetchone())
+                if probe: probe.close()
+            except sqlite3.Error:
+                has_import_table = False
+            if not has_import_table:
+                raise ForgeError("refusing to adopt pre-existing import staging", "integrity")
         if initialize:
             if not (self.root / "host.sqlite3").exists():
-                for directory_name in ("repos", "locks"):
+                for directory_name in ("repos", "locks", "imports"):
                     path = self.root / directory_name
                     if path.is_symlink() or (path.exists() and not path.is_dir()):
                         raise ForgeError(f"host {directory_name} path is unsafe", "integrity")
@@ -107,12 +120,15 @@ class Host:
                         raise ForgeError("refusing to initialize over nonempty host directories", "integrity")
             (self.root / "repos").mkdir(exist_ok=True)
             (self.root / "locks").mkdir(exist_ok=True)
-        for name in ("repos", "locks"):
+            (self.root / "imports").mkdir(mode=0o700, exist_ok=True)
+        elif not (self.root / "imports").exists():
+            (self.root / "imports").mkdir(mode=0o700)
+        for name in ("repos", "locks", "imports"):
             directory = self.root / name
             if directory.is_symlink() or not directory.is_dir():
                 raise ForgeError(f"host {name} path is unsafe", "integrity")
         self._directory_ids = {name: ((self.root / name).stat().st_dev, (self.root / name).stat().st_ino)
-                               for name in ("repos", "locks")}
+                               for name in ("repos", "locks", "imports")}
         self.db = self.root / "host.sqlite3"
         if self.db.is_symlink() or (self.db.exists() and not self.db.is_file()):
             raise ForgeError("host database cannot be a symlink")
@@ -145,11 +161,55 @@ class Host:
                                 raise ForgeError("host catalog schema is invalid", "integrity")
                         con.execute("CREATE TABLE membership_intents(intent_id TEXT PRIMARY KEY, repo_id TEXT NOT NULL REFERENCES repos(repo_id), account_id TEXT NOT NULL REFERENCES accounts(account_id), principal_id TEXT NOT NULL, email TEXT NOT NULL, clerk_user_id TEXT NOT NULL, inputs_hash TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','active')), created_at INTEGER NOT NULL, UNIQUE(repo_id,account_id), UNIQUE(repo_id,principal_id))")
                         con.execute("UPDATE schema_info SET version=3")
+                        version = (3,)
+                    if version and version[0] == 3:
+                        self._validate_schema_v3(con)
+                        con.execute(self._imports_ddl())
+                        con.execute("UPDATE schema_info SET version=4")
+                        version = (4,)
+                    if version and version[0] == 4:
+                        self._migrate_v4_import_columns(con)
+                        self._validate_schema(con, version=4)
+                        import_columns = {row[1] for row in con.execute("PRAGMA table_info(imports)")}
+                        if "mode" not in import_columns:
+                            con.execute("ALTER TABLE imports ADD COLUMN mode TEXT NOT NULL DEFAULT 'bundle' CHECK(mode IN ('bundle','push'))")
+                        if "push_tip" not in import_columns:
+                            con.execute("ALTER TABLE imports ADD COLUMN push_tip TEXT")
+                        con.execute(self._import_tokens_ddl())
+                        con.execute("UPDATE schema_info SET version=5")
                     self._validate_schema(con)
                 else:
-                    schema = """
+                    schema = self._schema_sql()
+                    for statement in schema.split(";"):
+                        if statement.strip():
+                            con.execute(statement)
+                    con.execute("UPDATE host_settings SET value=? WHERE key='total_repo_limit'", (str(configured_limit_value),))
+                if configured_limit is not None:
+                    con.execute("UPDATE host_settings SET value=? WHERE key='total_repo_limit'", (str(configured_limit_value),))
+                import_identity = ":".join(map(str, self._directory_ids["imports"]))
+                persisted_identity = con.execute("SELECT value FROM host_settings WHERE key='imports_identity'").fetchone()
+                if persisted_identity and persisted_identity[0] != import_identity:
+                    raise ForgeError("host import root identity changed", "integrity")
+                if not persisted_identity:
+                    if con.execute("SELECT count(*) FROM imports").fetchone()[0] or any((self.root / "imports").iterdir()):
+                        raise ForgeError("refusing to adopt unmarked import staging", "integrity")
+                    con.execute("INSERT INTO host_settings VALUES('imports_identity',?)", (import_identity,))
+        self._schema_ready = True
+        if self.db.exists():
+            info = self.db.stat()
+            self._db_identity = (info.st_dev, info.st_ino)
+        if not initialize:
+            with self._connect(read_only=True) as con:
+                self._validate_schema(con)
+                persisted_identity = con.execute("SELECT value FROM host_settings WHERE key='imports_identity'").fetchone()
+                if not persisted_identity or persisted_identity[0] != ":".join(map(str, self._directory_ids["imports"])):
+                    raise ForgeError("host import root identity changed", "integrity")
+
+    @classmethod
+    def _schema_sql(cls):
+        return f"""
             CREATE TABLE schema_info(version INTEGER NOT NULL);
-            INSERT INTO schema_info VALUES(3);
+                      INSERT INTO schema_info VALUES(5);
             CREATE TABLE IF NOT EXISTS accounts(
               account_id TEXT PRIMARY KEY, owner_name TEXT NOT NULL UNIQUE,
               emails TEXT NOT NULL, clerk_user_id TEXT UNIQUE,
@@ -169,21 +229,10 @@ class Host:
                      CREATE TABLE host_sessions(session_id TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(account_id), digest TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, revoked_at INTEGER);
                      CREATE TABLE host_settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
                      INSERT INTO host_settings VALUES('total_repo_limit','1000');
-                     CREATE TABLE membership_intents(intent_id TEXT PRIMARY KEY, repo_id TEXT NOT NULL REFERENCES repos(repo_id), account_id TEXT NOT NULL REFERENCES accounts(account_id), principal_id TEXT NOT NULL, email TEXT NOT NULL, clerk_user_id TEXT NOT NULL, inputs_hash TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','active')), created_at INTEGER NOT NULL, UNIQUE(repo_id,account_id), UNIQUE(repo_id,principal_id));
-                     """
-                    for statement in schema.split(";"):
-                        if statement.strip():
-                            con.execute(statement)
-                    con.execute("UPDATE host_settings SET value=? WHERE key='total_repo_limit'", (str(configured_limit_value),))
-                if configured_limit is not None:
-                    con.execute("UPDATE host_settings SET value=? WHERE key='total_repo_limit'", (str(configured_limit_value),))
-        self._schema_ready = True
-        if self.db.exists():
-            info = self.db.stat()
-            self._db_identity = (info.st_dev, info.st_ino)
-        if not initialize:
-            with self._connect(read_only=True) as con:
-                self._validate_schema(con)
+                      CREATE TABLE membership_intents(intent_id TEXT PRIMARY KEY, repo_id TEXT NOT NULL REFERENCES repos(repo_id), account_id TEXT NOT NULL REFERENCES accounts(account_id), principal_id TEXT NOT NULL, email TEXT NOT NULL, clerk_user_id TEXT NOT NULL, inputs_hash TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','active')), created_at INTEGER NOT NULL, UNIQUE(repo_id,account_id), UNIQUE(repo_id,principal_id));
+                         {cls._imports_ddl()};
+                         {cls._import_tokens_ddl()};
+                      """
 
     @contextmanager
     def _connect(self, *, read_only: bool = False, allow_create: bool = False):
@@ -227,7 +276,7 @@ class Host:
             self.root.stat().st_dev, self.root.stat().st_ino
         ) != self._root_identity:
             raise ForgeError("host root path changed", "integrity")
-        for name in ("repos", "locks"):
+        for name in ("repos", "locks", "imports"):
             path = self.root / name
             if (path.is_symlink() or not path.is_dir() or path.resolve() != self.root / name or
                 (path.stat().st_dev, path.stat().st_ino) != self._directory_ids[name]):
@@ -238,12 +287,16 @@ class Host:
         for child in (self.root / "locks").iterdir():
             seed = re.fullmatch(r"seed-([0-9a-f]{32})\.git", child.name)
             lock_or_marker = re.fullmatch(r"([0-9a-f]{32})\.(?:lock|owned)", child.name)
+            import_lock = re.fullmatch(r"import-([0-9a-f]{32})\.lock", child.name)
             marker_temp = re.fullmatch(r"[0-9a-f]{32}\.[A-Za-z0-9_-]+\.owned-tmp", child.name)
             catalog_lock = child.name == "catalog.lock"
-            if (child.is_symlink() or not (seed or lock_or_marker or marker_temp or catalog_lock) or
+            if (child.is_symlink() or not (seed or lock_or_marker or import_lock or marker_temp or catalog_lock) or
                 (seed and not child.is_dir()) or
-                ((lock_or_marker or marker_temp or catalog_lock) and not child.is_file())):
+                ((lock_or_marker or import_lock or marker_temp or catalog_lock) and not child.is_file())):
                 raise ForgeError("host locks directory contains an unsafe entry", "integrity")
+        for child in (self.root / "imports").iterdir():
+            if child.is_symlink() or not OPAQUE.fullmatch(child.name) or not child.is_dir():
+                raise ForgeError("host imports directory contains an unsafe entry", "integrity")
         if self.db.is_symlink() or (self.db.exists() and not self.db.is_file()):
             raise ForgeError("host database path changed", "integrity")
         if self.db.exists() and hasattr(self, "_db_identity"):
@@ -428,13 +481,7 @@ class Host:
                          for binding in state.get("role_bindings", {}).values())
         backend = _read_json(root / "backend.json")
         config = _read_json(root / "repository.json")
-        confinement = (
-            backend.get("backend") == "sqlite" and
-            config.get("object_store") == {"kind": "filesystem", "path": "object-store"} and
-            (root / "object-store").resolve() == root / "object-store" and
-            (root / "store.sqlite3").is_file() and not (root / "store.sqlite3").is_symlink() and
-            repo.repository_id == state.get("repository_id")
-        )
+        confinement = self._storage_confined(root, backend, config) and repo.repository_id == state.get("repository_id")
         if (not view or view.get("principal_id") != "owner" or
             view.get("projected_ref") != f"refs/heads/{branch}" or not descriptor or
             descriptor.get("principal_id") != "owner" or
@@ -447,6 +494,34 @@ class Host:
             state.get("canonical_branch") != branch or state.get("repository_state") != "ready"):
             raise ForgeError("owner assignment verification failed", "integrity")
         return repo
+
+    def _storage_confined(self, root, backend, config):
+        return (
+            backend.get("backend") == "sqlite" and
+            config.get("object_store") == {"kind": "filesystem", "path": "object-store"} and
+            (root / "object-store").resolve() == root / "object-store" and
+            (root / "store.sqlite3").is_file() and not (root / "store.sqlite3").is_symlink()
+        )
+
+    def prepare_repository(self, repo_id):
+        """Restore disposable configuration in hosted mode; local roots are durable."""
+
+    def persist_import(self, row, envelope):
+        """Local intake is already durable; hosted adapters publish it remotely."""
+
+    def prepare_import(self, row):
+        """Return the operation after restoring any remote intake workspace."""
+        return row
+
+    def source_receipt(self, row, tip, info):
+        return f"bundle:{row['bundle_sha256']}:{tip}:{info.st_dev}:{info.st_ino}"
+
+    def source_identity(self, source, branch, tip):
+        return f"{source}\0{branch}\0{tip}"
+
+    def retained_import_bytes(self, row):
+        from repository_import import _ready_stage_bytes
+        return _ready_stage_bytes(self, row)
 
     @staticmethod
     def _validate_v1_schema(con):
@@ -467,15 +542,17 @@ class Host:
             raise ForgeError("host catalog schema is invalid", "integrity") from error
 
     @staticmethod
-    def _validate_schema(con):
+    def _validate_schema(con, version=SCHEMA_VERSION):
         try:
             versions = con.execute("SELECT version FROM schema_info").fetchall()
-            version = versions[0] if len(versions) == 1 else None
+            stored_version = versions[0] if len(versions) == 1 else None
             tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         except sqlite3.Error as error:
             raise ForgeError("existing SQLite file is not a host catalog", "integrity") from error
-        expected = {"schema_info", "accounts", "repos", "memberships", "host_sessions", "host_settings", "membership_intents"}
-        if not version or version[0] != SCHEMA_VERSION or not expected.issubset(tables):
+        expected = {"schema_info", "accounts", "repos", "memberships", "host_sessions", "host_settings", "membership_intents", "imports"}
+        if version >= 5:
+            expected.add("import_tokens")
+        if not stored_version or stored_version[0] != version or not expected.issubset(tables):
             raise ForgeError("host catalog schema is unsupported", "integrity")
         columns = {table: {row[1] for row in con.execute(f"PRAGMA table_info({table})")} for table in expected}
         required = {
@@ -486,9 +563,54 @@ class Host:
             "host_sessions": {"session_id", "account_id", "digest", "created_at", "expires_at", "revoked_at"},
             "host_settings": {"key", "value"},
             "membership_intents": {"intent_id", "repo_id", "account_id", "principal_id", "email", "clerk_user_id", "inputs_hash", "state", "created_at"},
+            "imports": {"import_id", "account_id", "name", "branch", "request_id", "bundle_sha256", "size_bytes", "state", "source_identity", "repo_id", "error", "created_at", "stage_dev", "stage_ino", "source_dev", "source_ino", "work_name", "work_dev", "work_ino", "work_repo_dev", "work_repo_ino", "upload_temp_name", "upload_temp_dev", "upload_temp_ino", "reserved_stage_bytes"},
         }
+        if version >= 5:
+            required["imports"].update({"mode", "push_tip"})
+            required["import_tokens"] = {"import_id", "token_id", "digest", "created_at", "expires_at"}
         if any(not required[table].issubset(columns[table]) for table in required):
             raise ForgeError("host catalog table shape is invalid", "integrity")
+
+    @staticmethod
+    def _validate_schema_v3(con):
+        Host._validate_v1_schema(con)
+        tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        required = {"host_sessions", "host_settings", "membership_intents"}
+        if not required.issubset(tables):
+            raise ForgeError("host catalog schema is invalid", "integrity")
+        for table, names in {
+            "host_sessions": {"session_id", "account_id", "digest", "created_at", "expires_at", "revoked_at"},
+            "host_settings": {"key", "value"},
+            "membership_intents": {"intent_id", "repo_id", "account_id", "principal_id", "email", "clerk_user_id", "inputs_hash", "state", "created_at"},
+        }.items():
+            if not names.issubset({r[1] for r in con.execute(f"PRAGMA table_info({table})")}):
+                raise ForgeError("host catalog schema is invalid", "integrity")
+
+    @staticmethod
+    def _imports_ddl():
+        return "CREATE TABLE IF NOT EXISTS imports(import_id TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(account_id), name TEXT NOT NULL, branch TEXT NOT NULL, request_id TEXT NOT NULL UNIQUE, bundle_sha256 TEXT NOT NULL, size_bytes INTEGER NOT NULL, state TEXT NOT NULL CHECK(state IN ('awaiting-upload','uploaded','validating','provisioning','ready','failed')), source_identity TEXT, repo_id TEXT UNIQUE, error TEXT, created_at INTEGER NOT NULL, stage_dev INTEGER, stage_ino INTEGER, source_dev INTEGER, source_ino INTEGER, work_name TEXT, work_dev INTEGER, work_ino INTEGER, work_repo_dev INTEGER, work_repo_ino INTEGER, upload_temp_name TEXT, upload_temp_dev INTEGER, upload_temp_ino INTEGER, reserved_stage_bytes INTEGER NOT NULL DEFAULT 0, mode TEXT NOT NULL DEFAULT 'bundle' CHECK(mode IN ('bundle','push')), push_tip TEXT, UNIQUE(account_id,name))"
+
+    @staticmethod
+    def _import_tokens_ddl():
+        return "CREATE TABLE import_tokens(import_id TEXT PRIMARY KEY REFERENCES imports(import_id), token_id TEXT NOT NULL UNIQUE, digest TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)"
+
+    @staticmethod
+    def _migrate_v4_import_columns(con):
+        columns = {row[1] for row in con.execute("PRAGMA table_info(imports)")}
+        required_base = {"import_id", "account_id", "name", "branch", "request_id", "bundle_sha256", "size_bytes", "state", "source_identity", "repo_id", "error", "created_at"}
+        if not required_base.issubset(columns):
+            raise ForgeError("host import catalog schema is invalid", "integrity")
+        missing = {
+            "stage_dev": "INTEGER", "stage_ino": "INTEGER", "source_dev": "INTEGER", "source_ino": "INTEGER",
+            "work_name": "TEXT", "work_dev": "INTEGER", "work_ino": "INTEGER", "work_repo_dev": "INTEGER", "work_repo_ino": "INTEGER",
+            "upload_temp_name": "TEXT", "upload_temp_dev": "INTEGER", "upload_temp_ino": "INTEGER",
+            "reserved_stage_bytes": "INTEGER NOT NULL DEFAULT 0",
+        }
+        additions = {name: ddl for name, ddl in missing.items() if name not in columns}
+        if additions and con.execute("SELECT count(*) FROM imports").fetchone()[0]:
+            raise ForgeError("cannot safely migrate nonempty v4 import operations", "integrity")
+        for name, ddl in additions.items():
+            con.execute(f"ALTER TABLE imports ADD COLUMN {name} {ddl}")
 
     def approve_account(self, owner_name: str, emails: list[str], *, account_id: str | None = None, repo_limit: int | None = None) -> str:
         self._check_local_config()
@@ -560,6 +682,7 @@ class Host:
         for row in rows:
             if not OPAQUE.fullmatch(row["repo_id"]):
                 raise ForgeError("host repository id is invalid", "integrity")
+            self.prepare_repository(row["repo_id"])
             root = self.root / "repos" / row["repo_id"]
             self._check_layout()
             marker = _read_json(self.root / "locks" / f"{row['repo_id']}.owned")
@@ -598,6 +721,12 @@ class Host:
             con.execute("INSERT INTO host_sessions VALUES(?,?,?,?,?,NULL)",
                         (session_id, account_id, digest, now, now + lifetime))
         return f"bsh1.{session_id}.{secret}"
+
+    def is_host_admin(self, account_id):
+        with self._connect(read_only=True) as con:
+            configured = con.execute("SELECT value FROM host_settings WHERE key='bootstrap_account_id'").fetchone()
+            approved = con.execute("SELECT 1 FROM accounts WHERE account_id=? AND state='approved'", (account_id,)).fetchone()
+        return bool(configured and configured[0] == account_id and approved)
 
     def authenticate_session(self, token: str) -> dict | None:
         match = HOST_TOKEN_RE.fullmatch(token) if isinstance(token, str) else None
@@ -643,6 +772,7 @@ class Host:
         result = []
         for row in rows:
             try:
+                self.prepare_repository(row["repo_id"])
                 root = self.root / "repos" / row["repo_id"]
                 self._check_layout()
                 if root.is_symlink() or not root.is_dir() or root.resolve(strict=True).parent != (self.root / "repos").resolve(strict=True):
@@ -715,6 +845,13 @@ class Host:
             row = con.execute("SELECT owner_account_id FROM repos WHERE repo_id=?", (repo_id,)).fetchone()
         return row[0] if row else None
 
+    def _account_owner(self, account_id: str) -> str:
+        with self._connect(read_only=True) as con:
+            row = con.execute("SELECT owner_name FROM accounts WHERE account_id=? AND state='approved'", (account_id,)).fetchone()
+        if not row:
+            raise ForgeError("host account is unavailable", "policy")
+        return row[0]
+
     def reserve_membership_intent(self, repo_id: str, account_id: str, principal_id: str,
                                   email: str, clerk_user_id: str, inputs_hash: str) -> dict:
         with self._connect() as con:
@@ -749,6 +886,7 @@ class Host:
             account = con.execute("SELECT clerk_user_id,emails,state FROM accounts WHERE account_id=?", (account_id,)).fetchone()
         if not intent or not repo or repo["state"] != "ready" or not account or account["state"] != "approved":
             raise ForgeError("membership intent is not active", "policy")
+        self.prepare_repository(repo_id)
         root = self.root / "repos" / repo_id
         self._check_layout()
         if root.is_symlink() or not root.is_dir() or root.resolve(strict=True).parent != (self.root / "repos").resolve(strict=True):
@@ -875,7 +1013,8 @@ class Host:
 
     def create_repo(self, owner_name: str, name: str, *, request_id: str,
                    source: Path | str | None = None, branch: str = "main",
-                   seed_empty: bool = False, failpoint=None) -> dict:
+                   seed_empty: bool = False, failpoint=None, _import_id: str | None = None,
+                   _publish_guard=None) -> dict:
         owner_name, name = _slug(owner_name, "owner name"), _slug(name, "repository name")
         self._check_local_config()
         if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", request_id):
@@ -905,7 +1044,7 @@ class Host:
             tip = _git(source_path, "rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}")
             if _git(source_path, "rev-parse", "--show-object-format") != "sha1":
                 raise ForgeError("only SHA-1 Git sources are supported")
-            source_identity = f"{source_path}\0{branch}\0{tip}"
+            source_identity = self.source_identity(source_path, branch, tip)
             kind = "import"
         else:
             source_identity, kind = f"seeded-empty:{branch}", "seeded-empty"
@@ -915,6 +1054,24 @@ class Host:
                 account = con.execute("SELECT * FROM accounts WHERE owner_name=? AND state='approved'", (owner_name,)).fetchone()
                 if not account:
                     raise ForgeError("unknown or unapproved host account", "policy")
+                import_row = None
+                if _import_id is not None:
+                    import_row = con.execute("SELECT * FROM imports WHERE import_id=? AND account_id=?", (_import_id, account["account_id"])).fetchone()
+                    expected_source = str(self.root / "imports" / _import_id / "source.git")
+                    if source_path is None:
+                        raise ForgeError("import reservation requires a source", "conflict")
+                    source_stat = source_path.stat()
+                    current_tip = source_identity.rsplit("\0", 1)[-1]
+                    expected_import_identity = self.source_receipt(import_row, current_tip, source_stat) if import_row else None
+                    if (not import_row or import_row["request_id"] != request_id or import_row["name"] != name or import_row["branch"] != branch or
+                        import_row["source_identity"] != expected_import_identity or
+                        (source_stat.st_dev, source_stat.st_ino) != (import_row["source_dev"], import_row["source_ino"]) or
+                        str(source_path) != expected_source or import_row["state"] not in {"provisioning", "failed"}):
+                        raise ForgeError("import reservation is invalid", "conflict")
+                else:
+                    if con.execute("SELECT 1 FROM imports WHERE request_id=? OR (account_id=? AND name=? AND repo_id IS NULL)",
+                                   (request_id, account["account_id"], name)).fetchone():
+                        raise ForgeError("repository request or name is already reserved", "conflict")
                 immutable = json.dumps([account["account_id"], owner_name, name, branch, kind, source_identity], separators=(",", ":"))
                 inputs_hash = hashlib.sha256(immutable.encode()).hexdigest()
                 existing = con.execute("SELECT * FROM repos WHERE request_id=?", (request_id,)).fetchone()
@@ -922,16 +1079,18 @@ class Host:
                     if existing["inputs_hash"] != inputs_hash:
                         raise ForgeError("request id was already used with different inputs", "conflict")
                     repo_id = existing["repo_id"]
+                    if import_row and import_row["repo_id"] not in (None, repo_id):
+                        raise ForgeError("import repository reservation changed", "integrity")
                 else:
                     if account["repo_limit"] is not None:
-                        count = con.execute("SELECT count(*) FROM repos WHERE owner_account_id=?", (account["account_id"],)).fetchone()[0]
+                        count = con.execute("SELECT (SELECT count(*) FROM repos WHERE owner_account_id=?)+(SELECT count(*) FROM imports WHERE account_id=? AND repo_id IS NULL AND import_id!=COALESCE(?,''))", (account["account_id"], account["account_id"], _import_id)).fetchone()[0]
                         if count >= account["repo_limit"]:
                             raise ForgeError("host account repository capacity is exhausted", "limits")
                     raw_total_limit = con.execute("SELECT value FROM host_settings WHERE key='total_repo_limit'").fetchone()[0]
                     if not isinstance(raw_total_limit, str) or not re.fullmatch(r"[1-9][0-9]{0,6}", raw_total_limit):
                         raise ForgeError("host repository budget setting is corrupt", "integrity")
                     total_limit = int(raw_total_limit)
-                    total = con.execute("SELECT count(*) FROM repos").fetchone()[0]
+                    total = con.execute("SELECT (SELECT count(*) FROM repos)+(SELECT count(*) FROM imports WHERE repo_id IS NULL AND import_id!=COALESCE(?,''))", (_import_id,)).fetchone()[0]
                     if total >= total_limit:
                         raise ForgeError("host repository capacity is exhausted", "limits")
                     repo_id = uuid.uuid4().hex
@@ -939,6 +1098,10 @@ class Host:
                     try:
                         con.execute("INSERT INTO repos VALUES(?,?,?,?,?,?,?,?,?,'reserved',NULL,NULL)",
                                     (repo_id, account["account_id"], name, branch, kind, source_identity, request_id, inputs_hash, now))
+                        if import_row:
+                            con.execute("UPDATE imports SET repo_id=? WHERE import_id=? AND repo_id IS NULL", (repo_id, _import_id))
+                            if con.execute("SELECT changes()").fetchone()[0] != 1:
+                                raise ForgeError("import reservation conversion failed", "conflict")
                     except sqlite3.IntegrityError as error:
                         raise ForgeError("repository name or request id is already reserved", "conflict") from error
                 con.commit()
@@ -946,6 +1109,7 @@ class Host:
             raise ForgeError("repository name or request id is already reserved", "conflict") from error
         if not OPAQUE.fullmatch(repo_id) or not OPAQUE.fullmatch(account["account_id"]):
             raise ForgeError("host catalog contains an invalid opaque id", "integrity")
+        self.prepare_repository(repo_id)
         root = self.root / "repos" / repo_id
         # Never follow or remove an unexpected path at a reserved id.
         if root.is_symlink() or (root.exists() and not root.is_dir()):
@@ -968,7 +1132,7 @@ class Host:
                 if failpoint: failpoint("reserved")
                 if kind == "import":
                     current = _git(source_path, "rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}")
-                    if f"{source_path}\0{branch}\0{current}" != source_identity:
+                    if self.source_identity(source_path, branch, current) != source_identity:
                         raise ForgeError("import source branch changed since reservation", "conflict")
                     forge_source = source_path
                 else:
@@ -987,6 +1151,8 @@ class Host:
                     raise ForgeError("imported source tip differs from pinned reservation", "conflict")
                 if was_ready and row["repository_id"] != repository.repository_id:
                     raise ForgeError("ready repository identity differs from host registry", "integrity")
+                if _publish_guard is not None:
+                    _publish_guard()
                 with self._connect() as con:
                     con.execute("BEGIN IMMEDIATE")
                     current = con.execute("SELECT * FROM repos WHERE repo_id=?", (repo_id,)).fetchone()
@@ -994,7 +1160,8 @@ class Host:
                     if (current["inputs_hash"] != inputs_hash or not approved or
                         approved["clerk_user_id"] != account["clerk_user_id"]):
                         raise ForgeError("reservation or approval changed before publication", "conflict")
-                    con.execute("INSERT OR REPLACE INTO memberships VALUES(?,?,?,'active')", (repo_id, current["owner_account_id"], "owner"))
+                    if not was_ready:
+                        con.execute("INSERT OR REPLACE INTO memberships VALUES(?,?,?,'active')", (repo_id, current["owner_account_id"], "owner"))
                     con.execute("UPDATE repos SET state='ready',repository_id=?,error=NULL WHERE repo_id=?", (repository.repository_id, repo_id))
                     con.commit()
                 if failpoint: failpoint("ready")

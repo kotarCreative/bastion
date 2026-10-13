@@ -1,5 +1,68 @@
 # Cloudflare port verification
 
+## Multi-repository integration — October 12, 2026
+
+The current entry point is the empty multi-repository host, not the historical
+single-forge/demo runtime described below. Its local verification passed:
+
+- Full Python regression: **726 passed, 1 opt-in test skipped**, plus 319 unittest
+  subtests. Final follow-up regression: **70 passed**, plus 33 subtests, covering
+  the latest recovery barriers, bootstrap and repository transport changes.
+- Cloudflare Worker: **9 Vitest tests**, TypeScript checks, regenerated bindings,
+  and Wrangler dry-run packaging without deployment or Container rollout.
+- Browser: all four SPA suites, including scoped host/repo authentication,
+  account approval, import credentials/retries and stale-response isolation.
+- Docker image build, empty-host bootstrap inside the image with networking
+  disabled, and Compose configuration with an isolated validation environment.
+
+`tests/test_cloudflare_host.py` runs real workerd SQL with an authenticated HTTPS
+Artifacts fixture. It verifies empty-host onboarding, independent repository
+catalogs/branches, cross-repository token rejection, native first Git push,
+collaborator visibility/allowed writes/denied hidden writes, and preservation of
+identities, history, policy and tokens after deleting the container workspace and
+restarting workerd. Provisioning and import interruption tests recover the same
+durable repository identity without re-seeding it. Catalog outages fail closed.
+
+The test suites above are local integration evidence. A live deployment and
+public-endpoint verification followed with explicit operator authorization; see
+below. A complete authenticated browser journey through real Clerk is still
+not verified. Whole-host backup/migration and coordinated deprovisioning remain
+separate work.
+
+### Live multi-repository deployment
+
+On October 12, the `bastion-forge` Worker and Container image were deployed to
+`https://bastion-forge.kotarcreative.workers.dev` with immediate Container rollout.
+Existing Clerk and administrator secrets were retained.
+
+- Worker version: `a65913f3-61be-4f6a-8c57-ca327787b362`.
+- Container image digest:
+  `sha256:5d60cf00295df30176c042c1780efdc757b55b4365456a072283548f7941221c`.
+- `/healthz` and `/readyz`: HTTP 200.
+- `/api/v1/auth/config`: HTTP 200, Clerk enabled, host mode, first-push import.
+- `/` and `/assets/app.js`: HTTP 200, multi-repository dashboard, import and
+  administrator account-approval UI present.
+- Unauthenticated session, repository and host-account APIs: HTTP 401.
+- Old `/owner.git` and absent `/admin/demo.git` Git routes: HTTP 404.
+- Container inventory reports the new application version running; live tail
+  confirms successful private host-catalog SQL requests through `ContainerProxy`.
+
+The first health request during rollout returned Worker error 1101; subsequent
+readiness and health requests succeeded. Python urllib's default client received
+edge error 1010, so the live endpoint checks used curl. Operator SSH inspection
+was unavailable (Wrangler's WebSocket connection returned 400); it is not used
+by normal application traffic.
+
+With explicit permission to discard old demo data, the old `bastion-storage`
+branch was deleted from the `bastion-production` Artifacts repository using an
+exact-ref lease. That repository itself was retained for the new host's branches.
+The temporary cleanup token was revoked. Legacy singleton DO storage and the
+separate preview Artifacts repository were not purged, and are not adopted by
+the new host. Sign in with the configured bootstrap account to complete the
+authenticated create/import/permissions journey.
+
+## Historical single-repository verification
+
 Branch: `feat/cloudflare-artifacts`.
 
 ## Results

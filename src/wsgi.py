@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from demo_server import create_app
+from host_server import create_app
 
 
 root = os.environ.get("BASTION_ROOT")

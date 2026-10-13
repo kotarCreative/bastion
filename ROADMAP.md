@@ -13,7 +13,7 @@ Bastion currently provides:
 - synchronous receive validation with immutable canonical and evidence packs;
 - WAL-backed request idempotency and crash-safe publication;
 - optional projection jobs for cache freshness;
-- SQLite and PostgreSQL control-plane indexes with leases and checksums;
+- SQLite, PostgreSQL and Cloudflare Durable Object control-plane indexes with leases and checksums;
 - pinned-generation backup and verified restore;
 - a read-only repository invariant checker;
 - smart HTTP with per-view tokens and isolated intake repositories;
@@ -27,15 +27,21 @@ Track the implementation contract in
 [Multi-Repository Accounts](.specs/017-multi-repo-accounts.md).
 
 1. **Independent repositories:** approved accounts own multiple forge roots,
-   with isolated catalogs, histories, permissions, and credentials. The local
-   operator foundation is implemented.
+   with isolated catalogs, histories, permissions, and credentials. Local hosting
+   and the Cloudflare host/per-repository catalog adapter are implemented.
 2. **Usable hosted workflow:** account sessions independent of repository views,
    private repository discovery, creation and switching in the browser, scoped
-   collaborator discovery, and namespaced HTTPS clone/push. This is the current
-   served slice is implemented on persistent local storage; production rollout
-   and distributed admission remain gated on the operations milestone.
+   collaborator discovery, and namespaced HTTPS clone/push. The served slice is
+   implemented locally and on Cloudflare with Artifacts-backed objects and
+   disposable container disk. Initial host admins can approve accounts in the
+   dashboard; live rollout and distributed admission remain operations work.
 3. **Bring existing code:** bounded, recoverable self-service history import,
-   with clear author/branch constraints. Seeded-empty creation must not pretend
+   with clear author/branch constraints. Bounded single-branch first-push import
+   using Git smart HTTP(S) and pending-operation recovery is implemented for
+   local and Cloudflare hosts, with digest-pinned Artifacts intake for cold recovery.
+   Remote URL imports, raw-history owner-view compatibility,
+   cancellation, and staged source garbage collection remain separate work.
+   Seeded-empty creation must not pretend
    to accept an unrelated existing local history by a normal first push.
 4. **Operate safely:** isolated production catalogs/object stores, TLS,
    distributed quotas, deprovisioning and credential revocation, auditability,

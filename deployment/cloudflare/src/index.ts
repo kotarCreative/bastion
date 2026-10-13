@@ -1,4 +1,5 @@
 import { Container, ContainerProxy, type OutboundHandler } from "@cloudflare/containers";
+import { routeCatalog } from "./catalog-routing";
 export { ContainerProxy };
 export { ForgeCatalog } from "./catalog";
 
@@ -42,7 +43,7 @@ export class ForgeContainer extends Container<Env> {
 	static {
 		this.outboundByHost = {
 			"catalog.bastion.internal": (request, env, ctx) =>
-				env.CATALOG.getByName(ctx.containerId).fetch(request),
+				routeCatalog(request, env.CATALOG, ctx.containerId),
 		} satisfies Record<string, OutboundHandler<Env>>;
 	}
 	defaultPort = PORT;
@@ -146,7 +147,7 @@ export class ForgeContainer extends Container<Env> {
 					BASTION_ARTIFACTS_REMOTE: activeConfig.remote,
 					BASTION_ARTIFACTS_TOKEN: activeConfig.token,
 					BASTION_BOOTSTRAP_ADMIN_EMAIL: this.env.BASTION_BOOTSTRAP_ADMIN_EMAIL,
-					BASTION_ROOT: "/var/lib/bastion/forge",
+					BASTION_ROOT: "/var/lib/bastion/host",
 					BASTION_DATABASE: "durable_objects",
 					BASTION_CATALOG_ENDPOINT: "http://catalog.bastion.internal",
 					...clerkEnv,

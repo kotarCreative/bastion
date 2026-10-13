@@ -15,6 +15,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import re
 from pathlib import Path
 from typing import Iterable
 
@@ -60,7 +61,13 @@ class CatalogClient:
                     raise ForgeError("Durable Object result exceeds size limit", "storage")
                 return json.loads(encoded)
             except urllib.error.HTTPError as error:
+                try:
+                    detail = json.loads(error.read(MAX_RESPONSE + 1))
+                except (OSError, ValueError):
+                    detail = {}
                 error.close()
+                if detail.get("error") == "constraint-conflict":
+                    raise ForgeError("catalog uniqueness constraint failed", "conflict") from None
                 if error.code == 409:
                     raise ForgeError("Durable Object transaction revision conflict", "storage") from None
                 raise ForgeError("Durable Object storage unavailable", "storage") from None
@@ -73,6 +80,11 @@ class CatalogClient:
 
     def status(self) -> dict:
         return self.call("/status", {})
+
+    def scoped(self, catalog_id: str) -> "CatalogClient":
+        if catalog_id != "host" and not re.fullmatch(r"repos/[0-9a-f]{32}", catalog_id):
+            raise ForgeError("invalid catalog identity", "integrity")
+        return CatalogClient(self.endpoint.rstrip("/") + "/" + catalog_id, token=self.token)
 
     def commit(self, revision: int, statements: list[dict], *, root: dict | None = None) -> int:
         body = {"id": uuid.uuid4().hex, "revision": revision, "statements": statements}
@@ -177,6 +189,12 @@ class _Cursor:
     def fetchall(self):
         return self.rows
 
+    def fetchone(self):
+        return self.rows.pop(0) if self.rows else None
+
+    def __iter__(self):
+        return iter(self.rows)
+
     def close(self):
         self.rows = []
 
@@ -220,7 +238,14 @@ class DurableObjectsBackend:
 
     def __init__(self, root: Path, client: CatalogClient | None = None):
         self._root = root
-        self.client = client or CatalogClient()
+        if client is None:
+            client = CatalogClient()
+            config_path = root / "backend.json"
+            if config_path.exists():
+                record = json.loads(config_path.read_text())
+                if record.get("catalog_id") is not None:
+                    client = client.scoped("repos/" + record["catalog_id"])
+        self.client = client
 
     def connect(self):
         return _Connection(self.client)

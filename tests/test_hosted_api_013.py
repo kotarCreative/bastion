@@ -13,7 +13,7 @@ from pathlib import Path
 
 import forge
 import tokens as token_model
-from demo_server import create_app
+from repository_server import create_app
 from http_server import add_token, authenticate_token, list_tokens, revoke_token
 from store import open_store
 from tests import identity_harness

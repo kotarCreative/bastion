@@ -589,7 +589,7 @@ class Exploit6NoAdmissionControl(unittest.TestCase):
         import ast
         from pathlib import Path as P
 
-        source = (P(__file__).resolve().parent.parent / "src" / "demo_server.py").read_text()
+        source = (P(__file__).resolve().parent.parent / "src" / "repository_server.py").read_text()
         acquired = source.count('REQUEST_SLOTS"].acquire')
         released = source.count('REQUEST_SLOTS"].release')
         self.assertGreater(acquired, 0, "REQUEST_SLOTS must be acquired on requests")

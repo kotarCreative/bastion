@@ -7,7 +7,11 @@ x-bastion-service: &bastion-service
   image: bastion:test
   environment: &bastion-environment
     BASTION_DATA_DIR: /var/lib/bastion
-    BASTION_ROOT: /var/lib/bastion/forge
+    BASTION_ROOT: /var/lib/bastion/host
+    BASTION_BOOTSTRAP_ADMIN_EMAIL: ${BASTION_BOOTSTRAP_ADMIN_EMAIL:?set the initial admin email}
+    CLERK_PUBLISHABLE_KEY: ${CLERK_PUBLISHABLE_KEY:?set Clerk publishable key}
+    CLERK_SECRET_KEY: ${CLERK_SECRET_KEY:?set Clerk secret key}
+    CLERK_AUTHORIZED_PARTIES: ${CLERK_AUTHORIZED_PARTIES:?set the exact HTTPS origin}
   volumes:
     - bastion-data:/var/lib/bastion
   restart: unless-stopped
@@ -48,31 +52,6 @@ services:
       retries: 6
       start_period: 15s
 
-  bastion-git:
-    <<: *bastion-service
-    command: ["python", "forge.py", "serve", "/var/lib/bastion/forge", "--host", "0.0.0.0", "--port", "8001"]
-    expose:
-      - "8001"
-    healthcheck:
-      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8001), 3).close()"]
-      interval: 10s
-      timeout: 5s
-      retries: 6
-      start_period: 15s
-
-  bastion-worker:
-    <<: *bastion-service
-    command: ["/app/deployment/worker-loop.sh"]
-    environment:
-      <<: *bastion-environment
-      BASTION_WORKER_INTERVAL_SECONDS: ${BASTION_WORKER_INTERVAL_SECONDS:-2}
-    healthcheck:
-      test: ["CMD", "python", "-c", "import os,time; age=time.time()-os.path.getmtime('/var/lib/bastion/worker-ready'); raise SystemExit(0 if age < 30 else 1)"]
-      interval: 10s
-      timeout: 5s
-      retries: 4
-      start_period: 15s
-
   caddy:
     image: caddy:2.11.4-alpine
     environment:
@@ -87,17 +66,13 @@ services:
     depends_on:
       bastion-web:
         condition: service_healthy
-      bastion-git:
-        condition: service_healthy
-      bastion-worker:
-        condition: service_healthy
     restart: unless-stopped
     networks:
       - bastion
 
   bootstrap:
     <<: *bastion-service
-    command: ["/app/deployment/bootstrap-demo.sh"]
+    command: ["python", "deployment/bootstrap-host.py"]
     restart: "no"
     profiles: ["tools"]
 

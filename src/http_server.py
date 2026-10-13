@@ -716,7 +716,7 @@ class BastionRequestHandler(BaseHTTPRequestHandler):
     ) -> None:
         # Budgets apply before replay, materialization, or subprocess work.
         if receive and limits.free_below_floor(self.root):
-            raise HttpError(503, b"demo-read-only")
+            raise HttpError(503, b"repository-read-only")
         try:
             _repository, manifest, active, materialized = _resolve_service(self.root, view)
             if service == "git-upload-pack":
@@ -733,7 +733,7 @@ class BastionRequestHandler(BaseHTTPRequestHandler):
             and target == "info/refs"
             and manifest.head_seq >= limits.MAX_WAL_SEQUENCE
         ):
-            raise HttpError(503, b"demo-read-only")
+            raise HttpError(503, b"repository-read-only")
         if not self.server.git_slots.acquire(blocking=False):
             self.close_connection = True
             raise HttpError(503, BODY_503)

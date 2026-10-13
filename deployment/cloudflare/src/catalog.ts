@@ -275,6 +275,9 @@ export class ForgeCatalog extends DurableObject {
 			return reply({ error: "not-found" }, 404);
 		} catch (error) {
 			// SQL, parameter values, and account data never enter error responses.
+			if (error instanceof Error && /(?:UNIQUE|PRIMARY KEY) constraint failed/i.test(error.message)) {
+				return reply({ error: "constraint-conflict" }, 409);
+			}
 			return reply({ error: error instanceof Conflict ? "revision-conflict" : "catalog-operation-failed" }, error instanceof Conflict ? 409 : 503);
 		}
 	}

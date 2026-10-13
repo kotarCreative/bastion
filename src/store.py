@@ -160,6 +160,8 @@ def read_backend_record(root: Path) -> dict:
         raise ForgeError(f"unknown storage backend: {kind!r}")
     if kind == "postgres" and not record.get("dsn"):
         raise ForgeError("postgres backend record lacks a dsn")
+    if kind == "durable_objects" and record.get("catalog_id") is not None and not re.fullmatch(r"[0-9a-f]{32}", record["catalog_id"]):
+        raise ForgeError("invalid repository catalog identity", "integrity")
     return record
 
 
@@ -2345,8 +2347,13 @@ def initialize_store(
     admin_uri = os.environ.get("BASTION_ADMIN_DATABASE") or admin_database
     if uri.startswith("postgres://") or uri.startswith("postgresql://"):
         record = {"backend": "postgres", "dsn": uri}
-    elif uri == "durable_objects":
+    elif uri == "durable_objects" or uri.startswith("durable_objects:"):
         record = {"backend": "durable_objects"}
+        if uri.startswith("durable_objects:"):
+            catalog_id = uri.partition(":")[2]
+            if not re.fullmatch(r"[0-9a-f]{32}", catalog_id):
+                raise ForgeError("invalid repository catalog identity", "integrity")
+            record["catalog_id"] = catalog_id
     elif uri in ("", "sqlite"):
         record = {"backend": "sqlite"}
     else:
@@ -2354,8 +2361,11 @@ def initialize_store(
     if record["backend"] == "sqlite":
         store = Store(_SqliteBackend(root / "store.sqlite3"))
     elif record["backend"] == "durable_objects":
-        from durable_store import DurableObjectsBackend
-        store = Store(DurableObjectsBackend(root))
+        from durable_store import CatalogClient, DurableObjectsBackend
+        client = CatalogClient()
+        if "catalog_id" in record:
+            client = client.scoped("repos/" + record["catalog_id"])
+        store = Store(DurableObjectsBackend(root, client))
     else:
         backend = _PostgresBackend(record["dsn"], root, pooled=False)
         # Provisioning happens here (init path) and never in open_store, and

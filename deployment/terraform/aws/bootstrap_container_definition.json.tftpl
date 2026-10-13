@@ -3,7 +3,7 @@
     "name": "bastion-bootstrap",
     "image": "${image}",
     "essential": true,
-    "command": ["/app/deployment/bootstrap-demo.sh"],
+    "command": ["python", "-c", "raise SystemExit('The single-repository AWS demo profile is retired. Deploy the multi-repository Cloudflare host instead.')"],
     "environment": [
       { "name": "BASTION_DATA_DIR", "value": "/var/lib/bastion" },
       { "name": "BASTION_ROOT", "value": "/var/lib/bastion/forge" },

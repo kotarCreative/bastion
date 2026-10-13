@@ -14,7 +14,7 @@ import forge
 from errors import ForgeError
 from identity import CAPABILITIES
 from accounts import link_clerk_account
-from demo_server import create_app
+from repository_server import create_app
 from http_server import add_token
 from service import add_role, bind_role, managed_private_paths, set_path_privacy, transition_principal
 from state import load_state

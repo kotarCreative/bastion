@@ -27,29 +27,56 @@ class _NoopSemaphore:
         return None
 
 
-def create_app(root: Path | str) -> Flask:
-    host = Host(root, initialize=False, migrate=True)
+def create_app(root: Path | str, *, host_catalog=None) -> Flask:
+    host = host_catalog or Host(root, initialize=False, migrate=True)
     limits.validate()
     from clerk_auth import load_clerk_config
     clerk_config = load_clerk_config()
     app = Flask(__name__)
     from http_server import RECEIVE_MAX_BODY, UPLOAD_MAX_BODY
     app.config["MAX_CONTENT_LENGTH"] = max(RECEIVE_MAX_BODY, UPLOAD_MAX_BODY)
+    app.config["MAX_CONTENT_LENGTH"] = max(app.config["MAX_CONTENT_LENGTH"], limits.IMPORT_PACK_BYTES + 8192)
     cache: dict[str, object] = {}
     cache_lock = threading.RLock()
     global_git = threading.BoundedSemaphore(limits.MAX_ACTIVE_GIT)
     global_receive = threading.BoundedSemaphore(limits.MAX_ACTIVE_RECEIVES)
     global_requests = threading.BoundedSemaphore(limits.MAX_ACTIVE_REQUESTS)
     global_provisions = threading.BoundedSemaphore(limits.MAX_ACTIVE_PROVISIONS)
+    global_imports = threading.BoundedSemaphore(limits.MAX_ACTIVE_IMPORTS)
     admission_lock = threading.Lock()
     active_ips: dict[str, int] = {}
     active_tokens: dict[tuple[str, str], int] = {}
+    active_import_actors: dict[str, int] = {}
+    active_import_ips: dict[str, int] = {}
     app.config.update(HOST_REQUEST_SLOTS=global_requests, HOST_GIT_SLOTS=global_git,
-                      HOST_RECEIVE_SLOTS=global_receive, HOST_PROVISION_SLOTS=global_provisions)
+                      HOST_RECEIVE_SLOTS=global_receive, HOST_PROVISION_SLOTS=global_provisions,
+                      HOST_IMPORT_SLOTS=global_imports)
+    app.config["HOST_CATALOG"] = host
+
+    def admit_import(actor):
+        address = request.remote_addr or ""
+        account_id = actor["account_id"]
+        if not global_imports.acquire(blocking=False): return None
+        with admission_lock:
+            if (active_import_actors.get(account_id, 0) >= limits.MAX_ACTIVE_IMPORTS_PER_ACCOUNT or
+                    active_import_ips.get(address, 0) >= limits.MAX_IMPORTS_PER_IP):
+                global_imports.release(); return None
+            active_import_actors[account_id] = active_import_actors.get(account_id, 0) + 1
+            active_import_ips[address] = active_import_ips.get(address, 0) + 1
+        def release():
+            with admission_lock:
+                for table, key in ((active_import_actors, account_id), (active_import_ips, address)):
+                    count = table.get(key, 0)
+                    if count <= 1: table.pop(key, None)
+                    else: table[key] = count - 1
+            global_imports.release()
+        return release
 
     @app.before_request
     def request_admission():
         from flask import g
+        if request.path in ("/healthz", "/readyz"):
+            return None
         if not global_requests.acquire(blocking=False):
             return jsonify(error="server-saturated"), 503
         g.host_request_slot = True
@@ -116,7 +143,7 @@ def create_app(root: Path | str) -> Flask:
         response.headers.setdefault("Cache-Control", "no-store")
         response.headers.setdefault("Referrer-Policy", "no-referrer")
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
-        from demo_server import _security_headers
+        from repository_server import _security_headers
         for key, value in _security_headers(clerk_config.frontend_api_origin if clerk_config else None).items():
             response.headers.setdefault(key, value)
         response.headers.pop("Set-Cookie", None)
@@ -150,9 +177,10 @@ def create_app(root: Path | str) -> Flask:
     def config():
         from clerk_auth import load_clerk_config
         cfg = load_clerk_config()
-        return jsonify({"enabled": False, "mode": "host"} if cfg is None else {
+        return jsonify({"enabled": False, "mode": "host", "import_limits": {"pack_bytes": limits.IMPORT_PACK_BYTES}, "import_mode": "first-push"} if cfg is None else {
             "enabled": True, "publishable_key": cfg.publishable_key,
-            "frontend_api_origin": cfg.frontend_api_origin, "mode": "host"})
+            "frontend_api_origin": cfg.frontend_api_origin, "mode": "host",
+            "import_limits": {"pack_bytes": limits.IMPORT_PACK_BYTES}, "import_mode": "first-push"})
 
     @app.post("/api/v1/auth/clerk")
     def clerk_login():
@@ -172,7 +200,7 @@ def create_app(root: Path | str) -> Flask:
             token = host.issue_session(account_id)
             with host._connect(read_only=True) as con:
                 account = con.execute("SELECT account_id,owner_name FROM accounts WHERE account_id=? AND state='approved'", (account_id,)).fetchone()
-            return jsonify(access_token=token, account={"account_id": account["account_id"], "owner_name": account["owner_name"]}, mode="host")
+            return jsonify(access_token=token, account={"account_id": account["account_id"], "owner_name": account["owner_name"], "is_host_admin": host.is_host_admin(account["account_id"])}, mode="host")
         except ClerkAuthenticationError:
             return jsonify(error="invalid-credentials"), 401
         except (ValueError, UnicodeDecodeError):
@@ -201,7 +229,37 @@ def create_app(root: Path | str) -> Flask:
             return jsonify(error="auth-required"), 401
         with host._connect(read_only=True) as con:
             row = con.execute("SELECT account_id,owner_name FROM accounts WHERE account_id=? AND state='approved'", (account["account_id"],)).fetchone()
-        return jsonify(account={"account_id": row["account_id"], "owner_name": row["owner_name"]}, mode="host")
+        return jsonify(account={"account_id": row["account_id"], "owner_name": row["owner_name"], "is_host_admin": host.is_host_admin(row["account_id"])}, mode="host")
+
+    @app.route("/api/v1/host/accounts", methods=["GET", "POST"])
+    def host_accounts():
+        actor = auth()
+        if not actor:
+            return jsonify(error="auth-required"), 401
+        if not host.is_host_admin(actor["account_id"]):
+            return jsonify(error="not-found"), 404
+        if request.method == "GET":
+            with host._connect(read_only=True) as con:
+                rows = con.execute("SELECT account_id,owner_name,emails,state FROM accounts ORDER BY owner_name LIMIT 1000").fetchall()
+            return jsonify(accounts=[{"owner_name": row["owner_name"], "emails": json.loads(row["emails"]), "state": row["state"]} for row in rows])
+        try:
+            body = _bounded_json(4096)
+            if not isinstance(body, dict) or set(body) != {"owner_name", "email"} or not isinstance(body["email"], str) or not isinstance(body["owner_name"], str) or len(body["email"]) > 254:
+                return jsonify(error="bad-request"), 400
+            email = body["email"].strip().lower()
+            with host._connect(read_only=True) as con:
+                existing = con.execute("SELECT account_id,owner_name,emails,state FROM accounts WHERE owner_name=?", (body["owner_name"],)).fetchone()
+            if existing:
+                if existing["state"] != "approved" or json.loads(existing["emails"]) != [email]:
+                    return jsonify(error="account-approval-failed"), 409
+                return jsonify(account={"owner_name": existing["owner_name"], "account_id": existing["account_id"]}), 201
+            account_id = host.approve_account(body["owner_name"], [body["email"]])
+            return jsonify(account={"owner_name": body["owner_name"], "account_id": account_id}), 201
+        except (ValueError, UnicodeDecodeError):
+            return jsonify(error="bad-request"), 400
+        except ForgeError as error:
+            status = 409 if error.category == "conflict" else 503 if error.category in {"storage", "integrity"} else 400
+            return jsonify(error="account-approval-failed"), status
 
     @app.route("/api/v1/repos", methods=["GET", "POST"])
     def repos():
@@ -232,6 +290,59 @@ def create_app(root: Path | str) -> Flask:
             return jsonify(error="service-unavailable" if status == 503 else "creation-failed"), status
         except (KeyError, ValueError, StopIteration):
             return jsonify(error="creation-failed"), 409
+
+    @app.post("/api/v1/imports")
+    def import_reserve():
+        actor = auth()
+        if not actor: return jsonify(error="auth-required"), 401
+        try:
+            body = _bounded_json(4096)
+            import first_push
+            row = first_push.reserve(host, actor["account_id"], body)
+            return jsonify({"import": first_push.public(host, row)}), 201
+        except ForgeError as error:
+            status = 409 if error.category == "conflict" else 413 if error.category == "limits" else 503 if error.category in {"integrity", "storage"} else 400
+            return jsonify(error="import-conflict" if status == 409 else "service-unavailable" if status == 503 else "bad-request"), status
+        except (ValueError, UnicodeDecodeError): return jsonify(error="bad-request"), 400
+
+    @app.post("/api/v1/imports/<import_id>/credentials")
+    def import_credential(import_id):
+        actor = auth()
+        if not actor: return jsonify(error="auth-required"), 401
+        release_import = admit_import(actor)
+        if release_import is None: return jsonify(error="server-saturated"), 429
+        try:
+            if _bounded_json(4096) != {}: return jsonify(error="bad-request"), 400
+            import first_push
+            def authorize():
+                current = auth()
+                if current is None or current["account_id"] != actor["account_id"]:
+                    raise ForgeError("host session is no longer valid", "authentication")
+            result = first_push.issue_credential(host, actor["account_id"], import_id, authorize=authorize)
+            return (jsonify(result), 201) if result else (jsonify(error="not-found"), 404)
+        except ForgeError as error:
+            status = 401 if error.category == "authentication" else 409 if error.category == "conflict" else 413 if error.category == "limits" else 503
+            return jsonify(error="auth-required" if status == 401 else "import-failed"), status
+        except (ValueError, UnicodeDecodeError): return jsonify(error="bad-request"), 400
+        finally:
+            release_import()
+
+    @app.get("/api/v1/imports")
+    def import_list():
+        actor = auth()
+        if not actor: return jsonify(error="auth-required"), 401
+        import first_push
+        with host._connect(read_only=True) as con:
+            rows = con.execute("SELECT * FROM imports WHERE account_id=? AND mode='push' AND state!='ready' ORDER BY created_at DESC LIMIT 1000", (actor["account_id"],)).fetchall()
+        return jsonify(imports=[first_push.public(host, dict(row)) for row in rows])
+
+    @app.get("/api/v1/imports/<import_id>")
+    def import_status(import_id):
+        actor = auth()
+        if not actor: return jsonify(error="auth-required"), 401
+        import first_push, repository_import
+        row = repository_import.get(host, actor["account_id"], import_id)
+        return (jsonify({"import": first_push.public(host, row)}), 200) if row and row["mode"] == "push" else (jsonify(error="not-found"), 404)
 
     @app.post("/api/v1/repos/<repo_id>/auth/session")
     def exchange(repo_id):
@@ -289,6 +400,7 @@ def create_app(root: Path | str) -> Flask:
 
     def child_app(repo_id):
         with cache_lock:
+            host.prepare_repository(repo_id)
             root_path = host.root / "repos" / repo_id
             # Revalidate reservation marker and physical root identity on every use.
             if not OPAQUE.fullmatch(repo_id) or root_path.is_symlink() or not root_path.is_dir():
@@ -308,8 +420,8 @@ def create_app(root: Path | str) -> Flask:
                 raise ForgeError("repository identity changed", "integrity")
             host._check_forge_storage(root_path, meta.get("canonical_branch", ""))
             if repo_id not in cache:
-                from demo_server import create_app as create_demo_app
-                child = create_demo_app(root_path)
+                from repository_server import create_app as create_repository_app
+                child = create_repository_app(root_path)
                 child.config["GIT_SLOTS"] = global_git
                 child.config["RECEIVE_SLOTS"] = global_receive
                 child.config["REQUEST_SLOTS"] = _NoopSemaphore()
@@ -450,12 +562,12 @@ def create_app(root: Path | str) -> Flask:
             app.logger.exception("Host invitation failed unexpectedly")
             return jsonify(error="service-unavailable"), 503
 
-    def _read_bounded(maximum):
+    def _read_bounded(maximum, seconds=30):
         if request.content_length is not None and request.content_length > maximum:
             raise ForgeError("request body is too large", "limits")
         stream = request.stream
         chunks, size = [], 0
-        deadline = time.monotonic() + 30
+        deadline = time.monotonic() + seconds
         while True:
             if time.monotonic() > deadline:
                 raise ForgeError("request body timed out", "limits")
@@ -502,6 +614,55 @@ def create_app(root: Path | str) -> Flask:
     def _dispatch(child, path):
         return _internal_dispatch(child, path)
 
+    def initial_push(owner, name, suffix, parsed):
+        from http_server import parse_service
+        import first_push
+        challenge = {"WWW-Authenticate": 'Basic realm="bastion import"'}
+        if parsed is None or parsed[0] not in (None, "owner"):
+            return Response("authentication required", 401, challenge)
+        credential = parsed[1]
+        row = first_push.authenticate(host, credential, owner, name)
+        if row is None:
+            return Response("authentication required", 401, challenge)
+        if request.method == "GET" and suffix == "info/refs" and parse_service(request.query_string.decode("ascii", errors="replace")) == "git-receive-pack":
+            return Response(first_push.advertisement(row), content_type="application/x-git-receive-pack-advertisement")
+        if request.method != "POST" or suffix != "git-receive-pack":
+            return Response("not found", 404)
+        if request.mimetype != "application/x-git-receive-pack-request" or request.headers.get("Content-Encoding", "identity").lower() != "identity":
+            return Response("bad request", 400)
+        release_import = admit_import({"account_id": row["account_id"]})
+        if release_import is None: return Response("throttled", 429)
+        receive_status = admit_git(row["import_id"], request.remote_addr or "", True, row["import_id"])
+        if receive_status:
+            release_import(); return Response("server saturated", receive_status)
+        acquired = []
+        try:
+            for slot in (global_provisions, global_git):
+                if not slot.acquire(blocking=False): return Response("server saturated", 503)
+                acquired.append(slot)
+            def authorize():
+                current = first_push.authenticate(host, credential, owner, name)
+                if current is None or current["import_id"] != row["import_id"]:
+                    raise ForgeError("import credential is no longer valid", "authentication")
+            import repository_import
+            with repository_import._lock(host, row["import_id"]):
+                try:
+                    authorize()
+                    first_push.reserve_intake(host, row)
+                    body = _read_bounded(limits.IMPORT_PACK_BYTES + 8192, limits.IMPORT_UPLOAD_SECONDS)
+                    first_push.receive(host, row, body, authorize, _locked=True)
+                finally:
+                    first_push.release_unused_intake(host, row)
+            return Response(first_push.report(row["branch"]), content_type="application/x-git-receive-pack-result")
+        except ForgeError as error:
+            if error.category == "authentication": return Response("authentication required", 401, challenge)
+            if error.category in {"storage", "integrity"}: return Response("service unavailable", 503)
+            return Response(first_push.report(row["branch"], error=True), content_type="application/x-git-receive-pack-result")
+        finally:
+            for slot in reversed(acquired): slot.release()
+            release_git(row["import_id"], request.remote_addr or "", True, row["import_id"])
+            release_import()
+
     @app.route("/<path:unused>", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
     def git_or_static(unused):
         path = "/" + unused
@@ -509,9 +670,17 @@ def create_app(root: Path | str) -> Flask:
         if not match:
             return Response("not found", 404)
         owner, name, suffix = match.groups()
+        from http_server import parse_git_authorization
+        parsed = parse_git_authorization(request.headers.get("Authorization"))
+        if parsed and parsed[1].startswith("bsi1."):
+            return initial_push(owner, name, suffix, parsed)
         with host._connect(read_only=True) as con:
             row = con.execute("SELECT r.repo_id FROM repos r JOIN accounts a ON a.account_id=r.owner_account_id WHERE a.owner_name=? AND r.name=? AND r.state='ready'", (owner, name)).fetchone()
         if not row:
+            with host._connect(read_only=True) as con:
+                pending = con.execute("SELECT 1 FROM imports i JOIN accounts a ON a.account_id=i.account_id WHERE a.owner_name=? AND i.name=? AND i.mode='push'", (owner, name)).fetchone()
+            if pending:
+                return initial_push(owner, name, suffix, parsed)
             return Response("not found", 404)
         repo = find_repo(row["repo_id"])
         # Git authentication and username/view binding remain in the selected child.
@@ -536,12 +705,25 @@ def create_app(root: Path | str) -> Flask:
 
     @app.get("/")
     def landing():
-        from demo_server import ASSET_DIR
+        from repository_server import ASSET_DIR
         return Response((ASSET_DIR / "index.html").read_bytes(), content_type="text/html; charset=utf-8")
+
+    @app.get("/healthz")
+    def health():
+        return jsonify(status="ok")
+
+    @app.get("/readyz")
+    def ready():
+        try:
+            with host._connect(read_only=True) as con:
+                con.execute("SELECT value FROM host_settings WHERE key='total_repo_limit'").fetchone()
+            return jsonify(status="ok")
+        except ForgeError:
+            return jsonify(error="not-ready"), 503
 
     @app.get("/assets/<path:name>")
     def assets(name):
-        from demo_server import ASSET_DIR
+        from repository_server import ASSET_DIR
         path = (ASSET_DIR / name).resolve()
         if path.parent != ASSET_DIR.resolve() or not path.is_file():
             return Response("not found", 404)

@@ -27,7 +27,7 @@
   ],
   "vars": {
     "ARTIFACTS_REPO": "bastion-production",
-    "BASTION_ROOT": "/var/lib/bastion/forge"
+    "BASTION_ROOT": "/var/lib/bastion/host"
   },
   "observability": { "enabled": true, "traces": { "enabled": true } }
 }

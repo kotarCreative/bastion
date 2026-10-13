@@ -18,9 +18,9 @@ import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
-import demo_server
+import repository_server
 import forge
-from demo_server import create_app
+from repository_server import create_app
 from http_server import add_token, make_server
 from state import load_state, recover
 from tests import identity_harness

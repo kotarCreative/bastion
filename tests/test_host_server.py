@@ -52,7 +52,7 @@ def test_approved_zero_repository_clerk_login_uses_fake_authenticator(tmp_path, 
 
 def test_exchange_revokes_session_when_downstream_envelope_fails(tmp_path, monkeypatch):
     from flask import Flask, jsonify
-    import demo_server
+    import repository_server
     from http_server import list_tokens
     host = Host(tmp_path / "host")
     account = host.approve_account("alice", ["alice@example.test"])
@@ -60,7 +60,7 @@ def test_exchange_revokes_session_when_downstream_envelope_fails(tmp_path, monke
     failed = Flask("failed-child")
     @failed.get("/api/v1/session")
     def broken_session(): return jsonify(error="service-unavailable"), 503
-    monkeypatch.setattr(demo_server, "create_app", lambda _root: failed)
+    monkeypatch.setattr(repository_server, "create_app", lambda _root: failed)
     client = create_app(host.root).test_client()
     response = client.post(f"/api/v1/repos/{repo['repo_id']}/auth/session", json={}, headers={"Authorization": "Bearer " + host.issue_session(account)})
     assert response.status_code == 503
@@ -140,11 +140,12 @@ def test_host_v1_migration_and_corrupt_catalog_fail_closed(tmp_path):
     con.execute("DROP TABLE membership_intents")
     con.execute("DROP TABLE host_sessions")
     con.execute("DROP TABLE host_settings")
+    con.execute("DROP TABLE import_tokens")
     con.execute("UPDATE schema_info SET version=1")
     con.commit(); con.close()
     migrated = Host(root)
     with migrated._connect(read_only=True) as con:
-        assert con.execute("SELECT version FROM schema_info").fetchone()[0] == 3
+        assert con.execute("SELECT version FROM schema_info").fetchone()[0] == 5
         assert con.execute("SELECT count(*) FROM membership_intents").fetchone()[0] == 0
     bad = tmp_path / "bad"
     bad.mkdir()

@@ -2,6 +2,7 @@ import { env } from "cloudflare:workers";
 import { runInDurableObject, runDurableObjectAlarm } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { ForgeCatalog } from "../src/catalog";
+import { routeCatalog } from "../src/catalog-routing";
 
 const binding = (env as { CATALOG: DurableObjectNamespace<ForgeCatalog> }).CATALOG;
 const statement = (sql: string, ...params: (string | number | null)[]) => ({ sql, params });
@@ -20,6 +21,18 @@ async function seeded(name: string) {
 }
 
 describe("Durable Object catalog transactions", () => {
+	it("routes host and repository catalogs independently and rejects unscoped traffic", async () => {
+		const host = "routing-host";
+		const id = "a".repeat(32);
+		const request = (path: string, body: unknown = {}) => new Request("http://catalog.bastion.internal" + path, { method: "POST", body: JSON.stringify(body) });
+		expect((await routeCatalog(request("/status"), binding, host)).status).toBe(404);
+		expect((await routeCatalog(request("/repos/not-an-id/status"), binding, host)).status).toBe(404);
+		const body = { id: "seed-host", revision: 0, statements: [statement("CREATE TABLE accounts (key TEXT PRIMARY KEY)")] };
+		expect((await routeCatalog(request("/host/commit", body), binding, host)).status).toBe(200);
+		expect(await (await routeCatalog(request("/host/status"), binding, host)).json()).toMatchObject({ revision: 1 });
+		expect(await (await routeCatalog(request("/repos/" + id + "/status"), binding, host)).json()).toMatchObject({ revision: 0 });
+		expect(await (await routeCatalog(request("/host/status"), binding, "other-host")).json()).toMatchObject({ revision: 0 });
+	});
 	it("reads tentative writes but rolls them back, then commits exactly once", async () => {
 		const stub = await seeded("atomic");
 		const writes = [statement("UPDATE items SET value = ? WHERE key = ?", "new", "a")];
@@ -37,7 +50,7 @@ describe("Durable Object catalog transactions", () => {
 	it("rolls back the entire batch on constraint failure", async () => {
 		const stub = await seeded("rollback");
 		const result = await call(stub, "/commit", { id: "fail", revision: 1, statements: [statement("UPDATE items SET value = 'changed'"), statement("INSERT INTO items VALUES ('a', 'duplicate')")] });
-		expect(result.status).toBe(503);
+		expect(result.status).toBe(409);
 		await runInDurableObject(stub, (_instance, state) => {
 			expect(state.storage.sql.exec("SELECT value FROM items").one()).toEqual({ value: "original" });
 			expect(state.storage.sql.exec("SELECT revision FROM _bastion_revision").one()).toEqual({ revision: 1 });
@@ -84,7 +97,7 @@ describe("Durable Object catalog transactions", () => {
 		const stub = await seeded("staged-failure");
 		const writes = [statement("UPDATE items SET value = 'changed'"), statement("INSERT INTO items VALUES ('a', 'duplicate')")];
 		let staged = await (await call(stub, "/stage", { id: "constraint", revision: 1, sequence: 0, previous: "", chunk: btoa(writes.map(s => JSON.stringify(s) + "\n").join("")) })).json();
-		expect((await call(stub, "/commit", { id: "constraint", revision: 1, staged, statements: [] })).status).toBe(503);
+		expect((await call(stub, "/commit", { id: "constraint", revision: 1, staged, statements: [] })).status).toBe(409);
 		staged = await (await call(stub, "/stage", { id: "incomplete", revision: 1, sequence: 0, previous: "", chunk: btoa(JSON.stringify(writes[0])) })).json();
 		expect((await call(stub, "/commit", { id: "incomplete", revision: 1, staged, statements: [] })).status).toBe(409);
 		expect((await call(stub, "/discard", { id: "constraint" })).status).toBe(200);

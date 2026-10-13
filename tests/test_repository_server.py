@@ -12,8 +12,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 import forge
-import demo_server
-from demo_server import create_app
+import repository_server
+from repository_server import create_app
 from http_server import add_token
 from state import load_state, recover
 from tests import identity_harness

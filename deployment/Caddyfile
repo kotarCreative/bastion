@@ -1,6 +1,4 @@
 {$BASTION_HOST:localhost} {
-	@git path_regexp git ^/[A-Za-z0-9][A-Za-z0-9._-]{0,63}\.git/(info/refs|git-upload-pack|git-receive-pack)$
-	reverse_proxy @git bastion-git:8001
 	reverse_proxy bastion-web:8000
 
 	header {

@@ -74,4 +74,14 @@ Materialization reuse binds to per-view content identity — descriptor assignme
 
 ## Hosted Demo
 
-`forge.py serve-demo` runs a single-process Flask application that serves the Git smart-HTTP endpoints and a small static browser application on one port. A TLS-terminating reverse proxy (e.g. Caddy) is the supported production-shaped deployment; the application itself listens on a private address and serves plain HTTP. The demo verifies that all descriptors use algorithm `capabilities-v3` before binding a listener. Clerk manages the browser identity session; after Clerk verification, the browser keeps Bastion's one-hour, view-scoped bearer token in page memory only (never in cookies, URLs, or browser storage). The API exposes the effective descriptor, capability decisions, and paginated projected tree and visible history with integrity-protected, bounded cursors. Resource limits, admission control, and Git process-group lifecycle are documented in `src/limits.py` and [SECURITY.md](SECURITY.md).
+`forge.py serve-host` runs the multi-repository Flask application on one port.
+Cloudflare uses the same dispatcher with a host DO catalog, separate repository
+DO catalogs, and isolated Artifacts branches; container disk is disposable.
+The local alternative uses SQLite and filesystem objects. Clerk sign-in yields
+a host session; opening a repository yields a separate view-scoped UI token.
+Git routes are `/<owner>/<repository>.git` and require repository-specific Git
+credentials. Browser credentials remain in page memory. No startup seeds a demo
+repository. A TLS reverse proxy or Cloudflare Worker is required for public use.
+The repository engine validates `capabilities-v3` descriptors and exposes scoped
+decisions, trees and history with bounded integrity-protected cursors. Limits
+and Git process lifecycle are documented in `src/limits.py` and [SECURITY.md](SECURITY.md).

@@ -437,7 +437,7 @@ class BudgetTest(unittest.TestCase):
                 auth(self.transport.token("alice")),
             )
             self.assertEqual(status, 503)
-            self.assertEqual(payload, b"demo-read-only")
+            self.assertEqual(payload, b"repository-read-only")
 
     def test_event_budget_gates_advertisement(self) -> None:
         manifest, _replay = repository_state(self.fixture.root)
@@ -450,7 +450,7 @@ class BudgetTest(unittest.TestCase):
                 auth(self.transport.token("alice")),
             )
             self.assertEqual(status, 503)
-            self.assertEqual(payload, b"demo-read-only")
+            self.assertEqual(payload, b"repository-read-only")
 
     def test_event_budget_rejects_publication(self) -> None:
         manifest, _replay = repository_state(self.fixture.root)

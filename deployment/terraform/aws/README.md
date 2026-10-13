@@ -1,4 +1,10 @@
-# Bastion AWS Dev Deployment
+# Bastion AWS Dev Deployment (retired single-repository profile)
+
+This profile is retained only for operator recovery of existing infrastructure.
+Its pre-seeded bootstrap, deployment workflow, launchers and demo smoke script
+have been removed. The commands below are historical, not runnable deployment
+instructions. Use [Cloudflare multi-repository hosting](../../cloudflare/README.md)
+for new deployments; existing AWS resources and Terraform state are untouched.
 
 This Terraform root creates one disposable Bastion test environment on AWS. It
 is for invite-only testing with synthetic data, not production repositories.
