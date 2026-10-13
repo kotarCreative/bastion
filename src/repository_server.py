@@ -38,7 +38,7 @@ from http_server import (
     run_service,
     _resolve_service,
 )
-from identity import resolve_principal
+from identity import resolve_principal, SUPPORTED_DESCRIPTOR_ALGORITHMS
 from state import load_state_sections
 from identity import CAPABILITIES
 from tokens import has_scope
@@ -90,11 +90,12 @@ def _preflight(root: Path) -> None:
     state = load_state_sections(root, ["view_descriptors"])
     if state.get("repository_state") != "ready":
         raise ForgeError("forge initialization is incomplete")
+    from wal import validate_descriptor
     for descriptor in state.get("view_descriptors", {}).values():
-        if descriptor.get("algorithm") != "capabilities-v3":
-            raise ForgeError(
-                "repository server requires descriptor algorithm capabilities-v3"
-            )
+        algorithm = descriptor.get("algorithm")
+        if algorithm not in SUPPORTED_DESCRIPTOR_ALGORITHMS:
+            raise ForgeError(f"unsupported descriptor algorithm: {algorithm!r}")
+        validate_descriptor(descriptor)
 
 
 def _authenticate_git(root: Path, view: str, service: str) -> dict:
@@ -347,17 +348,29 @@ def create_app(root: Path) -> Flask:
         from http_server import _resolve_service as _resolve
 
         try:
-            _repository, manifest, active, materialized = _resolve(
+            repository, _manifest, active, materialized = _resolve(
                 _forge_root(app), self_view
             )
         except ForgeError:
             abort(404)
         if not materialized.path.is_dir():
             abort(404)
-        view_state, descriptor = _active_descriptor(_forge_root(app), self_view)
+        if not materialized.projected_refs:
+            # A v4 principal can retain an empty browser session, but browse
+            # endpoints have no authorized tree/history tip to disclose.
+            abort(404)
+        # Use the descriptor belonging to the exact replay snapshot that
+        # produced this validated projection; never pair a new policy with an
+        # old materialized object database.
+        view_state = active
+        try:
+            descriptor = repository._descriptor(active["descriptor_id"])
+        except ForgeError:
+            abort(404)
+        if descriptor.get("principal_id") != active.get("principal_id"):
+            abort(404)
         try:
             import api_v1 as _api_v1
-
             tip = _api_v1.projected_tip(materialized.path)
         except ForgeError:
             abort(404)
@@ -382,7 +395,16 @@ def create_app(root: Path) -> Flask:
     def _api_session_envelope(view: str) -> dict:
         import api_v1 as _api
 
-        view_state, descriptor = _active_descriptor(_forge_root(app), view)
+        from http_server import _resolve_service
+        try:
+            repository, _manifest, view_state, materialized = _resolve_service(
+                _forge_root(app), view
+            )
+            descriptor = repository._descriptor(view_state["descriptor_id"])
+        except ForgeError:
+            raise
+        if descriptor.get("principal_id") != view_state.get("principal_id"):
+            raise ForgeError("active descriptor principal mismatch", "integrity")
         from state import load_principal_provenance
 
         state = load_principal_provenance(
@@ -392,6 +414,11 @@ def create_app(root: Path) -> Flask:
             state, descriptor["principal_id"]
         )
         principal = state["principals"][descriptor["principal_id"]]
+        projected_ref = view_state["projected_ref"]
+        if descriptor.get("algorithm") == "capabilities-v4":
+            # v4 advertises the authorized HEAD selected by materialization;
+            # do not echo the canonical default branch when it is denied.
+            projected_ref = materialized.projected_ref
         return {
             "view_id": view,
             "principal": {"id": principal["id"], "kind": principal["kind"]},
@@ -402,11 +429,62 @@ def create_app(root: Path) -> Flask:
                 "id": descriptor["id"],
                 "generation": view_state["descriptor_generation"],
                 "projection_epoch": view_state["projection_epoch"],
-                "projected_ref": view_state["projected_ref"],
+                "projected_ref": projected_ref,
                 "capabilities": _api.capability_map_object(descriptor["capabilities"]),
                 "restrictions": _api.capability_map_object(descriptor["restrictions"]),
+                **({"permissions": _effective_permissions(descriptor)}
+                   if descriptor.get("algorithm") == "capabilities-v4" else {}),
             },
         }
+
+    def _effective_permissions(descriptor: dict) -> dict:
+        from permissions import descriptor_permissions
+        return descriptor_permissions(descriptor)
+
+    @app.route("/api/v1/self/permissions/check", methods=["POST"])
+    def api_check_self_permission():
+        import api_v1 as _api
+        _record, view = _api_auth()
+        try:
+            raw = _read_bounded_body(_api.MAX_JSON_BODY_BYTES)
+            payload = json.loads(raw.decode("utf-8")) if raw else None
+        except (RepositoryHttpError, UnicodeDecodeError, ValueError):
+            return jsonify({"error": "bad-request"}), 400
+        if not isinstance(payload, dict):
+            return jsonify({"error": "bad-request"}), 400
+        scope = payload.get("scope")
+        if scope == "repository" and set(payload) == {"scope", "action"}:
+            from permissions import REPOSITORY_ACTIONS, repository_allowed
+            if not isinstance(payload["action"], str) or payload["action"] not in REPOSITORY_ACTIONS:
+                return jsonify({"error": "bad-request"}), 400
+            action = payload["action"]
+            try:
+                _active, descriptor = _active_descriptor(_forge_root(app), view)
+                policy = _effective_permissions(descriptor)
+            except ForgeError:
+                return jsonify({"error": "service-unavailable"}), 503
+            allowed = repository_allowed(policy, action)
+        elif scope == "branch" and set(payload) == {"scope", "action", "ref"}:
+            from permissions import BRANCH_ACTIONS, branch_allowed
+            from git_refs import validate_branch_ref
+            action, ref = payload.get("action"), payload.get("ref")
+            if not isinstance(action, str) or action not in BRANCH_ACTIONS or not isinstance(ref, str):
+                return jsonify({"error": "bad-request"}), 400
+            try:
+                validate_branch_ref(ref)
+            except ForgeError:
+                return jsonify({"error": "bad-request"}), 400
+            try:
+                _active, descriptor = _active_descriptor(_forge_root(app), view)
+                policy = _effective_permissions(descriptor)
+            except ForgeError:
+                return jsonify({"error": "service-unavailable"}), 503
+            allowed = branch_allowed(policy, action, ref)
+        else:
+            return jsonify({"error": "bad-request"}), 400
+        response = make_response(jsonify({"allowed": allowed}), 200)
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
     def _issue_ui_session(
         principal_id: str, requested_view: str | None, expires_in: str
@@ -1180,6 +1258,8 @@ def create_app(root: Path) -> Flask:
                 _repository, manifest, _active, materialized = _resolve_service(root, view)
             except ForgeError:
                 raise RepositoryHttpError(404, BODY_404)
+            if not materialized.projected_refs:
+                raise RepositoryHttpError(403, b"forbidden")
             if receive and (
                 manifest.head_seq >= limits.MAX_WAL_SEQUENCE
                 or limits.free_below_floor(root)
@@ -1251,6 +1331,8 @@ def create_app(root: Path) -> Flask:
                 _repository, _manifest, active, _materialized = _resolve_service(root, view)
             except ForgeError:
                 raise RepositoryHttpError(404, BODY_404)
+            if not _materialized.projected_refs:
+                raise RepositoryHttpError(403, b"forbidden")
 
             extra_env = {
                 "BASTION_VIEW": view,

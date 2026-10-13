@@ -719,6 +719,10 @@ class BastionRequestHandler(BaseHTTPRequestHandler):
             raise HttpError(503, b"repository-read-only")
         try:
             _repository, manifest, active, materialized = _resolve_service(self.root, view)
+            if not materialized.projected_refs:
+                # An empty v4 projection is not a ref-inventory endpoint.
+                # Keep the response deliberately generic for fetch and push.
+                raise HttpError(403, b"forbidden")
             if service == "git-upload-pack":
                 repo, alternates = materialized.path, None
             else:

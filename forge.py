@@ -61,6 +61,27 @@ def capability_grants(pairs: list[str]) -> dict[str, list[str]]:
     return grants
 
 
+def permission_configuration(repository_allow, repository_deny, branch_allow, branch_deny):
+    """Parse optional repository/branch action rules into the complete policy shape."""
+    if not any((repository_allow, repository_deny, branch_allow, branch_deny)):
+        return None
+    from permissions import BRANCH_ACTIONS, REPOSITORY_ACTIONS, empty_permissions, normalize_permissions
+
+    policy = empty_permissions()
+    for polarity, actions in (("allow", repository_allow), ("deny", repository_deny)):
+        for action in actions:
+            if action not in REPOSITORY_ACTIONS:
+                raise ForgeError(f"invalid repository action: {action}")
+            policy["repository"][polarity].append(action)
+    for polarity, pairs in (("allow", branch_allow), ("deny", branch_deny)):
+        for pair in pairs:
+            action, separator, selector = pair.partition("=")
+            if not separator or action not in BRANCH_ACTIONS or not selector:
+                raise ForgeError("branch permission must be ACTION=SELECTOR with a valid branch action")
+            policy["branches"][polarity][action].append(selector)
+    return normalize_permissions(policy)
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     commands = result.add_subparsers(dest="command", required=True)
@@ -110,6 +131,14 @@ def parser() -> argparse.ArgumentParser:
     role.add_argument("role")
     role.add_argument("--allow", action="append", default=[], metavar="CAPABILITY=PATH")
     role.add_argument("--deny", action="append", default=[], metavar="CAPABILITY=PATH")
+    role.add_argument("--repo-allow", action="append", default=[], metavar="ACTION",
+                      help="allow repository action (pr_view, pr_create, pr_merge); independent of path --allow")
+    role.add_argument("--repo-deny", action="append", default=[], metavar="ACTION",
+                      help="deny repository action; independent of path --deny")
+    role.add_argument("--branch-allow", action="append", default=[], metavar="ACTION=SELECTOR",
+                      help="allow branch action on exact full ref or namespace selector (not a repository path rule)")
+    role.add_argument("--branch-deny", action="append", default=[], metavar="ACTION=SELECTOR",
+                      help="deny branch action on exact full ref or namespace selector (not a repository path rule)")
     bind = commands.add_parser("bind-role")
     bind.add_argument("root", type=Path)
     bind.add_argument("role")
@@ -272,6 +301,9 @@ def main() -> int:
                 args.role,
                 capability_grants(args.allow),
                 capability_grants(args.deny),
+                permissions=permission_configuration(
+                    args.repo_allow, args.repo_deny, args.branch_allow, args.branch_deny
+                ),
             )
         elif args.command == "bind-role":
             if args.principal is not None:

@@ -36,7 +36,13 @@ from materialization import ensure_canonical_materialized, ensure_view_materiali
 from repository import AlreadyCommitted, Candidate, Repository
 from wal import idempotency_key_hash, record_fingerprint
 from state import audit_event, load_state_sections
-from validation import parse_updates, validate_ref_update
+from validation import (
+    parse_updates,
+    select_advertised_branch_base,
+    validate_branch_update_shape,
+    validate_ref_update,
+)
+from permissions import transport_branch_allowed
 
 
 MAX_PUSH_COMMITS = limits.MAX_PUSH_COMMITS
@@ -169,13 +175,19 @@ def candidate_environment(canonical: Path, directory: Path) -> dict[str, str]:
     return env
 
 
-def enforce_pack_limits(repo: Path, old: str, new: str, env: dict[str, str]) -> None:
+def enforce_pack_limits(
+    repo: Path, old: str, new: str, env: dict[str, str], *, commit_count: int | None = None
+) -> None:
     """Reject abusive packs before any validation work begins.
 
     Object bytes are counted from the batch-check census without loading
     any object contents, bounding the aggregate expanded-object budget.
     """
-    count = output(repo, "rev-list", "--count", f"{old}..{new}", env=env)
+    count = (
+        str(commit_count)
+        if commit_count is not None
+        else output(repo, "rev-list", "--count", f"{old}..{new}", env=env)
+    )
     try:
         if int(count) > MAX_PUSH_COMMITS:
             raise ForgeError("push exceeds the commit depth limit", "limits")
@@ -239,6 +251,55 @@ def enforce_object_integrity(
     strict_commit_headers(destination, commits, env)
 
 
+def verify_linear_submission_objects(
+    destination: Path, old: str, new: str, env: dict[str, str]
+) -> None:
+    """Require every quarantined object to belong to the bounded linear delta."""
+    quarantined = quarantine_objects(env)
+    if not quarantined:
+        return
+    reachable = set(
+        output(
+            destination, "rev-list", "--objects", "--no-object-names",
+            new, f"^{old}", env=env,
+        ).splitlines()
+    )
+    if quarantined - reachable:
+        raise ForgeError("push contains objects unreachable from the submitted tip")
+
+
+def linear_commits_after_base(
+    repo: Path, walk_newest_first: list[str], base_index: int, base: str,
+    env: dict[str, str],
+) -> list[str]:
+    """Validate the new segment by walking first-parent commits only.
+
+    The walk has already been capped at MAX_PUSH_COMMITS plus the matching
+    base. Reading each bounded commit header rejects merges without traversing
+    their arbitrary side histories.
+    """
+    newer = walk_newest_first[:base_index]
+    if len(newer) > MAX_PUSH_COMMITS:
+        raise ForgeError("push exceeds the commit depth limit", "limits")
+    expected_parent = base
+    commits: list[str] = []
+    for oid in reversed(newer):
+        try:
+            raw = git(repo, "cat-file", "-p", oid, env=env).stdout
+        except (ForgeError, UnicodeError) as error:
+            raise ForgeError("branch update is not authorized") from error
+        try:
+            headers = raw.partition(b"\n\n")[0].splitlines()
+            parents = [line[7:].decode("ascii") for line in headers if line.startswith(b"parent ")]
+        except UnicodeError as error:
+            raise ForgeError("branch update is not authorized") from error
+        if parents != [expected_parent]:
+            raise ForgeError("branch update is not authorized")
+        expected_parent = oid
+        commits.append(oid)
+    return commits
+
+
 def validate_commit_metadata(
     state: dict,
     destination: Path,
@@ -267,13 +328,18 @@ def prepare_submission(
     state: dict | None = None,
     canonical: Path | None = None,
     received_at: int | None = None,
+    intake_path: Path | None = None,
+    submitted: list[str] | None = None,
 ):
-    destination = intake_repo(root, name)
+    destination = intake_path or intake_repo(root, name)
     canonical = canonical or canonical_repo(root)
-    commits = submitted_commits(destination, old, new, hook_env)
-    enforce_pack_limits(destination, old, new, hook_env)
+    commits = submitted if submitted is not None else submitted_commits(destination, old, new, hook_env)
+    enforce_pack_limits(destination, old, new, hook_env, commit_count=len(commits))
     enforce_object_integrity(destination, old, new, commits, hook_env)
-    verify_no_extra_objects(destination, new, hook_env)
+    if submitted is None:
+        verify_no_extra_objects(destination, new, hook_env)
+    else:
+        verify_linear_submission_objects(destination, old, new, hook_env)
     if state is not None:
         if received_at is None:
             raise ForgeError("submission is missing a captured receive time")
@@ -406,6 +472,7 @@ def pre_receive(root: Path, name: str, updates: bytes) -> None:
     # Every build return path records the event_id of the WAL record that the
     # returned sequence refers to, so the audit below never needs a full replay.
     published_event_id: list[str] = []
+    pinned_branch_source: dict[tuple, tuple] = {}
 
     def build(manifest, replay):
         active = replay.active_views.get(name)
@@ -428,6 +495,12 @@ def pre_receive(root: Path, name: str, updates: bytes) -> None:
         descriptor = repository._descriptor(active["descriptor_id"])
         if len(parsed) != 1:
             raise ForgeError("exactly one authorized branch may be updated")
+        if descriptor.get("algorithm") == "capabilities-v4":
+            return _build_branch_submission(
+                root, name, parsed, active, descriptor, source, manifest, replay,
+                repository, control, context, idempotency_hash, published_event_id,
+                pinned_branch_source,
+            )
         old, new, updated_ref = parsed[0]
         if updated_ref != active["projected_ref"]:
             raise ForgeError("branch update is not authorized")
@@ -552,3 +625,244 @@ def pre_receive(root: Path, name: str, updates: bytes) -> None:
         )
     except Exception:
         pass
+
+
+def _build_branch_submission(
+    root, name, parsed, active, descriptor, source, manifest, replay,
+    repository, control, context, idempotency_hash, published_event_id,
+    pinned_branch_source,
+):
+    """Build a v4, single-ref receive using only the current advertised tips."""
+    from permissions import authorized_branch_refs
+
+    old_wire, new, target = validate_branch_update_shape(parsed)
+    try:
+        invalid_ref = git(canonical_repo(root), "check-ref-format", target, check=False).returncode
+    except (UnicodeError, OSError):
+        invalid_ref = 1
+    if invalid_ref:
+        raise ForgeError("branch update is not authorized")
+    advertised = source.projected_refs
+    if not transport_branch_allowed(descriptor, "read", target):
+        raise ForgeError("branch update is not authorized")
+
+    # Exact lost-ack retries must be recognized before testing current ref
+    # existence/old-tip continuity: a successful push necessarily changed one
+    # or both. Only same-epoch branch_submission records are replayable.
+    request = (name, target, old_wire, new)
+    request_events = replay.requests.get(request, [])
+    if idempotency_hash is not None:
+        indexed = replay.idempotency.get(idempotency_hash)
+        if indexed is not None:
+            event_id = indexed["event_id"]
+            record = replay.records[replay.events[event_id]["seq"] - 1]
+            if not _branch_retry_authorized(
+                record, request, active, descriptor, idempotency_hash
+            ):
+                raise ForgeError("idempotency key was already used for a different request")
+            published_event_id.append(event_id)
+            return AlreadyCommitted(record["seq"])
+    for event_id in reversed(request_events):
+        record = replay.records[replay.events[event_id]["seq"] - 1]
+        payload = record.get("payload", {})
+        if record.get("kind") != "branch_submission":
+            continue
+        if payload.get("projection_epoch") != active["projection_epoch"]:
+            continue
+        if idempotency_hash is not None:
+            raise ForgeError("a new idempotency key cannot be attached to a committed request")
+        if _branch_retry_authorized(record, request, active, descriptor, None):
+            published_event_id.append(event_id)
+            return AlreadyCommitted(record["seq"])
+
+    readable = set(authorized_branch_refs(descriptor, manifest.canonical_refs))
+    exists = target in manifest.canonical_refs
+    creation_commits: list[str] | None = None
+    if exists:
+        if not transport_branch_allowed(descriptor, "update", target):
+            raise ForgeError("branch update is not authorized")
+        old = advertised.get(target)
+        if old is None or old_wire != old:
+            raise ForgeError("branch update is not authorized")
+        if new == old:
+            raise ForgeError("branch update is not authorized")
+        source_ref = None
+        base_projected = old
+        canonical_ref = target
+        canonical_old = manifest.canonical_refs[target]
+        frontier = active.get("branch_frontiers", {}).get(target)
+        if frontier is None:
+            raise ForgeError("branch update is not authorized")
+    else:
+        if old_wire != ZERO_OID or not transport_branch_allowed(descriptor, "create", target):
+            raise ForgeError("branch update is not authorized")
+        # Namespace conflicts are rejected before traversing any submitted graph.
+        if any(r.startswith(target + "/") or target.startswith(r + "/") for r in manifest.canonical_refs):
+            raise ForgeError("branch update is not authorized")
+        receiving_intake = Path(os.environ.get("BASTION_INTAKE_REPO", str(intake_repo(root, name))))
+        env = os.environ.copy()
+        # One bounded first-parent walk, newest to oldest. The nearest current
+        # advertised tip is the only eligible base; older advertised ancestors
+        # are not alternative source choices.
+        try:
+            object_type = output(receiving_intake, "cat-file", "-t", new, env=env)
+            if object_type != "commit":
+                raise ForgeError("branch update is not authorized")
+            walk = output(
+                receiving_intake, "rev-list", "--first-parent", "--max-count",
+                str(MAX_PUSH_COMMITS + 2), new, env=env,
+            ).splitlines()
+        except ForgeError as error:
+            raise ForgeError("branch update is not authorized") from error
+        current_sources: dict[str, list[tuple[str, str]]] = {}
+        for candidate in sorted(readable):
+            tip = advertised.get(candidate)
+            canonical_tip = manifest.canonical_refs.get(candidate)
+            if tip is not None and canonical_tip is not None:
+                current_sources.setdefault(tip, []).append((candidate, canonical_tip))
+        pin_key = (name, target, old_wire, new)
+        try:
+            source_ref, base_projected, canonical_old = select_advertised_branch_base(
+                walk, current_sources, MAX_PUSH_COMMITS
+            )
+        except ForgeError as error:
+            if pin_key in pinned_branch_source:
+                raise ForgeError("branch creation source changed; retry the push", "conflict") from error
+            raise
+        if new != base_projected and not transport_branch_allowed(descriptor, "update", target):
+            raise ForgeError("branch update is not authorized")
+        creation_commits = linear_commits_after_base(
+            receiving_intake, walk, walk.index(base_projected), base_projected, env
+        )
+        pin = (
+            source_ref, base_projected, canonical_old,
+            active["descriptor_id"], active["descriptor_generation"],
+            active["projection_epoch"],
+        )
+        previous_pin = pinned_branch_source.setdefault(pin_key, pin)
+        if previous_pin != pin:
+            raise ForgeError("branch creation source changed; retry the push", "conflict")
+        old = base_projected
+        canonical_ref = source_ref
+        frontier = canonical_old
+
+    view = {
+        "principal_id": active["principal_id"],
+        "canonical_ref": canonical_ref,
+        "projected_ref": target,
+        "canonical_frontier": frontier,
+        "projected_tip": base_projected,
+    }
+    canonical = ensure_canonical_materialized(root, manifest, repository)
+    hook_env = os.environ.copy()
+    received_at = int(time.time())
+    destination = Path(os.environ.get("BASTION_INTAKE_REPO", str(intake_repo(root, name))))
+    transition = None
+    canonpack = None
+    subpack = None
+    if new == old:
+        # Pure fork: validate quarantine accounting/integrity without treating
+        # inherited metadata as a new submission.
+        enforce_pack_limits(destination, old, new, hook_env)
+        verify_no_extra_objects(destination, new, hook_env)
+        fsck_strict(destination, quarantine_objects(hook_env), hook_env)
+        from types import SimpleNamespace
+        transition = SimpleNamespace(canonical_old=canonical_old, canonical_new=canonical_old,
+                                     mappings=[], candidate_object_dir=None)
+        subpack = None
+        canonpack = None
+        checkpoint(root, "wal.validation_complete")
+    else:
+        # Creation uses the bounded first-parent segment captured above;
+        # updates retain the established validator's old..new range check.
+        transition = prepare_submission(
+            root, name, view, descriptor, old, new, hook_env, state=control,
+            canonical=canonical, received_at=received_at, intake_path=destination,
+            submitted=creation_commits,
+        )
+        try:
+            for mapping in transition.mappings:
+                cid = mapping["change_id"]
+                claim = replay.change_claims.get(cid) if cid else None
+                if claim is not None and claim["owner_principal_id"] != active["principal_id"]:
+                    raise ForgeError("Change-Id belongs to another principal or branch")
+            checkpoint(root, "wal.validation_complete")
+            if limits.free_below_floor(root):
+                raise ForgeError("volume is below the receive free-space reserve", "limits")
+            subpack = build_submission_pack(destination, old, new, hook_env)
+            checkpoint(root, "wal.submission_pack_built")
+            canonpack = build_canonical_pack(
+                canonical, transition.canonical_old, transition.canonical_new,
+                candidate_environment(canonical, transition.candidate_object_dir),
+            )
+            checkpoint(root, "wal.canonical_pack_built")
+        except Exception:
+            if canonpack:
+                canonpack.cleanup()
+            if subpack:
+                subpack.cleanup()
+            cleanup_transaction_workspace(transition.candidate_object_dir)
+            raise
+    if new == old and limits.free_below_floor(root):
+        raise ForgeError("volume is below the receive free-space reserve", "limits")
+    canonical_ref_pack = canonpack.reference("packs/canonical") if canonpack else None
+    submission_ref_pack = subpack.reference("packs/submissions") if subpack else None
+    payload = {
+        "idempotency_key_hash": idempotency_hash, "view_id": name,
+        "principal_id": active["principal_id"], "descriptor_id": active["descriptor_id"],
+        "descriptor_generation": active["descriptor_generation"], "projection_epoch": active["projection_epoch"],
+        "canonical_ref": target, "canonical_old": transition.canonical_old,
+        "canonical_new": transition.canonical_new, "projected_ref": target,
+        "projected_old": old, "projected_new": new,
+        "canonical_frontier_old": frontier, "canonical_pack": canonical_ref_pack,
+        "submission_pack": submission_ref_pack, "mappings": transition.mappings,
+        "received_at": received_at, "transport": context.transport,
+        "remote_identity": context.remote_addr, "source_ref": source_ref,
+        "receive_old": old_wire,
+    }
+    callbacks = []
+    if canonpack:
+        callbacks.append(lambda target_repo: upload_pack(target_repo, "packs/canonical", canonpack))
+    if subpack:
+        callbacks.append(lambda target_repo: upload_pack(target_repo, "packs/submissions", subpack))
+    cleanup = lambda: (canonpack.cleanup() if canonpack else None,
+                       subpack.cleanup() if subpack else None,
+                       cleanup_transaction_workspace(transition.candidate_object_dir))
+    candidate = Candidate(record_fingerprint(repository.repository_id, "branch_submission", payload),
+                          payload, tuple(callbacks), cleanup)
+    published_event_id.append(candidate.event_id)
+    return candidate
+
+
+def _branch_retry_authorized(record, request, active, descriptor, idempotency_hash):
+    """Authorize replay of a committed v4 receive without stale-tip checks."""
+    if record.get("kind") != "branch_submission":
+        return False
+    payload = record.get("payload", {})
+    if (
+        (payload.get("view_id"), payload.get("canonical_ref"),
+         payload.get("receive_old"), payload.get("projected_new")) != request
+        or payload.get("principal_id") != active["principal_id"]
+        or payload.get("descriptor_id") != active["descriptor_id"]
+        or payload.get("descriptor_generation") != active["descriptor_generation"]
+        or payload.get("projection_epoch") != active["projection_epoch"]
+        or payload.get("projected_ref") != request[1]
+    ):
+        return False
+    if idempotency_hash is not None and payload.get("idempotency_key_hash") != idempotency_hash:
+        return False
+    target = payload.get("canonical_ref")
+    source = payload.get("source_ref")
+    mappings = payload.get("mappings")
+    if not isinstance(mappings, (list, tuple)):
+        return False
+    if source is None:
+        return transport_branch_allowed(descriptor, "read", target) and transport_branch_allowed(
+            descriptor, "update", target
+        )
+    return (
+        transport_branch_allowed(descriptor, "read", source)
+        and transport_branch_allowed(descriptor, "read", target)
+        and transport_branch_allowed(descriptor, "create", target)
+        and (not mappings or transport_branch_allowed(descriptor, "update", target))
+    )

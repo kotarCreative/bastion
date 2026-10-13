@@ -57,16 +57,20 @@ rights or access to another owner's private repositories.
 
 ## Git Compatibility
 
-### Branching foundation
+### Scoped branch transport
 
-The initial multi-branch slice is intentionally operator-only: canonical
-branch refs and tips are WAL truth, and a root administrator may create a
-branch at an already-canonical tip and inspect the canonical inventory. Public
-clone/fetch/push and browser projection remain default-branch-only. This is not
-forge/client feature branching. Next work must separately define authorized
-repo viewing, branch-scoped projections and transport, lifecycle operations,
-and a review/PR model before presenting branches to end users. See
-[spec 018](.specs/018-multi-branch-foundation.md).
+Capabilities-v4 now applies explicit branch `read`, `create`, and `update`
+permissions to a private multi-ref projection and narrow single-ref HTTP Git
+transport. v3 remains default-branch compatible; its secondary refs stay
+denied. This does not implement branch deletion, arbitrary-history imports,
+merge workflows, or PR lifecycle. Repository PR permissions remain policy
+only, not an implemented PR feature. See [spec 018](.specs/018-multi-branch-foundation.md),
+[spec 019](.specs/019-scoped-permissions.md), and
+[spec 020](.specs/020-scoped-branch-transport.md).
+
+Remaining work includes richer client workflows, policy UI and PR lifecycle,
+plus compatibility/security verification for policy contraction, canonical
+frontier races, cold-cache rebuilds, and additional Git protocol edge cases.
 
 - Maintain the [Git compatibility matrix](docs/GIT_COMPATIBILITY.md) for repack,
   garbage collection, commit graphs, bitmaps, multi-pack-index, protocol

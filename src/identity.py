@@ -26,6 +26,8 @@ CAPABILITIES = (
     "tag",
 )
 DESCRIPTOR_ALGORITHM = "capabilities-v3"
+PERMISSIONS_DESCRIPTOR_ALGORITHM = "capabilities-v4"
+SUPPORTED_DESCRIPTOR_ALGORITHMS = (DESCRIPTOR_ALGORITHM, PERMISSIONS_DESCRIPTOR_ALGORITHM)
 DESCRIPTOR_DOMAIN = b"bastion-effective-view\0"
 TIMESTAMP_SKEW_SECONDS = 600
 
@@ -152,6 +154,7 @@ def add_role(
     role_id: str,
     allow: dict[str, list[str]],
     deny: dict[str, list[str]],
+    *, permissions=None,
 ) -> None:
     validate_identifier(role_id)
     roles = state.setdefault("roles", {})
@@ -159,13 +162,25 @@ def add_role(
         raise ForgeError(f"role already exists: {role_id}")
     normalized_allow = normalize_capability_map(allow, "allow")
     normalized_deny = normalize_capability_map(deny, "deny")
-    if not any(normalized_allow[capability] for capability in CAPABILITIES):
+    if permissions is None and not any(normalized_allow[capability] for capability in CAPABILITIES):
         raise ForgeError("a role needs at least one allow grant")
-    roles[role_id] = {
+    record = {
         "id": role_id,
         "allow": normalized_allow,
         "deny": normalized_deny,
     }
+    if permissions is not None:
+        from permissions import normalize_permissions
+        normalized_permissions = normalize_permissions(permissions)
+        has_policy = any(normalized_permissions['repository'][p] for p in ('allow','deny')) or any(
+            normalized_permissions['branches'][p][a]
+            for p in ('allow','deny') for a in normalized_permissions['branches'][p]
+        )
+        has_legacy = any(normalized_allow[c] or normalized_deny[c] for c in CAPABILITIES)
+        if not has_policy and not has_legacy:
+            raise ForgeError("a role needs at least one grant or restriction")
+        record['permissions'] = normalized_permissions
+    roles[role_id] = record
 
 
 def binding_identifier(subject_kind: str, subject_id: str, role_id: str) -> str:
@@ -297,7 +312,7 @@ def descriptor_payload(
 ) -> dict:
     principal = state["principals"][principal_id]
     allow, deny = effective_grants(state, role_ids)
-    return {
+    payload = {
         "algorithm": DESCRIPTOR_ALGORITHM,
         "principal_id": principal_id,
         "principal_kind": principal["kind"],
@@ -308,6 +323,12 @@ def descriptor_payload(
         "capabilities": allow,
         "restrictions": deny,
     }
+    permission_roles = [state['roles'][role_id]['permissions'] for role_id in role_ids if 'permissions' in state['roles'][role_id]]
+    if permission_roles:
+        from permissions import combine_permissions
+        payload['algorithm'] = PERMISSIONS_DESCRIPTOR_ALGORITHM
+        payload['permissions'] = combine_permissions(permission_roles)
+    return payload
 
 
 def compute_descriptor_id(payload: dict) -> str:
@@ -374,8 +395,10 @@ def _verified_descriptor_record(state: dict, descriptor_id: str) -> dict:
     payload = {key: value for key, value in descriptor.items() if key != "id"}
     if compute_descriptor_id(payload) != descriptor_id:
         raise ForgeError("descriptor content does not match its identity")
-    if payload.get("algorithm") != DESCRIPTOR_ALGORITHM:
+    if payload.get("algorithm") not in SUPPORTED_DESCRIPTOR_ALGORITHMS:
         raise ForgeError(f"unsupported descriptor algorithm: {payload.get('algorithm')!r}")
+    from wal import validate_descriptor
+    validate_descriptor(descriptor)
     return descriptor
 
 

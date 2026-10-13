@@ -288,8 +288,15 @@ def add_role(
     role_id: str,
     allow: dict[str, list[str]],
     deny: dict[str, list[str]],
+    *,
+    permissions: dict | None = None,
 ) -> None:
-    _catalog_operation(root, lambda state: identity.add_role(state, role_id, allow, deny))
+    _catalog_operation(
+        root,
+        lambda state: identity.add_role(
+            state, role_id, allow, deny, permissions=permissions
+        ),
+    )
 
 
 def bind_role(root: Path, role_id: str, subject_kind: str, subject_id: str) -> None:

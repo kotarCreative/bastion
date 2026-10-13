@@ -77,6 +77,13 @@ def _validate_packs(repository, replay: ReplayState, manifest) -> None:
         payload = record["payload"]
         if record["kind"] == "submission":
             references.extend((payload["canonical_pack"], payload["submission_pack"]))
+        elif record["kind"] == "branch_submission":
+            # A pure fork is represented entirely by already-referenced source
+            # objects; its two pack references are intentionally null.
+            references.extend(
+                pack for pack in (payload["canonical_pack"], payload["submission_pack"])
+                if pack is not None
+            )
         elif record["kind"] in {"canonical_update", "import"}:
             references.append(payload["canonical_pack"])
     for pack in references:
@@ -196,6 +203,9 @@ def _validate_policy_transition(
         active["descriptor_id"] = item["new_descriptor_id"]
         active["descriptor_generation"] = item["new_generation"]
         active["projection_epoch"] = item["new_projection_epoch"]
+        active["canonical_frontier"] = payload["canonical_frontier"]
+        active["epoch_start_seq"] = record["seq"]
+        active["epoch_branches"] = dict(active.get("branch_frontiers", {}))
 
 
 def _validate_administrative_authorization(
@@ -334,6 +344,21 @@ def _recompute_change_claims(replay: ReplayState) -> dict[str, dict]:
                     }
                 elif claims[change_id]["owner_principal_id"] != payload["principal_id"]:
                     _fail("METADATA", record["seq"], "Change-Id belongs to another principal")
+        elif kind == "branch_submission":
+            # Transported changes have the same principal-wide Change-Id
+            # ownership as ordinary submissions; inherited fork ancestry is
+            # not a new claim because only mappings are considered here.
+            for item in payload["mappings"]:
+                change_id = item["change_id"]
+                if not change_id:
+                    continue
+                if change_id not in claims:
+                    claims[change_id] = {
+                        "owner_principal_id": payload["principal_id"],
+                        "canonical_ref": payload["canonical_ref"],
+                    }
+                elif claims[change_id]["owner_principal_id"] != payload["principal_id"]:
+                    _fail("METADATA", record["seq"], "Change-Id is not owned by this principal")
     return claims
 
 
@@ -435,6 +460,16 @@ def _advance_view_for_record(
         projected_tip = _apply_canonical_commits(
             canonical, temp, descriptor, payload["commits"], projected_tip
         )
+    elif record["kind"] == "branch_submission":
+        # Scoped views are reconstructed separately across all of their refs.
+        # Legacy views still observe canonical advances to their default ref.
+        if (
+            descriptor["algorithm"] != identity.PERMISSIONS_DESCRIPTOR_ALGORITHM
+            and payload["canonical_ref"] == view_state["projected_ref"]
+        ):
+            projected_tip = _apply_canonical_commits(
+                canonical, temp, descriptor, payload["mappings"], projected_tip
+            )
     elif record["kind"] == "policy_transition":
         for item in payload["views"]:
             if item["view_id"] == view_id:
@@ -496,6 +531,11 @@ def check_invariants(root: Path) -> None:
                         "descriptor_generation": payload["descriptor_generation"],
                         "projection_epoch": payload["projection_epoch"],
                         "canonical_frontier": payload["canonical_frontier"],
+                        # Snapshot full-ref tips at epoch start.  Later branch
+                        # events advance branch_frontiers, not this snapshot.
+                        "branch_frontiers": dict(running_refs),
+                        "epoch_branches": dict(running_refs),
+                        "epoch_start_seq": record["seq"],
                     }
                     temp = _initialize_view_repo(root, canonical, running_views[payload["view_id"]], descriptor, record)
                     running_views[payload["view_id"]]["_temp_repo"] = temp
@@ -553,9 +593,100 @@ def check_invariants(root: Path) -> None:
                         _validate_submission_authorization(record, descriptor, canonical, sub)
                         _validate_submission_metadata(record, principals, sub)
                     for view_id, active in running_views.items():
-                        active["canonical_frontier"] = payload["canonical_new"]
+                        if payload["canonical_ref"] == manifest.canonical_ref:
+                            active["canonical_frontier"] = payload["canonical_new"]
+                        active.setdefault("branch_frontiers", {})[payload["canonical_ref"]] = payload["canonical_new"]
                         _advance_view_for_record(record, view_id, active, canonical, repository)
                     running_refs[payload["canonical_ref"]] = payload["canonical_new"]
+                elif kind == "branch_submission":
+                    # Keep this independent of materialized/cached views. The
+                    # branch transport builder's evidence pack is checked in
+                    # isolation and its canonical range is re-derived here.
+                    active = running_views.get(payload["view_id"])
+                    if active is None:
+                        _fail("AUTHORIZATION", record["seq"], "branch submission source view does not exist")
+                    target = payload["canonical_ref"]
+                    if any(payload[key] != active[key] for key in (
+                        "descriptor_id", "descriptor_generation", "projection_epoch"
+                    )) or payload["projected_ref"] != target:
+                        _fail("AUTHORIZATION", record["seq"], "branch submission active-view provenance differs")
+                    source_ref = payload["source_ref"]
+                    if source_ref is None:
+                        if running_refs.get(target) != payload["canonical_old"] or payload["receive_old"] != payload["projected_old"]:
+                            _fail("GRAPH", record["seq"], "branch update old endpoint differs")
+                        frontier_ref = target
+                    else:
+                        if target in running_refs or running_refs.get(source_ref) != payload["canonical_old"]:
+                            _fail("GRAPH", record["seq"], "branch creation source or destination differs")
+                        if any(refname.startswith(target + "/") or target.startswith(refname + "/") for refname in running_refs):
+                            _fail("AUTHORIZATION", record["seq"], "branch creation destination conflicts with an existing ref")
+                        if payload["receive_old"] != ZERO_OID:
+                            _fail("GRAPH", record["seq"], "branch creation receive old is not zero")
+                        frontier_ref = source_ref
+                    if payload["canonical_frontier_old"] != active.get("branch_frontiers", {}).get(frontier_ref, active.get("canonical_frontier")):
+                        _fail("GRAPH", record["seq"], "branch submission captured frontier differs")
+                    descriptor = _descriptor_for_record(repository, record)
+                    if descriptor["id"] != active["descriptor_id"]:
+                        _fail("AUTHORIZATION", record["seq"], "branch submission descriptor differs from active view")
+                    from permissions import transport_branch_allowed
+                    if source_ref is None:
+                        allowed = transport_branch_allowed(descriptor, "read", target) and transport_branch_allowed(descriptor, "update", target)
+                    else:
+                        allowed = transport_branch_allowed(descriptor, "read", source_ref) and transport_branch_allowed(descriptor, "read", target) and transport_branch_allowed(descriptor, "create", target)
+                        if payload["mappings"]:
+                            allowed = allowed and transport_branch_allowed(descriptor, "update", target)
+                    if not allowed:
+                        _fail("AUTHORIZATION", record["seq"], "branch transport is outside captured permission scope")
+                    if payload["mappings"] or source_ref is not None:
+                        # Rebuild the source view at this WAL position, rather
+                        # than trusting the current cache or a final snapshot.
+                        # This yields the exact source/target projected base
+                        # against which the receive was advertised.
+                        from types import SimpleNamespace
+                        from branch_projection import build_scoped_projection
+                        history_path = Path(tempfile.mkdtemp(prefix="bastion-check-history-", dir=root.parent))
+                        shutil.rmtree(history_path)
+                        initialize_view_generation(history_path, "unborn")
+                        historical_records = replay.records[: record["seq"] - 1]
+                        historical_replay = SimpleNamespace(
+                            active_views={payload["view_id"]: dict(active)},
+                            records=historical_records,
+                        )
+                        try:
+                            historical_refs = build_scoped_projection(
+                                root, payload["view_id"], canonical, history_path,
+                                SimpleNamespace(canonical_refs=dict(running_refs)),
+                                historical_replay, repository, descriptor,
+                            )
+                            base_ref = source_ref if source_ref is not None else target
+                            if historical_refs.get(base_ref) != payload["projected_old"]:
+                                _fail("GRAPH", record["seq"], "branch submission projected base differs from historical authorized ref")
+                            if payload["source_ref"] is None and payload["canonical_old"] != running_refs.get(target):
+                                _fail("GRAPH", record["seq"], "branch update canonical old differs from target tip")
+                            if payload["source_ref"] is not None and payload["canonical_old"] != running_refs.get(source_ref):
+                                _fail("GRAPH", record["seq"], "branch creation canonical old differs from source tip")
+                            sub = Path(tempfile.mkdtemp(prefix="bastion-check-branch-", dir=root.parent))
+                            try:
+                                initialize_view_generation(sub, payload["projected_ref"].split("/")[-1])
+                                (sub / "objects" / "info").mkdir(parents=True, exist_ok=True)
+                                (sub / "objects" / "info" / "alternates").write_text(f"{history_path.resolve() / 'objects'}\n")
+                                if payload["submission_pack"] is not None:
+                                    _install_submission_pack(repository, payload, sub)
+                                git(sub, "update-ref", payload["projected_ref"], payload["projected_new"])
+                                _validate_record_graph({**record, "kind": "submission"}, canonical, sub)
+                                _validate_submission_authorization(record, descriptor, canonical, sub)
+                                _validate_submission_metadata(record, principals, sub)
+                            finally:
+                                shutil.rmtree(sub, ignore_errors=True)
+                        finally:
+                            shutil.rmtree(history_path, ignore_errors=True)
+                    running_refs[target] = payload["canonical_new"]
+                    for other in running_views.values():
+                        other.setdefault("branch_frontiers", {})[target] = payload["canonical_new"]
+                        if source_ref is None and target == manifest.canonical_ref:
+                            other["canonical_frontier"] = payload["canonical_new"]
+                    for view_id, other in running_views.items():
+                        _advance_view_for_record(record, view_id, other, canonical, repository)
                 elif kind == "canonical_update":
                     if running_refs.get(payload["canonical_ref"]) != payload["canonical_old"]:
                         _fail("GRAPH", record["seq"], "canonical update does not extend the independently replayed branch tip")
@@ -566,7 +697,9 @@ def check_invariants(root: Path) -> None:
                     )
                     _validate_administrative_authorization(record, descriptor, canonical)
                     for view_id, active in running_views.items():
-                        active["canonical_frontier"] = payload["canonical_new"]
+                        if payload["canonical_ref"] == manifest.canonical_ref:
+                            active["canonical_frontier"] = payload["canonical_new"]
+                        active.setdefault("branch_frontiers", {})[payload["canonical_ref"]] = payload["canonical_new"]
                         _advance_view_for_record(record, view_id, active, canonical, repository)
                     running_refs[payload["canonical_ref"]] = payload["canonical_new"]
                 elif kind == "import":
@@ -601,6 +734,8 @@ def check_invariants(root: Path) -> None:
                         _fail("AUTHORIZATION", record["seq"], "branch destination is not a valid Git branch ref")
                     _require_object_type(canonical, tip, "commit")
                     running_refs[destination] = tip
+                    for active in running_views.values():
+                        active.setdefault("branch_frontiers", {})[destination] = tip
 
             recomputed_claims = _recompute_change_claims(replay)
             if recomputed_claims != replay.change_claims:
@@ -611,6 +746,139 @@ def check_invariants(root: Path) -> None:
 
             for view_id, temp in view_temp_repos.items():
                 active = replay.active_views[view_id]
+                descriptor = _load_descriptor_object(repository, active["descriptor_id"])
+                if descriptor.get("algorithm") == "capabilities-v4":
+                    # Reconstruct from canonical + immutable WAL into a fresh
+                    # temporary generation. Never inspect/write the active
+                    # cache as checker evidence.
+                    from branch_projection import build_scoped_projection, selected_default
+                    scoped = Path(tempfile.mkdtemp(prefix="bastion-check-scoped-", dir=root.parent))
+                    shutil.rmtree(scoped)
+                    initialize_view_generation(scoped, "unborn")
+                    try:
+                        projected = build_scoped_projection(
+                            root, view_id, canonical, scoped, manifest, replay,
+                            repository, descriptor,
+                        )
+                        from permissions import authorized_branch_refs
+                        authorized = authorized_branch_refs(descriptor, manifest.canonical_refs)
+                        if sorted(projected) != authorized:
+                            _fail("ISOLATION", view_id, "scoped projection contains missing or unauthorized refs")
+                        selected = selected_default(descriptor, projected)
+                        git(scoped, "symbolic-ref", "HEAD", selected or "refs/heads/unborn")
+                        # Keep expected-tree computation out of the candidate
+                        # object database: even a failing comparison must not
+                        # contaminate the closure being audited.
+                        expected_repo = Path(tempfile.mkdtemp(prefix="bastion-check-expected-", dir=root.parent))
+                        shutil.rmtree(expected_repo)
+                        initialize_view_generation(expected_repo, "expected")
+                        try:
+                            for fullref, tip in projected.items():
+                                expected_tree = project_tree(
+                                    canonical, expected_repo, manifest.canonical_refs[fullref], descriptor
+                                )
+                                if tree_oid(scoped, tip) != expected_tree:
+                                    _fail("PROJECTION", fullref, "scoped tip tree differs from current authorized canonical tree")
+                        finally:
+                            shutil.rmtree(expected_repo, ignore_errors=True)
+                        refs = git(scoped, "for-each-ref", "--format=%(refname)", check=False)
+                        if refs.returncode or refs.stdout.decode().splitlines() != sorted(authorized):
+                            _fail("ISOLATION", view_id, "scoped projection has unexpected refs")
+                        if not has_exact_object_closure(scoped):
+                            _fail("ISOLATION", view_id, "scoped projection contains unreachable objects")
+                        cached = view_repo(root, view_id)
+                        if cached.exists() or cached.is_symlink():
+                            if not cached.exists():
+                                _fail("ISOLATION", view_id, "active scoped view link is dangling")
+                            cached = cached.resolve()
+                            cursor_path = cached / "bastion-cursor.json"
+                            try:
+                                cursor = json.loads(cursor_path.read_text())
+                            except (OSError, json.JSONDecodeError) as error:
+                                _fail("ISOLATION", view_id, f"active scoped cursor is invalid: {error}")
+                            expected_frontiers = {ref_name: manifest.canonical_refs[ref_name] for ref_name in authorized}
+                            if (
+                                cursor.get("schema") != "scoped-v4"
+                                or cursor.get("view_id") != view_id
+                                or cursor.get("descriptor_id") != active["descriptor_id"]
+                                or cursor.get("descriptor_generation") != active["descriptor_generation"]
+                                or cursor.get("projection_epoch") != active["projection_epoch"]
+                            ):
+                                _fail("ISOLATION", view_id, "active scoped cursor differs from current policy")
+                            cached_projection = projected
+                            if cursor.get("canonical_frontiers") != expected_frontiers:
+                                # Receives publish truth before disposable views
+                                # catch up. Validate a stale cache against its
+                                # captured WAL prefix, not against today's tips.
+                                from materialization import _read_receipt
+                                from types import SimpleNamespace
+
+                                receipt = _read_receipt(root, view_id)
+                                captured_seq = receipt.get("applied_seq") if receipt else None
+                                if (
+                                    type(captured_seq) is not int
+                                    or not active["epoch_start_seq"] <= captured_seq <= manifest.head_seq
+                                    or receipt.get("generation") != cached.name
+                                    or receipt.get("projected_refs") != cursor.get("projected_refs")
+                                    or receipt.get("canonical_frontiers") != cursor.get("canonical_frontiers")
+                                ):
+                                    _fail("ISOLATION", view_id, "stale scoped cache has no valid progress receipt")
+                                historical_records = replay.records[:captured_seq]
+                                historical_frontiers = {}
+                                for historical in historical_records:
+                                    event = historical["payload"]
+                                    if historical["kind"] == "import":
+                                        historical_frontiers[event["canonical_ref"]] = event["canonical_tip"]
+                                    elif historical["kind"] == "branch_create":
+                                        historical_frontiers[event["branch_ref"]] = event["canonical_tip"]
+                                    elif historical["kind"] in {"submission", "branch_submission", "canonical_update"}:
+                                        historical_frontiers[event["canonical_ref"]] = event["canonical_new"]
+                                historical_authorized = authorized_branch_refs(descriptor, historical_frontiers)
+                                if cursor.get("canonical_frontiers") != {
+                                    name: historical_frontiers[name] for name in historical_authorized
+                                }:
+                                    _fail("ISOLATION", view_id, "scoped cache frontiers differ from captured WAL")
+                                cache_proof = Path(tempfile.mkdtemp(prefix="bastion-check-cache-", dir=root.parent))
+                                shutil.rmtree(cache_proof)
+                                initialize_view_generation(cache_proof, "unborn")
+                                try:
+                                    cached_projection = build_scoped_projection(
+                                        root, view_id, canonical, cache_proof,
+                                        SimpleNamespace(canonical_refs=historical_frontiers),
+                                        SimpleNamespace(active_views=replay.active_views, records=historical_records),
+                                        repository, descriptor,
+                                    )
+                                finally:
+                                    shutil.rmtree(cache_proof, ignore_errors=True)
+                            if cursor.get("projected_refs") != cached_projection:
+                                _fail("ISOLATION", view_id, "active scoped cursor differs from captured projection")
+                            cached_refs = git(cached, "for-each-ref", "--format=%(refname)", check=False)
+                            if cached_refs.returncode or cached_refs.stdout.decode().splitlines() != sorted(cached_projection):
+                                _fail("ISOLATION", view_id, "active scoped view has unexpected refs")
+                            for name, tip in cached_projection.items():
+                                if ref(cached, name) != tip:
+                                    _fail("ISOLATION", view_id, "active scoped ref tip differs from captured projection")
+                            cached_selected = selected_default(descriptor, cached_projection)
+                            if (
+                                cursor.get("projected_ref") != cached_selected
+                                or cursor.get("projected_tip") != cached_projection.get(cached_selected, ZERO_OID)
+                            ):
+                                _fail("ISOLATION", view_id, "active scoped cursor has an invalid selected tip")
+                            expected_head = cached_selected or "refs/heads/unborn"
+                            head = git(cached, "symbolic-ref", "HEAD", check=False)
+                            if head.returncode or head.stdout.decode().strip() != expected_head:
+                                _fail("ISOLATION", view_id, "active scoped HEAD differs from selected authorized ref")
+                            if any(path.exists() for path in (
+                                cached / "objects" / "info" / "alternates",
+                                cached / "info" / "grafts",
+                                cached / "shallow",
+                            )) or not has_exact_object_closure(cached):
+                                _fail("ISOLATION", view_id, "active scoped view has unsafe history state or unreachable objects")
+                    finally:
+                        shutil.rmtree(scoped, ignore_errors=True)
+                    # Legacy single-ref replay above is intentionally not used
+                    # as authority for v4; it may omit branches by design.
+                    continue
                 refs = git(temp, "for-each-ref", "--format=%(refname)", check=False)
                 if refs.returncode or refs.stdout.decode().splitlines() != [active["projected_ref"]]:
                     _fail("ISOLATION", view_id, "projected repository has unexpected refs")

@@ -12,6 +12,7 @@ from typing import Any, Callable
 
 import identity
 from errors import ForgeError
+from git_refs import validate_branch_ref as _validate_branch_ref
 
 
 OBJECT_FORMAT = "sha1"
@@ -21,7 +22,7 @@ OID_RE = re.compile(r"^[0-9a-f]{40}$")
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 UUID_RE = re.compile(r"^[0-9a-f]{32}$")
 DESCRIPTOR_RE = re.compile(r"^vdesc-[0-9a-f]{64}$")
-KINDS = {"import", "view_create", "submission", "canonical_update", "policy_transition", "branch_create"}
+KINDS = {"import", "view_create", "submission", "branch_submission", "canonical_update", "policy_transition", "branch_create"}
 
 
 def canonical_json(value: object) -> bytes:
@@ -132,19 +133,10 @@ def _ref(value: object, subject: str) -> str:
 
 def validate_branch_ref(value: object) -> str:
     """Validate a user-created branch with Git's check-ref-format rules."""
-    ref = _string(value, "branch ref")
     try:
-        ref.encode("utf-8", "strict")
-    except UnicodeEncodeError:
-        _fail("branch ref is not valid UTF-8")
-    if (not ref.startswith("refs/heads/") or ref.endswith("/") or ref.endswith(".")
-        or ".." in ref or "@{" in ref or "\\" in ref or "//" in ref
-        or ref == "@" or any(ord(c) < 32 or ord(c) == 127 or c in " ~^:?*[" for c in ref)):
-        _fail("branch ref is not a valid Git branch ref")
-    parts = ref.split("/")
-    if any(not part or part.startswith(".") or part.endswith(".lock") for part in parts):
-        _fail("branch ref is not a valid Git branch ref")
-    return ref
+        return _validate_branch_ref(value)
+    except ForgeError as error:
+        _fail(str(error))
 
 
 def _pack_ref(value: object, expected_kind: str | None = None) -> dict:
@@ -197,15 +189,30 @@ def _normalized_capability_list(value: object, subject: str) -> list[str]:
 
 
 def validate_descriptor(record: object) -> dict:
-    fields = {
+    common = {
         "id", "algorithm", "principal_id", "principal_kind", "canonical_ref",
         "team_ids", "role_ids", "binding_ids", "capabilities", "restrictions",
     }
+    if not _is_mapping(record):
+        _fail("descriptor must be an object")
+    algorithm = record.get('algorithm')
+    if algorithm == identity.DESCRIPTOR_ALGORITHM:
+        fields = common
+    elif algorithm == identity.PERMISSIONS_DESCRIPTOR_ALGORITHM:
+        fields = common | {'permissions'}
+    else:
+        _fail("descriptor algorithm is unsupported")
     record = _exact(record, fields, "descriptor")
     identifier = _descriptor_id(record["id"], "descriptor id")
     payload = {key: value for key, value in record.items() if key != "id"}
-    if payload["algorithm"] != identity.DESCRIPTOR_ALGORITHM:
-        _fail("descriptor algorithm is unsupported")
+    if payload["algorithm"] == identity.PERMISSIONS_DESCRIPTOR_ALGORITHM:
+        try:
+            from permissions import normalize_permissions
+            normalized = normalize_permissions(payload['permissions'], 'descriptor.permissions')
+        except ForgeError as error:
+            _fail(str(error))
+        if normalized != payload['permissions']:
+            _fail('descriptor permissions are not normalized')
     _string(payload["principal_id"], "descriptor principal")
     if payload["principal_kind"] not in identity.PRINCIPAL_KINDS:
         _fail("descriptor principal kind is invalid")
@@ -404,7 +411,9 @@ class ReplayState:
         result.canonical_refs = dict(self.canonical_refs)
         result.canonical_packs = list(self.canonical_packs)
         result.active_views = {
-            view_id: dict(view) for view_id, view in self.active_views.items()
+            view_id: {**view,
+                "branch_frontiers": dict(view.get("branch_frontiers", {}))}
+            for view_id, view in self.active_views.items()
         }
         result.change_claims = dict(self.change_claims)
         result.events = dict(self.events)
@@ -539,6 +548,18 @@ def record_fingerprint(repository_id: str, kind: str, payload: dict) -> dict:
             **{key: payload.get(key) for key in (
                 "view_id", "projected_ref", "projected_old", "projected_new",
                 "descriptor_id", "descriptor_generation", "projection_epoch",
+            )},
+        }
+    elif kind == "branch_submission":
+        result = {
+            "kind": kind,
+            "repository_id": repository_id,
+            **{key: payload.get(key) for key in (
+                "idempotency_key_hash", "view_id", "principal_id", "descriptor_id",
+                "descriptor_generation", "projection_epoch", "canonical_ref", "projected_ref",
+                "canonical_old", "canonical_new", "projected_old", "projected_new",
+                "canonical_frontier_old", "canonical_pack", "submission_pack", "mappings",
+                "received_at", "transport", "remote_identity", "source_ref", "receive_old",
             )},
         }
     elif kind == "canonical_update":
@@ -735,6 +756,57 @@ def _validate_payload(
             _string(value["remote_identity"], "submission remote_identity", nonempty=False)
         _require_descriptor(descriptor_id, loader, value["principal_id"], value["canonical_ref"])
         return
+    if kind == "branch_submission":
+        fields = {
+            "idempotency_key_hash", "view_id", "principal_id", "descriptor_id",
+            "descriptor_generation", "projection_epoch", "canonical_ref", "canonical_old",
+            "canonical_new", "projected_ref", "projected_old", "projected_new",
+            "canonical_frontier_old", "canonical_pack", "submission_pack", "mappings",
+            "received_at", "transport", "remote_identity", "source_ref", "receive_old",
+        }
+        value = _exact(payload, fields, "branch_submission payload")
+        if value["idempotency_key_hash"] is not None:
+            _hash(value["idempotency_key_hash"], "branch submission idempotency key")
+        for name in ("view_id", "principal_id"):
+            _string(value[name], f"branch submission {name}")
+        descriptor_id = _descriptor_id(value["descriptor_id"], "branch submission descriptor")
+        _integer(value["descriptor_generation"], "branch submission generation", 1)
+        _integer(value["projection_epoch"], "branch submission epoch", 1)
+        validate_branch_ref(value["canonical_ref"])
+        validate_branch_ref(value["projected_ref"])
+        for name in ("canonical_old", "canonical_new", "projected_old", "projected_new", "canonical_frontier_old"):
+            if _oid(value[name], f"branch submission {name}") == "0" * 40:
+                _fail(f"branch submission {name} cannot be zero")
+        _oid(value["receive_old"], "branch submission receive_old")
+        if value["source_ref"] is not None:
+            validate_branch_ref(value["source_ref"])
+        mappings = value["mappings"]
+        if not isinstance(mappings, list):
+            _fail("branch submission mappings must be a list")
+        if mappings:
+            _mappings(mappings)
+        elif value["source_ref"] is None or value["canonical_new"] != value["canonical_old"] or value["projected_new"] != value["projected_old"]:
+            _fail("only pure branch creation may have empty mappings")
+        pure = value["source_ref"] is not None and not mappings
+        if pure:
+            if value["canonical_pack"] is not None or value["submission_pack"] is not None:
+                _fail("pure branch creation cannot carry packs")
+        else:
+            _pack_ref(value["canonical_pack"], "canonical")
+            _pack_ref(value["submission_pack"], "submission")
+            if not mappings or mappings[-1]["submitted"] != value["projected_new"] or mappings[-1]["canonical"] != value["canonical_new"]:
+                _fail("branch submission mapping endpoints differ from payload")
+        _integer(value["received_at"], "branch submission received_at", 0)
+        if not _string(value["transport"], "branch submission transport").isascii():
+            _fail("branch submission transport is not ASCII")
+        if value["remote_identity"] is not None:
+            _string(value["remote_identity"], "branch submission remote identity", nonempty=False)
+        if loader is None:
+            _fail("branch submission requires its captured descriptor")
+        captured = validate_descriptor(loader(descriptor_id))
+        if captured["id"] != descriptor_id or captured["principal_id"] != value["principal_id"] or captured["canonical_ref"] != state.canonical_ref:
+            _fail("branch submission descriptor provenance is invalid")
+        return
     if kind == "canonical_update":
         fields = {"principal_id", "descriptor_id", "canonical_ref", "canonical_old", "canonical_new", "canonical_pack", "commits", "received_at"}
         value = _exact(payload, fields, "canonical_update payload")
@@ -865,6 +937,8 @@ def apply_record(
             "projection_epoch": payload["projection_epoch"],
             "canonical_frontier": payload["canonical_frontier"],
             "epoch_start_seq": record["seq"],
+            "branch_frontiers": dict(state.canonical_refs),
+            "epoch_branches": dict(state.canonical_refs),
         }
     elif kind == "submission":
         view = state.active_views.get(payload["view_id"])
@@ -909,6 +983,108 @@ def apply_record(
         state.canonical_refs[state.canonical_ref] = state.canonical_tip
         for active in state.active_views.values():
             active["canonical_frontier"] = payload["canonical_new"]
+            active["branch_frontiers"][state.canonical_ref] = payload["canonical_new"]
+        state.requests.setdefault(request, []).append(record["event_id"])
+        if key_hash is not None:
+            state.idempotency[key_hash] = {
+                "event_id": record["event_id"],
+                "event_fingerprint": copy.deepcopy(record["event_fingerprint"]),
+            }
+    elif kind == "branch_submission":
+        view = state.active_views.get(payload["view_id"])
+        required = (
+            "principal_id", "descriptor_id", "descriptor_generation", "projection_epoch"
+        )
+        if view is None or any(payload[name] != view[name] for name in required):
+            _fail("branch submission does not match active view provenance")
+        target = validate_branch_ref(payload["canonical_ref"])
+        source = payload["source_ref"]
+        receive_old = payload["receive_old"]
+        mappings = payload["mappings"]
+        descriptor = validate_descriptor(descriptor_loader(payload["descriptor_id"]))
+        if descriptor["algorithm"] != identity.PERMISSIONS_DESCRIPTOR_ALGORITHM:
+            _fail("branch submission requires a capabilities-v4 descriptor")
+        if descriptor["principal_id"] != payload["principal_id"] or descriptor["canonical_ref"] != state.canonical_ref:
+            _fail("branch submission descriptor provenance is invalid")
+        from permissions import transport_branch_allowed
+
+        if source is None:
+            if payload["projected_ref"] != target:
+                _fail("update projected ref differs from target ref")
+            if target not in state.canonical_refs or receive_old == "0" * 40:
+                _fail("branch update target or expected old is invalid")
+            if state.canonical_refs[target] != payload["canonical_old"]:
+                _fail("branch update canonical old is stale")
+            if receive_old != payload["projected_old"]:
+                _fail("branch update wire old differs from projected old")
+            if not transport_branch_allowed(descriptor, "read", target) or not transport_branch_allowed(descriptor, "update", target):
+                _fail("branch update is not permitted")
+            frontier_ref = target
+        else:
+            source = validate_branch_ref(source)
+            if payload["projected_ref"] != target:
+                _fail("creation projected ref differs from target ref")
+            if target in state.canonical_refs or any(
+                ref.startswith(target + "/") or target.startswith(ref + "/")
+                for ref in state.canonical_refs
+            ):
+                _fail("branch creation destination conflicts with existing refs")
+            if receive_old != "0" * 40:
+                _fail("branch creation expected old must be zero")
+            if source not in state.canonical_refs:
+                _fail("branch creation source does not exist")
+            if state.canonical_refs[source] != payload["canonical_old"] or payload["canonical_old"] != payload["canonical_frontier_old"]:
+                _fail("branch creation source tip is stale")
+            if len(state.canonical_refs) >= MAX_BRANCH_REFS:
+                _fail("repository branch ref quota is exhausted")
+            if not transport_branch_allowed(descriptor, "read", source):
+                _fail("branch creation source read is not permitted")
+            if not transport_branch_allowed(descriptor, "read", target) or not transport_branch_allowed(descriptor, "create", target):
+                _fail("branch creation target is not permitted")
+            if mappings and not transport_branch_allowed(descriptor, "update", target):
+                _fail("branch creation commits are not permitted")
+            frontier_ref = source
+
+        if payload["canonical_frontier_old"] != view["branch_frontiers"].get(frontier_ref):
+            _fail("branch submission frontier is stale")
+        if mappings:
+            if mappings[0]["submitted"] == payload["projected_old"] or mappings[-1]["submitted"] != payload["projected_new"] or mappings[-1]["canonical"] != payload["canonical_new"]:
+                _fail("branch submission mapping endpoints differ")
+        elif source is None or payload["canonical_new"] != payload["canonical_old"] or payload["projected_new"] != payload["projected_old"]:
+            _fail("empty mappings are allowed only for a pure branch creation")
+
+        request = (payload["view_id"], target, receive_old, payload["projected_new"])
+        for previous_event in state.requests.get(request, []):
+            previous_payload = state.records[state.events[previous_event]["seq"] - 1]["payload"]
+            if previous_payload.get("projection_epoch") == payload["projection_epoch"]:
+                _fail("branch submission request was already committed in this epoch")
+        key_hash = payload["idempotency_key_hash"]
+        if key_hash is not None and key_hash in state.idempotency:
+            _fail("branch submission idempotency key was already committed")
+
+        for mapping in mappings:
+            change_id = mapping["change_id"]
+            if not change_id:
+                continue
+            claim = state.change_claims.get(change_id)
+            if claim is not None and claim["owner_principal_id"] != payload["principal_id"]:
+                _fail("Change-Id belongs to another principal")
+        for mapping in mappings:
+            change_id = mapping["change_id"]
+            if change_id and change_id not in state.change_claims:
+                state.change_claims[change_id] = {
+                    "owner_principal_id": payload["principal_id"],
+                    "canonical_ref": target,
+                }
+        if payload["canonical_pack"] is not None:
+            state.canonical_packs.append(copy.deepcopy(payload["canonical_pack"]))
+        state.canonical_refs[target] = payload["canonical_new"]
+        for active in state.active_views.values():
+            active["branch_frontiers"][target] = payload["canonical_new"]
+            if target == state.canonical_ref:
+                active["canonical_frontier"] = payload["canonical_new"]
+        if target == state.canonical_ref:
+            state.canonical_tip = payload["canonical_new"]
         state.requests.setdefault(request, []).append(record["event_id"])
         if key_hash is not None:
             state.idempotency[key_hash] = {
@@ -926,6 +1102,7 @@ def apply_record(
         state.canonical_refs[state.canonical_ref] = state.canonical_tip
         for active in state.active_views.values():
             active["canonical_frontier"] = payload["canonical_new"]
+            active["branch_frontiers"][state.canonical_ref] = payload["canonical_new"]
         for commit in commits:
             change_id = commit["change_id"]
             if change_id and change_id not in state.change_claims:
@@ -943,6 +1120,8 @@ def apply_record(
         if len(state.canonical_refs) >= MAX_BRANCH_REFS:
             _fail("repository branch ref quota is exhausted")
         state.canonical_refs[ref] = payload["canonical_tip"]
+        for active in state.active_views.values():
+            active["branch_frontiers"][ref] = payload["canonical_tip"]
     else:
         if payload["canonical_frontier"] != state.canonical_tip:
             _fail("policy transition is not at the current canonical tip")
@@ -970,6 +1149,8 @@ def apply_record(
             active["descriptor_generation"] = item["new_generation"]
             active["projection_epoch"] = item["new_projection_epoch"]
             active["epoch_start_seq"] = record["seq"]
+            active["branch_frontiers"] = dict(state.canonical_refs)
+            active["epoch_branches"] = dict(state.canonical_refs)
     existing = state.events.get(record["event_id"])
     if existing is not None:
         _fail("event ID is duplicated in WAL")
@@ -1011,6 +1192,16 @@ def validate_record_objects(record: dict, canonical_repo, view_repo=None) -> Non
             submitted = output(view_repo, "rev-list", "--reverse", f"{payload['projected_old']}..{payload['projected_new']}").splitlines()
             if submitted != [item["submitted"] for item in mappings]:
                 _fail("submission evidence mappings are not an exact first-parent range")
+    elif kind == "branch_submission":
+        mappings = payload["mappings"]
+        if mappings:
+            canonical = first_parent_commits(canonical_repo, payload["canonical_old"], payload["canonical_new"])
+            if canonical != [item["canonical"] for item in mappings]:
+                _fail("branch submission canonical mappings are not an exact first-parent range")
+            if view_repo is not None:
+                submitted = output(view_repo, "rev-list", "--reverse", f"{payload['projected_old']}..{payload['projected_new']}").splitlines()
+                if submitted != [item["submitted"] for item in mappings]:
+                    _fail("branch submission evidence mappings are not an exact first-parent range")
     elif kind == "canonical_update":
         commits = first_parent_commits(canonical_repo, payload["canonical_old"], payload["canonical_new"])
         if commits != [item["canonical"] for item in payload["commits"]]:

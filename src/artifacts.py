@@ -129,6 +129,14 @@ def build_full_ref_pack(repo: Path, ref_name: str) -> BuiltPack:
     return _build(repo, f"{ref_name}\n".encode("ascii"), None)
 
 
+def build_full_refs_pack(repo: Path, refs: list[str]) -> BuiltPack | None:
+    """Build one full reachable-union pack for the supplied refs."""
+    if not refs:
+        return None
+    revisions = ("".join(f"{ref}\n" for ref in sorted(refs))).encode("ascii")
+    return _build(repo, revisions, None)
+
+
 def _put_immutable(store, key: str, body: bytes) -> None:
     """Use Repository's stricter helper when available, otherwise emulate it."""
     if hasattr(store, "put_immutable"):

@@ -39,6 +39,29 @@ The edge cases come from Git's own test suite and security documentation:
 - `t/t5306-pack-nobase.sh` and `t/t5309-pack-delta-cycles.sh`: missing thin-pack
   bases and pathological delta graphs.
 
+## Scoped branch transport (capabilities-v4)
+
+v4 advertises only readable full branch refs, from a private object database
+whose objects are the union of those authorized projected closures. It does
+not merely hide canonical refs: protocol v0/v2 exact-OID wants for known hidden
+objects must fail, and `cat-file` against the private projection must not find
+them. With no readable branches the repository is empty and `HEAD` is
+unborn; Git fetch/push returns a generic denial without a ref inventory.
+
+Push support is intentionally narrow: a single fast-forward update, or a new
+branch created from the current authorized advertised projected tip. Existing
+targets require `read` + `update`; creation requires target `read` + `create`
+and source `read` even for a pure fork. Adding commits on creation additionally
+requires target `update`. Path transition checks apply in all cases.
+Force, delete, multiple refs, tags, merge commits, arbitrary historic bases,
+and stale creation proofs are unsupported. v3 retains its canonical-default
+branch-only behavior. This is not general GitHub merge compatibility.
+
+- Permission contraction followed by a fresh projection/re-clone is required
+  to discard objects that are no longer reachable from authorized refs.
+- Exercise protocol v0 and v2 known-OID wants after branch revocation and after
+  a cold-cache rebuild; hidden physical OIDs must not be served.
+
 ## Next Rows
 
 - Permission contraction followed by cruft-pack and GC maintenance across the

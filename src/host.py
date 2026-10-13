@@ -29,6 +29,28 @@ SCHEMA_VERSION = 5
 HOST_TOKEN_RE = re.compile(r"^bsh1\.([0-9a-f]{32})\.([A-Za-z0-9_-]{43})$")
 
 
+def _public_branch_name(descriptor: dict, canonical_refs: dict[str, str]) -> str | None:
+    """Choose a branch label only from refs readable by this active policy."""
+    from permissions import authorized_branch_refs, transport_branch_allowed
+
+    if descriptor.get("algorithm") == "capabilities-v3":
+        default_ref = descriptor.get("canonical_ref")
+        if isinstance(default_ref, str) and transport_branch_allowed(
+            descriptor, "read", default_ref
+        ):
+            return default_ref.removeprefix("refs/heads/")
+        return None
+    if descriptor.get("algorithm") != "capabilities-v4":
+        return None
+    readable = authorized_branch_refs(descriptor, canonical_refs)
+    if not readable:
+        return None
+    selected = descriptor.get("canonical_ref")
+    if selected not in readable:
+        selected = readable[0]
+    return selected.removeprefix("refs/heads/")
+
+
 def _slug(value: str, label: str) -> str:
     if not isinstance(value, str) or not SLUG.fullmatch(value) or value in RESERVED:
         raise ForgeError(f"invalid {label}; use a lowercase ASCII slug")
@@ -801,15 +823,26 @@ class Host:
                                    and identity.get("kind") == "user")
                 linked = identity and (identity.get("clerk_user_id") == account["clerk_user_id"]
                                        if account["clerk_user_id"] else owner_exception)
+                descriptors = [repository._descriptor(v["descriptor_id"]) for v in active]
                 descriptor_valid = all(
-                    (descriptor := repository._descriptor(v["descriptor_id"])).get("principal_id") == row["principal_id"]
+                    descriptor.get("principal_id") == row["principal_id"]
                     and descriptor.get("canonical_ref") == f"refs/heads/{row['branch']}"
-                    for v in active
+                    for descriptor in descriptors
+                )
+                visible_branches = {
+                    _public_branch_name(descriptor, _manifest.canonical_refs)
+                    for descriptor in descriptors
+                }
+                # Multiple active views for one membership should not make
+                # discovery guess which policy governs the public label.
+                public_branch = (
+                    next(iter(visible_branches)) if len(visible_branches) == 1 else None
                 )
                 self._check_forge_storage(root, row["branch"])
                 if (not identity or identity.get("kind") != "user" or not linked or not views or not descriptor_valid or
                     any(not v.get("descriptor_id") or v.get("principal_id") != row["principal_id"] or
-                        v.get("projected_ref") != f"refs/heads/{row['branch']}" for v in active) or
+                        (descriptor.get("algorithm") == "capabilities-v3" and
+                         v.get("projected_ref") != f"refs/heads/{row['branch']}") for v, descriptor in zip(active, descriptors)) or
                     state.get("repository_id") != row["repository_id"] or
                     state.get("repository_state") != "ready" or
                     marker.get("repo_id") != row["repo_id"] or
@@ -826,7 +859,7 @@ class Host:
             except Exception:
                 continue
             result.append({"repo_id": row["repo_id"], "owner_name": row["owner_name"], "name": row["name"],
-                           "branch": row["branch"], "git_url": f"/{row['owner_name']}/{row['name']}.git", "views": views})
+                           "branch": public_branch, "git_url": f"/{row['owner_name']}/{row['name']}.git", "views": views})
         return result
 
     def reconcile_membership_intents(self, account_id: str) -> None:

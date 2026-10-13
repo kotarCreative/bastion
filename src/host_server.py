@@ -136,7 +136,10 @@ def create_app(root: Path | str, *, host_catalog=None) -> Flask:
             row = con.execute("SELECT r.*,a.owner_name FROM repos r JOIN accounts a ON a.account_id=r.owner_account_id WHERE r.repo_id=? AND r.state='ready'", (repo_id,)).fetchone()
         if not row:
             return None
-        return {"repo_id": row["repo_id"], "owner_name": row["owner_name"], "name": row["name"], "branch": row["branch"], "git_url": f"/{row['owner_name']}/{row['name']}.git"}
+        # This path is used for routing when no membership-scoped discovery
+        # result is available. Never echo the configured canonical default
+        # branch here; only Host.public_repos can select a policy-readable ref.
+        return {"repo_id": row["repo_id"], "owner_name": row["owner_name"], "name": row["name"], "branch": None, "git_url": f"/{row['owner_name']}/{row['name']}.git"}
 
     @app.after_request
     def secure(response):

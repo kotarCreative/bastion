@@ -196,3 +196,49 @@ def validate_ref_update(
             "branch creation, deletion, and stale or force updates are not supported"
         )
     return old, new, updated_ref
+
+
+def validate_branch_update_shape(
+    updates: list[tuple[str, str, str]],
+) -> tuple[str, str, str]:
+    """Validate the transport-level envelope before branch authorization.
+
+    The policy decision and old-tip continuity checks are deliberately left
+    to the receive transaction, which has the captured descriptor and current
+    advertised ref inventory.
+    """
+    if len(updates) != 1:
+        raise ForgeError("exactly one authorized branch may be updated")
+    old, new, updated_ref = updates[0]
+    if not updated_ref.startswith("refs/heads/") or updated_ref == "refs/heads/":
+        raise ForgeError("branch update is not authorized")
+    if new == ZERO_OID:
+        raise ForgeError("branch creation, deletion, and stale or force updates are not supported")
+    return old, new, updated_ref
+
+
+def select_advertised_branch_base(
+    first_parent_newest_first: list[str],
+    current_sources: dict[str, list[tuple[str, str]]],
+    max_new_commits: int,
+) -> tuple[str, str, str]:
+    """Choose the nearest current advertised tip as a creation base.
+
+    ``current_sources`` maps projected tip OIDs to ``(fullref,
+    canonical_tip)`` candidates. Historic refs are never considered. Multiple
+    names at the nearest tip are deterministic only when their canonical
+    frontiers agree; otherwise the submitted graph cannot disambiguate the
+    hidden canonical base.
+    """
+    for index, tip in enumerate(first_parent_newest_first):
+        sources = current_sources.get(tip)
+        if not sources:
+            continue
+        if index > max_new_commits:
+            raise ForgeError("branch update is not authorized")
+        frontiers = {canonical for _ref, canonical in sources}
+        if len(frontiers) != 1:
+            raise ForgeError("ambiguous branch creation base")
+        source_ref, canonical_tip = sorted(sources)[0]
+        return source_ref, tip, canonical_tip
+    raise ForgeError("branch update is not authorized")

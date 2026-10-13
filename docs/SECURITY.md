@@ -23,15 +23,34 @@ closures, not to hostile users sharing the server filesystem.
 
 ## Protected Assets
 
-Canonical branch inventory is trusted-operator-only: listing refs is a local
-filesystem/server operator operation, not a repository-user capability or
-public API. Creating a canonical ref additionally verifies that the specified
-principal has a root-administrator descriptor. Ordinary repository read
-permission does not expose non-default branch names or refs; browser browsing
-and Git clone/fetch/push remain default-branch-only. This internal inventory
-does not activate the reserved public branch capability or grant clients
-branch access. Branch-scoped viewing and transport authorization require a
-separate design and implementation.
+Canonical branch inventory remains a trusted-operator operation, not a public
+catalog API. HTTP Git advertisement and browser projection expose only refs
+authorized by the active descriptor and materialized into the private view
+object database. A hidden canonical ref or OID is not made safe merely by
+omitting its name from advertisement; exact-OID requests must also fail.
+
+The capabilities-v4 descriptor adds explicit, separately scoped repository
+(`pr_view`, `pr_create`, `pr_merge`) and branch (`read`, `create`, `update`,
+`delete`) policy. Both scopes default deny, including for root administrators;
+path `read`/`admin`, owner status, and service-account ownership grant none of
+these actions. Branch selectors are exact full refs or terminal namespace
+wildcards, with most-specific rule winning and deny winning ties; any repository
+deny wins. The authenticated self-session exposes only the requesting
+principal's active captured policy for v4 descriptors. The v3 envelope remains
+exactly unchanged; v4 adds a normalized `permissions` field. Its decision helper
+maps v3 to deny-all via the shared descriptor helper and evaluates selectors
+without looking up branch existence. v4 transport enforces branch rights;
+branch `read` does not grant path reads, and path capabilities remain a separate
+gate on commit transitions. v3 retains legacy default-branch read/update
+behavior and denies secondary refs. `delete` is a policy action, but HTTP
+transport does not implement branch deletion. PR operations and a UI policy
+editor are not implemented.
+
+Legacy capabilities-v3 descriptor payloads and IDs are preserved exactly when
+no role opts into explicit permissions. A role that explicitly carries policy
+produces a capabilities-v4 descriptor; catalog changes remain dormant until the
+existing principal transition activates a new immutable descriptor. Old UI
+tokens resolve the current active descriptor, not stale catalog policy.
 
 - unauthorized blob contents;
 - hidden filenames and tree structure where practical;
@@ -427,3 +446,29 @@ permitted push on a throwaway target) is covered by
 `tests/test_backup_consistency_015.py`.
 
 See [ROADMAP.md](../ROADMAP.md) for the work required before production claims.
+# Scoped branch transport (capabilities-v4)
+
+Branch transport rights are explicit and independent of path capabilities.
+`read` controls advertisement and projected object closure. Updating an
+existing target requires `read` and `update`; creating a target requires
+`read` and `create` on that target plus `read` on the currently advertised
+source, even for a pure fork. A creation that adds commits additionally
+requires `update` on its target. Every submitted commit transition continues
+to be checked against path capabilities. Ref selectors are full
+`refs/heads/...` names or terminal namespace wildcards such as
+`refs/heads/team/*`.
+
+v3 remains the legacy default-branch-only mode: its canonical default is
+readable/updatable under the legacy behavior, and all secondary refs are
+denied. Upgrading a policy to v4 is an explicit migration, not an implicit
+grant. Owners must configure branch `read`, `create`, and `update` selectors
+that they intend to permit (for example `refs/heads/*` for all branches) and
+continue to configure path scopes separately. No PR merge workflow is implied
+by `pr_merge` policy.
+
+After branch rights contract, a fresh projection is required before re-cloning so
+previously authorized branch objects are removed from the private object
+database. Existing credentials do not preserve access: current policy is
+re-evaluated on each transport request. Empty branch access denies Git fetch
+and push without exposing branch inventory or object IDs; it does not revoke
+an otherwise authorized browser session.

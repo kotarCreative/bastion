@@ -37,6 +37,7 @@ short-lived view-scoped API tokens.
 - [Architecture](docs/ARCHITECTURE.md)
 - [Transaction and event model](docs/TRANSACTIONS.md)
 - [Security model](docs/SECURITY.md)
+- [Scoped permissions](.specs/019-scoped-permissions.md)
 - [Testing and local operation](docs/TESTING.md)
 - [Test deployment](docs/DEPLOYMENT.md)
 - [AWS dev deployment](deployment/terraform/aws/README.md)
@@ -50,12 +51,13 @@ short-lived view-scoped API tokens.
 Bastion provides an internal, WAL-backed inventory of canonical branches.
 Trusted local/server operators can list the canonical inventory; creating a
 branch at an existing canonical tip additionally verifies the specified
-principal's root-administrator descriptor. This is an operator foundation
-only: Git clients, browser
-views, and clone/fetch/push still expose the default branch only. Review/PR
-workflows are not implemented. It does not implement client-created feature
-branches, branch deletion or merging, or GitHub-compatible branching. The
-canonical inventory is limited to 1,024 branches including the default.
+principal's root-administrator descriptor. Git clients and browser views use
+the active descriptor's scoped projection: v3 remains default-branch-only,
+while v4 can expose explicitly readable refs and accept narrow single-ref
+branch pushes. Client creation must start from a currently advertised
+authorized source; arbitrary historical bases, deletion, merging, and
+GitHub-compatible PR workflows are not supported. The canonical inventory is
+limited to 1,024 branches including the default.
 
 For a hosted repository, run from the host CLI but pass the **repository root**
 (not the host root); `owner` is the configured owner principal:
@@ -73,6 +75,39 @@ commands, not end-user Git branch commands. See
 [branch foundation spec](.specs/018-multi-branch-foundation.md).
 
 ## Multi-repository hosting
+
+### Scoped repository and branch policy
+
+Operators may configure explicit repository PR actions (`pr_view`, `pr_create`,
+`pr_merge`) and branch actions (`read`, `create`, `update`, `delete`) with
+`--repo-allow ACTION`, `--repo-deny ACTION`, `--branch-allow ACTION=SELECTOR`,
+and `--branch-deny ACTION=SELECTOR` on `add-role`. Bind the configured role to
+the existing principal, then run `transition-principal` to activate it. All
+actions default deny, including for administrators; path `read`/`admin`, service
+account ownership, and owner status imply no PR permissions. Branch selectors
+are exact full refs or terminal namespace wildcards such as
+`refs/heads/feature/*`. Path permissions and branch permissions are distinct
+scopes. Legacy descriptor IDs remain unchanged; a permissions-bearing role
+uses the v4 descriptor format.
+
+For v4 Git transport, `read` must explicitly cover every advertised/target ref,
+including the default branch. Existing-ref pushes need target `read` and
+`update`. New branches need target `read` and `create`, plus `read` on the
+currently advertised source even for a pure fork; when the push adds commits,
+the target also needs `update`. For example, an owner opting into all branch reads, creates
+and updates must pass `--branch-allow read=refs/heads/*`,
+`--branch-allow create=refs/heads/*`, and
+`--branch-allow update=refs/heads/*` to `add-role`. These are not implicit
+grants: v3 continues its legacy default-branch read/update behavior, while
+secondary branches remain denied until an explicit v4 policy is activated.
+Path capabilities still govern every commit transition independently.
+
+The `/api/v1/session` envelope retains its exact legacy shape for v3; v4 adds
+the requesting principal's normalized `permissions` field and selected
+authorized ref (or `null` for an empty projection). PR rights remain policy
+only: PR lifecycle/merge workflows and a UI policy editor are not implemented.
+See the [scoped permissions spec](.specs/019-scoped-permissions.md) and
+[scoped branch transport spec](.specs/020-scoped-branch-transport.md).
 
 The primary hosted application uses [Cloudflare](deployment/cloudflare/README.md):
 a durable host catalog, one isolated Durable Object catalog per repository,

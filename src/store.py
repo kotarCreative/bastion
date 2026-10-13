@@ -2550,6 +2550,14 @@ def _backup_repository(
         elif record["kind"] == "submission":
             descriptor_ids.add(payload["descriptor_id"])
             pack_refs.extend((payload["canonical_pack"], payload["submission_pack"]))
+        elif record["kind"] == "branch_submission":
+            descriptor_ids.add(payload["descriptor_id"])
+            # Pure fork records deliberately carry no packs: their ancestry
+            # is already reachable from manifest.canonical_packs.
+            pack_refs.extend(
+                pack for pack in (payload["canonical_pack"], payload["submission_pack"])
+                if pack is not None
+            )
         elif record["kind"] == "canonical_update":
             descriptor_ids.add(payload["descriptor_id"])
             pack_refs.append(payload["canonical_pack"])

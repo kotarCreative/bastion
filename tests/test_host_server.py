@@ -30,6 +30,49 @@ def test_host_routes_require_host_credential(tmp_path):
     assert len(client.get("/api/v1/repos", headers={"Authorization": "Bearer " + token}).json["repos"]) == 1
 
 
+def test_v4_host_discovery_does_not_echo_denied_default_branch(tmp_path):
+    from identity import empty_capability_map
+    from permissions import empty_permissions
+    from service import add_role, bind_role, create_branch, transition_principal
+
+    host = Host(tmp_path / "host")
+    account_id = host.approve_account("alice", ["alice@example.test"])
+    repo = host.create_repo("alice", "private-default", request_id="private-default", seed_empty=True)
+    root = host.root / "repos" / repo["repo_id"]
+    with host._connect(read_only=True) as con:
+        principal_id = con.execute(
+            "SELECT principal_id FROM memberships WHERE repo_id=? AND account_id=?",
+            (repo["repo_id"], account_id),
+        ).fetchone()[0]
+    create_branch(root, "feature", principal_id)
+    permissions = empty_permissions()
+    permissions["branches"]["allow"]["read"] = ["refs/heads/feature"]
+    add_role(root, "feature-reader", empty_capability_map(), empty_capability_map(),
+             permissions=permissions)
+    bind_role(root, "feature-reader", "principal", principal_id)
+    transition_principal(root, principal_id)
+
+    token = host.issue_session(account_id)
+    client = create_app(host.root).test_client()
+    listing = client.get("/api/v1/repos", headers={"Authorization": "Bearer " + token})
+    assert listing.status_code == 200
+    public_repo = next(item for item in listing.json["repos"] if item["repo_id"] == repo["repo_id"])
+    # The denied default is not named; the selected readable ref is.
+    assert public_repo["branch"] == "feature"
+
+    denied = empty_permissions()
+    denied["branches"]["deny"]["read"] = ["refs/heads/feature"]
+    add_role(root, "deny-feature-discovery", empty_capability_map(),
+             empty_capability_map(), permissions=denied)
+    bind_role(root, "deny-feature-discovery", "principal", principal_id)
+    transition_principal(root, principal_id)
+    listing = client.get("/api/v1/repos", headers={"Authorization": "Bearer " + token})
+    public_repo = next(item for item in listing.json["repos"] if item["repo_id"] == repo["repo_id"])
+    # With no readable branches discovery returns null rather than main or a
+    # stale feature label; the repository itself remains discoverable.
+    assert public_repo["branch"] is None
+
+
 def test_approved_zero_repository_clerk_login_uses_fake_authenticator(tmp_path, monkeypatch):
     import clerk_auth
     from clerk_auth import ClerkConfig

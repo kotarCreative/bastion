@@ -90,6 +90,25 @@ class MaterializedView:
     def projected_tip(self) -> str:
         return self.cursor["projected_tip"]
 
+    @property
+    def projected_refs(self) -> dict[str, str]:
+        """Advertised, permission-scoped refs (legacy cursors are singleton)."""
+        refs = self.cursor.get("projected_refs")
+        if refs is not None:
+            return dict(refs)
+        reference = self.cursor.get("projected_ref")
+        return {reference: self.projected_tip} if reference else {}
+
+    @property
+    def projected_ref(self) -> str | None:
+        return self.cursor.get("projected_ref")
+
+    def tip_for_ref(self, fullref: str) -> str | None:
+        return self.projected_refs.get(fullref)
+
+    def canonical_frontier_for_ref(self, fullref: str) -> str | None:
+        return self.cursor.get("canonical_frontiers", {}).get(fullref)
+
 
 @contextmanager
 def _flock(path: Path):
@@ -490,7 +509,105 @@ def _suffix_affects_view(
                 canonical, payload["canonical_old"], payload["canonical_new"], descriptor
             ):
                 return True
+        elif kind == "branch_submission":
+            payload = record["payload"]
+            # A legacy descriptor has one transport ref.  A v4 submission
+            # to another branch cannot move its selected legacy projection.
+            if payload.get("canonical_ref") == active["projected_ref"] and _visible_changes(
+                canonical, payload["canonical_old"], payload["canonical_new"], descriptor
+            ):
+                return True
     return False
+
+
+def _scoped_cursor(view_id, active, projected_refs, canonical_frontiers, selected):
+    return {
+        "schema": "scoped-v4",
+        "view_id": view_id,
+        "descriptor_id": active["descriptor_id"],
+        "descriptor_generation": active["descriptor_generation"],
+        "projection_epoch": active["projection_epoch"],
+        "projected_ref": selected,
+        "projected_tip": projected_refs.get(selected, ZERO_OID),
+        "projected_refs": dict(sorted(projected_refs.items())),
+        "canonical_frontiers": dict(sorted(canonical_frontiers.items())),
+    }
+
+
+def _scoped_inventory_valid(path: Path, cursor: dict, *, full=False) -> bool:
+    if _read_cursor(path) != cursor:
+        return False
+    for unsafe in (path / "objects" / "info" / "alternates", path / "info" / "grafts", path / "shallow"):
+        if unsafe.exists():
+            return False
+    refs = git(path, "for-each-ref", "--format=%(refname)", check=False)
+    if refs.returncode or refs.stdout.decode().splitlines() != sorted(cursor["projected_refs"]):
+        return False
+    for name, tip in cursor["projected_refs"].items():
+        if ref(path, name) != tip or not tip or tip == ZERO_OID:
+            return False
+        kind = git(path, "cat-file", "-t", tip, check=False)
+        if kind.returncode or kind.stdout.decode().strip() != "commit":
+            return False
+    selected = cursor["projected_ref"]
+    expected_head = selected or "refs/heads/unborn"
+    head = git(path, "symbolic-ref", "HEAD", check=False)
+    if head.returncode or head.stdout.decode().strip() != expected_head:
+        return False
+    if not _uses_repository_hooks(path):
+        return False
+    hook = path / "hooks" / "pre-receive"
+    try:
+        if hook.read_text() != REJECT_ALL_HOOK or hook.stat().st_mode & 0o777 != 0o755:
+            return False
+    except OSError:
+        return False
+    if full:
+        _COUNTS["full_view_validations"] += 1
+        return git(path, "fsck", "--full", "--strict", check=False).returncode == 0 and has_exact_object_closure(path)
+    return True
+
+
+def _ensure_scoped_view_materialized(root, view_id, manifest, replay_state, repository, active, descriptor, *, full_validation):
+    """Fresh-generation v4 path: the builder owns all projected objects."""
+    from permissions import authorized_branch_refs
+    from branch_projection import build_scoped_projection
+
+    cache_key = (str(root.resolve()), view_id)
+    link = view_repo(root, view_id)
+    expected_refs = authorized_branch_refs(descriptor, manifest.canonical_refs)
+    expected_frontiers = {r: manifest.canonical_refs[r] for r in expected_refs}
+    selected = descriptor.get("canonical_ref") if descriptor.get("canonical_ref") in expected_refs else (expected_refs[0] if expected_refs else None)
+    with _flock(materialization_lock(root, view_id)):
+        active_path = _resolved_symlink(link)
+        registered = _VIEW_REGISTRATIONS.get(cache_key)
+        # Reuse is allowed only after re-evaluating today's permissions and
+        # every relevant canonical tip; a contraction can never inherit ODBs.
+        if not full_validation and active_path is not None and registered:
+            old_cursor, old_path, _seq = registered
+            if old_path == str(active_path) and old_cursor == _scoped_cursor(view_id, active, old_cursor.get("projected_refs", {}), expected_frontiers, selected) and _scoped_inventory_valid(active_path, old_cursor):
+                _COUNTS["light_view_checks"] += 1
+                return MaterializedView(active_path, dict(old_cursor))
+        generation = materializations_dir(root) / "views" / view_id / str(active["projection_epoch"]) / f"{manifest.head_seq}-{uuid.uuid4().hex}.git"
+        generation.parent.mkdir(parents=True, exist_ok=True)
+        initialize_view_generation(generation, _branch(selected) if selected else "unborn")
+        try:
+            projected_refs = build_scoped_projection(root, view_id, ensure_canonical_materialized(root, manifest, repository), generation, manifest, replay_state, repository, descriptor)
+            if not isinstance(projected_refs, dict) or sorted(projected_refs) != expected_refs:
+                raise ForgeError("scoped projection returned an invalid authorized ref inventory", "integrity")
+            git(generation, "symbolic-ref", "HEAD", selected or "refs/heads/unborn")
+            cursor = _scoped_cursor(view_id, active, projected_refs, expected_frontiers, selected)
+            _write_cursor(generation, cursor)
+            if not _scoped_inventory_valid(generation, cursor, full=True):
+                raise ForgeError("scoped view materialization failed validation", "integrity")
+            _activate(root, link, generation)
+            _COUNTS["view_generations_built"] += 1
+            _write_receipt(root, view_id, {"schema": "scoped-v4", "repository_id": manifest.repository_id, "view_id": view_id, "descriptor_id": active["descriptor_id"], "descriptor_generation": active["descriptor_generation"], "projection_epoch": active["projection_epoch"], "projected_refs": cursor["projected_refs"], "canonical_frontiers": cursor["canonical_frontiers"], "applied_seq": manifest.head_seq, "generation": generation.name})
+            _VIEW_REGISTRATIONS[cache_key] = (dict(cursor), str(generation), manifest.head_seq)
+            return MaterializedView(generation, dict(cursor))
+        except Exception:
+            shutil.rmtree(generation, ignore_errors=True)
+            raise
 
 
 def _link_tree(source: Path, destination: Path) -> None:
@@ -702,6 +819,12 @@ def ensure_view_materialized(
     active = replay_state.active_views.get(view_id)
     if active is None:
         raise ForgeError("view is not active in the committed WAL", "policy")
+    descriptor = repository._descriptor(active["descriptor_id"])
+    if descriptor.get("algorithm") == "capabilities-v4":
+        return _ensure_scoped_view_materialized(
+            root, view_id, manifest, replay_state, repository, active, descriptor,
+            full_validation=full_validation,
+        )
     cache_key = (str(root.resolve()), view_id)
     link = view_repo(root, view_id)
     with _flock(materialization_lock(root, view_id)):
@@ -848,6 +971,16 @@ def ensure_view_materialized(
                     projected_tip, tracked_entries = _apply_canonical_commits(
                         canonical, generation, descriptor, payload["commits"], projected_tip, tracked_entries
                     )
+                elif record["kind"] == "branch_submission":
+                    # V3 descriptors remain bound to their single default
+                    # ref. A v4 principal may update that ref; replay its
+                    # canonical mappings through this v3 path projector (never
+                    # install another view's permission-scoped Git evidence).
+                    if payload.get("canonical_ref") == active["projected_ref"]:
+                        projected_tip, tracked_entries = _apply_canonical_commits(
+                            canonical, generation, descriptor, payload["mappings"],
+                            projected_tip, tracked_entries,
+                        )
                 elif record["kind"] == "policy_transition" and any(
                     item["view_id"] == view_id for item in payload["views"]
                 ):
@@ -895,14 +1028,16 @@ def ensure_intake_materialized(
 ) -> Path:
     view_id = materialized_view.cursor["view_id"]
     link = intake_repo(root, view_id)
-    # The branch is encoded by the only advertised ref in the view generation.
+    cursor = materialized_view.cursor
     refs = git(materialized_view.path, "for-each-ref", "--format=%(refname)").stdout.decode().splitlines()
-    if len(refs) != 1:
+    scoped = cursor.get("schema") == "scoped-v4"
+    if (scoped and refs != sorted(cursor.get("projected_refs", {}))) or (not scoped and len(refs) != 1):
         raise ForgeError("materialized view has an invalid ref inventory", "integrity")
-    branch = _branch(refs[0])
-    projected_ref = refs[0]
-    target_tip = ref(materialized_view.path, projected_ref)
-    if target_tip == ZERO_OID:
+    projected_ref = cursor.get("projected_ref")
+    branch = _branch(projected_ref) if projected_ref else "unborn"
+    target_refs = {name: ref(materialized_view.path, name) for name in refs}
+    target_tip = cursor["projected_tip"]
+    if not scoped and target_tip == ZERO_OID:
         raise ForgeError("materialized view is missing its projected tip", "integrity")
     expected_alternate = f"{(materialized_view.path / 'objects').resolve()}\n"
     with _flock(materialization_lock(root, view_id)):
@@ -916,9 +1051,20 @@ def ensure_intake_materialized(
         # WAL appends do not supersede it; a rebuilt generation (new tip)
         # or a policy change does.
         active = replay.active_views.get(view_id)
+        if scoped and active is not None:
+            from permissions import authorized_branch_refs
+
+            descriptor = Repository.open(root)._descriptor(active["descriptor_id"])
+            authorized = authorized_branch_refs(descriptor, manifest.canonical_refs)
+            current_frontiers = {name: manifest.canonical_refs[name] for name in authorized}
+            if (
+                sorted(cursor.get("projected_refs", {})) != authorized
+                or cursor.get("canonical_frontiers") != current_frontiers
+            ):
+                raise ForgeError("materialized view was superseded", "conflict")
         if (
             active is None
-            or _view_identity(active)
+            or (not scoped and _view_identity(active)
             != _view_identity(
                 {
                     "descriptor_id": cursor["descriptor_id"],
@@ -926,7 +1072,8 @@ def ensure_intake_materialized(
                     "projection_epoch": cursor["projection_epoch"],
                     "projected_ref": cursor["projected_ref"],
                 }
-            )
+            ))
+            or (scoped and (active["descriptor_id"] != cursor["descriptor_id"] or active["descriptor_generation"] != cursor["descriptor_generation"] or active["projection_epoch"] != cursor["projection_epoch"]))
             or cursor["projected_tip"] != target_tip
         ):
             raise ForgeError("materialized view was superseded", "conflict")
@@ -935,7 +1082,7 @@ def ensure_intake_materialized(
             active_cursor = _read_cursor(active_generation)
             if (
                 active_cursor is not None
-                and active_cursor.get("projected_tip") != cursor["projected_tip"]
+                and active_cursor != cursor
             ):
                 raise ForgeError("materialized view was superseded", "conflict")
         active_intake = _resolved_symlink(link)
@@ -945,11 +1092,13 @@ def ensure_intake_materialized(
             if (
                 alternate.is_file()
                 and alternate.read_text() == expected_alternate
-                and ref(active_intake, projected_ref) == target_tip
+                and all(ref(active_intake, name) == tip for name, tip in target_refs.items())
                 and _uses_repository_hooks(active_intake)
                 and _intake_receive_checks(active_intake)
                 and not advertised.returncode
-                and advertised.stdout.decode().splitlines() == [projected_ref]
+                and advertised.stdout.decode().splitlines() == refs
+                and git(active_intake, "symbolic-ref", "HEAD", check=False).stdout.decode().strip()
+                == (projected_ref or "refs/heads/unborn")
             ):
                 _install_intake_hooks(root, view_id, active_intake)
                 return active_intake
@@ -963,7 +1112,8 @@ def ensure_intake_materialized(
         try:
             initialize_intake(generation, materialized_view.path, branch)
             _install_intake_hooks(root, view_id, generation)
-            git(generation, "update-ref", projected_ref, target_tip)
+            for reference, tip in target_refs.items():
+                git(generation, "update-ref", reference, tip)
             _write_cursor(generation, cursor)
             _activate(root, link, generation)
             return generation
