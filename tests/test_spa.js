@@ -64,14 +64,17 @@ const calls = [];
   const credentialCalls = [];
 const logoutCalls = [];
 const tokens = [];
+const clerkSession = { id: "session-owner", user: { id: "user-owner" }, getToken: async () => "jwt-owner" };
+const clerk = { session: clerkSession, isSignedIn: true, load: async () => {}, addListener() {}, mountSignIn() {}, signOut: async () => {} };
 const context = {
   document: {
     getElementById: id => nodes.get(id),
     createElement: tag => new Node(tag),
     querySelectorAll: selector => selector === ".tab" ? tabs : panels,
   },
-  window: { location: { protocol: "https:", host: "demo.test" }, scrollTo() {}, setTimeout, clearTimeout },
-  TextEncoder, btoa: value => Buffer.from(value, "binary").toString("base64"), Intl, Date,
+  window: { location: { protocol: "https:", host: "demo.test", pathname: "/", href: "https://demo.test/" }, Clerk: clerk, scrollTo() {}, setTimeout, clearTimeout },
+  TextEncoder, URL, btoa: value => Buffer.from(value, "binary").toString("base64"), Intl, Date,
+  head: undefined,
   fetch: async (path, options) => {
     const method = (options && options.method) || "GET";
     for (const [needle, ms] of Object.entries(delays)) {
@@ -80,8 +83,8 @@ const context = {
     calls.push({ path, options });
     let body;
     let status = 200;
-    if (path === "/api/v1/auth/config") body = { enabled: false };
-    else if (path === "/api/v1/session") body = envelope;
+    if (path === "/api/v1/auth/config") body = { enabled: true, frontend_api_origin: "https://clerk.test", publishable_key: "pk_test" };
+    else if (path === "/api/v1/auth/clerk") body = { mode: "repository", access_token: "owner-token", session: envelope };
     else if (path === "/api/v1/logout" && method === "POST") { logoutCalls.push(options); body = { revoked: true }; }
     else if (path === "/api/v1/permissions") {
       if (method === "POST") body = { view_id: "writer", private_paths: [] };
@@ -136,13 +139,13 @@ const context = {
     return { status, json: async () => body };
   },
 };
+context.document.head = { appendChild(node) { node.fire("load"); } };
+context.window.history = { replaceState(_state, _title, path) { context.window.location.pathname = path; context.window.location.hash = ""; } };
 vm.runInNewContext(fs.readFileSync("templates/spa/app.js", "utf8"), context);
 const settle = async () => { for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve)); };
 
 (async () => {
   await settle();
-  nodes.get("token").value = "owner-token";
-  nodes.get("login-form").fire("submit");
   await settle();
   const tree = nodes.get("tree-list");
   assert.match(text(tree), /app\.js/);

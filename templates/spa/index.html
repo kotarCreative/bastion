@@ -12,17 +12,24 @@
 <header class="topbar">
   <a class="brand" href="/" aria-label="Bastion home"><span class="brand-mark" aria-hidden="true">b</span><span>bastion</span></a>
   <nav id="home-nav" class="home-nav" aria-label="Main navigation">
-    <a href="#product">Product</a>
-    <a href="#principles">How it works</a>
-    <a href="#login" class="nav-button">Sign in</a>
+    <a href="/#product">Product</a>
+    <a href="/#use-cases">Use cases</a>
+    <a href="/#principles">How it works</a>
+    <a href="/sign-in" class="nav-button">Sign in</a>
   </nav>
   <div id="session-nav" class="session-nav" hidden>
     <button id="repository-nav" class="quiet-button" type="button">Repository</button>
-    <button id="profile-nav" class="quiet-button" type="button">Profile</button>
-    <span id="identity" class="identity" hidden></span>
-    <div id="clerk-user-button" hidden></div>
-    <button id="manage-account" class="quiet-button" type="button" hidden>Account</button>
-    <button id="logout" class="quiet-button" type="button" hidden>Sign out</button>
+    <div id="profile-menu" class="profile-menu">
+      <button id="profile-menu-toggle" class="profile-menu-toggle" type="button" aria-label="Open profile menu" aria-expanded="false" aria-controls="profile-menu-content">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="12" cy="8" r="3.5"/><path d="M5 21v-2a7 7 0 0 1 14 0v2"/></svg>
+      </button>
+      <div id="profile-menu-content" class="profile-menu-content" hidden>
+        <span id="identity" class="identity" hidden></span>
+        <button id="profile-nav" class="quiet-button" type="button">Profile</button>
+        <button id="manage-account" class="quiet-button" type="button" hidden>Account settings</button>
+        <button id="logout" class="quiet-button" type="button" hidden>Sign out</button>
+      </div>
+    </div>
   </div>
 </header>
 
@@ -31,35 +38,46 @@
     <section class="hero" aria-labelledby="hero-title">
       <div class="hero-copy">
         <p class="eyebrow"><span class="status-dot"></span> PERMISSION-AWARE GIT HOSTING</p>
-        <h1 id="hero-title">Ship together.<br><em>Share precisely.</em></h1>
-        <p class="hero-description">Bastion gives every collaborator a real Git repository containing exactly the paths they are allowed to use. No custom client. No accidental over-sharing.</p>
+        <h1 id="hero-title">Your code.<br>Your rules.<br><em>Every path.</em></h1>
+        <p class="hero-description">One repository. Precisely scoped access. Give contributors, agents, and teams the code they need. Keep everything else behind the boundary.</p>
         <div class="hero-actions">
-          <a class="primary-link" href="#login">Open your workspace <span aria-hidden="true">→</span></a>
+          <a class="primary-link" href="/sign-in">Enter your workspace <span aria-hidden="true">↗</span></a>
           <a class="text-link" href="#principles">See how it works <span aria-hidden="true">↓</span></a>
         </div>
         <div class="trust-line"><span>Works with standard Git</span><span>Path-level access</span><span>Auditable policy</span></div>
       </div>
 
-      <div id="product" class="repository-preview" aria-label="A repository shown through a permission-aware view">
-        <div class="preview-topline"><span class="window-dots" aria-hidden="true"><i></i><i></i><i></i></span><span>acme / platform</span><span class="preview-private">Scoped view</span></div>
+      <figure id="product" class="repository-preview" aria-labelledby="preview-caption">
+        <div class="preview-topline"><span class="window-dots" aria-hidden="true"><i></i><i></i><i></i></span><span>BASTION / ACCESS CONTROL</span><span class="preview-private">Policy active</span></div>
         <div class="preview-meta">
-          <div><span class="preview-icon" aria-hidden="true">B</span><strong>platform</strong><small>Engineering view</small></div>
+          <div><span class="preview-icon" aria-hidden="true"><svg width="24" height="28" viewBox="0 0 24 28" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2 22 6v8c0 6-10 12-10 12S2 20 2 14V6Z"/><path d="m7 13 3 3 7-7"/></svg></span><strong>acme / platform</strong><small>POLICY MAP · TEAM: FRONTEND</small></div>
           <span class="branch-chip">main</span>
         </div>
-        <div class="preview-row"><span class="file-glyph folder-glyph" aria-hidden="true"></span><strong>src</strong><span>Visible</span></div>
-        <div class="preview-row"><span class="file-glyph folder-glyph" aria-hidden="true"></span><strong>shared</strong><span>Visible</span></div>
-        <div class="preview-row muted-row"><span class="file-glyph lock-glyph" aria-hidden="true"></span><strong>finance</strong><span>Not in this view</span></div>
-        <div class="preview-readme">
-          <span>README.md</span>
-          <h2>Build the platform</h2>
-          <p>This view contains the services and shared packages your team needs.</p>
+        <div class="preview-tree">
+          <div class="tree-root"><span aria-hidden="true">⌘</span> platform/ <span>PATH ACCESS</span></div>
+          <div class="preview-row"><span class="file-glyph folder-glyph" aria-hidden="true"></span><strong>apps/web/</strong><span>Read + write</span></div>
+          <div class="preview-row"><span class="file-glyph folder-glyph" aria-hidden="true"></span><strong>packages/ui/</strong><span>Read + write</span></div>
+          <div class="preview-row read-only-row"><span class="file-glyph folder-glyph" aria-hidden="true"></span><strong>packages/core/</strong><span>Read only</span></div>
+          <div class="preview-row locked-row"><span class="file-glyph lock-glyph" aria-hidden="true"></span><strong>infra/production/</strong><span>Locked</span></div>
+          <div class="preview-row locked-row"><span class="file-glyph lock-glyph" aria-hidden="true"></span><strong>services/billing/</strong><span>Locked</span></div>
+          <div class="preview-row locked-row"><span class="file-glyph lock-glyph" aria-hidden="true"></span><strong>internal/roadmap.md</strong><span>Locked</span></div>
         </div>
-        <div class="preview-stamp"><span class="status-dot"></span> Projection ready to clone</div>
+        <div class="projection-output"><span class="projection-arrow" aria-hidden="true">↓</span><div><span class="eyebrow">PROJECTED GIT VIEW</span><strong>Only allowed paths make the cut.</strong><code><span>$</span> git clone &lt;your-scoped-url&gt;</code></div><svg class="projection-lock" width="30" height="36" viewBox="0 0 30 36" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="4" y="15" width="22" height="18" rx="2"/><path d="M9 15V9a6 6 0 0 1 12 0v6M15 22v5"/></svg></div>
+        <figcaption id="preview-caption" class="preview-stamp"><span class="status-dot"></span> Illustrative policy map. Locked paths are absent from the clone.</figcaption>
+      </figure>
+    </section>
+
+    <section id="use-cases" class="use-cases" aria-labelledby="use-cases-title">
+      <div class="section-heading"><p class="eyebrow">01 / BUILT FOR YOUR BOUNDARIES</p><h2 id="use-cases-title">Open collaboration.<br><span>Selective access.</span></h2></div>
+      <div class="use-case-grid">
+        <article class="use-case-card"><div class="use-case-label"><span aria-hidden="true">&lt;/&gt;</span><span>01 / OPEN SOURCE</span></div><h3>Go public.<br>Keep control.</h3><p>Choose which files and directories are available publicly. Share your open source code and docs while keeping internal tooling, private modules, and unreleased work in a restricted view of the same repository.</p><div class="scope-example"><span>public/</span><span class="scope-locked"><span class="file-glyph lock-glyph" aria-hidden="true"></span>internal/</span></div></article>
+        <article class="use-case-card"><div class="use-case-label"><span aria-hidden="true">&gt;_</span><span>02 / CODING AGENTS</span></div><h3>Give agents a task.<br>And a boundary.</h3><p>Limit an agent to the paths its task requires. Grant read-only context or targeted write access, and keep unrelated code and sensitive directories outside its repository view.</p><div class="scope-example"><span>src/feature/</span><span class="scope-locked"><span class="file-glyph lock-glyph" aria-hidden="true"></span>deploy/</span></div></article>
+        <article class="use-case-card"><div class="use-case-label"><span aria-hidden="true">[ / ]</span><span>03 / LARGE MONOREPOS</span></div><h3>One monorepo.<br>Every team’s scope.</h3><p>Keep large teams working in one source of truth. Give each team specific access to its services and shared packages, with separate read and write boundaries for the rest of the monorepo.</p><div class="scope-example"><span>teams/payments/</span><span class="scope-locked"><span class="file-glyph lock-glyph" aria-hidden="true"></span>teams/ml/</span></div></article>
       </div>
     </section>
 
     <section id="principles" class="principles" aria-label="How Bastion works">
-      <div class="section-heading"><p class="eyebrow">ONE REPOSITORY, PURPOSEFUL VIEWS</p><h2>Security that follows the shape of the work.</h2></div>
+      <div class="section-heading"><p class="eyebrow">02 / THE ACCESS PROTOCOL</p><h2>Set the policy.<br><span>Keep your workflow.</span></h2></div>
       <div class="principle-grid">
         <article><span>01</span><h3>Define the boundary</h3><p>Grant read and write capabilities to exact files or directories. Explicit restrictions win where precision matters.</p></article>
         <article><span>02</span><h3>Project the repository</h3><p>Each person receives a normal Git view with inaccessible paths removed from the tree and visible history.</p></article>
@@ -68,20 +86,21 @@
     </section>
 
     <section class="landing-cta">
-      <div><p class="eyebrow">YOUR CODE, ON YOUR TERMS</p><h2>See the repository<br>you are meant to see.</h2></div>
-      <p>Sign in to browse your projected code, read documentation, inspect history, and clone a permission-bounded repository.</p>
+      <div><p class="eyebrow">YOUR CODE, ON YOUR TERMS</p><h2>Collaboration without<br>the all-access pass.</h2></div>
+      <div class="cta-action"><p>Real Git. Exact permissions.<br>A workspace that respects the boundary.</p><a class="primary-link" href="/sign-in">Access your workspace <span aria-hidden="true">↗</span></a></div>
     </section>
   </div>
 
-  <section id="login" class="login-shell">
-    <div class="login-aside">
-      <span class="login-index">ACCESS / 01</span>
-      <h2>Welcome back.</h2>
-      <p>Your repository view is assembled from the permissions active for your account.</p>
-      <div class="login-proof"><span class="status-dot"></span><span>Credentials remain in page memory only</span></div>
-    </div>
+  <section id="login" class="login-shell" aria-labelledby="sign-in-title" hidden>
+    <a class="sign-in-back text-link" href="/">← Back to Bastion</a>
     <div class="login-card">
-      <p class="eyebrow">SIGN IN TO BASTION</p>
+      <header class="sign-in-heading">
+        <span class="sign-in-emblem" aria-hidden="true"><svg width="28" height="32" viewBox="0 0 24 28" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2 22 6v8c0 6-10 12-10 12S2 20 2 14V6Z"/><path d="m7 13 3 3 7-7"/></svg></span>
+        <p class="eyebrow">BASTION / IDENTITY CHECK</p>
+        <h1 id="sign-in-title">Access granted.<br><span>Starts here.</span></h1>
+        <p>Sign in to your permission-aware workspace.</p>
+      </header>
+      <p id="auth-status" class="auth-status" role="status">Connecting to secure sign-in…</p>
       <div id="clerk-auth" hidden>
         <div id="clerk-sign-in"></div>
         <form id="clerk-view-form" hidden>
@@ -90,28 +109,34 @@
           <button type="submit" class="primary-button">Open repository <span aria-hidden="true">→</span></button>
         </form>
       </div>
-      <details>
-        <summary>Use a Git or API access token</summary>
-        <form id="login-form" autocomplete="off">
-          <label for="token">Access token</label>
-          <input id="token" name="token" type="password" autocomplete="off" spellcheck="false" required placeholder="bst1…">
-          <button type="submit" class="primary-button">Open repository <span aria-hidden="true">→</span></button>
-        </form>
-      </details>
       <p id="login-error" class="error" role="alert" hidden></p>
       <p id="session-note" class="session-note">Account authentication is managed by Clerk.</p>
     </div>
+    <p class="sign-in-footnote"><span class="status-dot"></span> YOUR IDENTITY. YOUR SCOPE. YOUR CODE.</p>
   </section>
 
   <section id="host-dashboard" class="host-dashboard" hidden>
-    <div class="section-heading"><p class="eyebrow">YOUR WORKSPACE</p><h2 id="host-heading">Repositories</h2><p id="host-message" role="status"></p></div>
+    <div id="repository-index">
+    <header class="repository-index-header">
+      <div><p class="eyebrow">YOUR WORKSPACE</p><h2 id="host-heading">Repositories</h2></div>
+      <nav class="repository-actions" aria-label="Workspace actions">
+        <button id="approve-account-action" class="quiet-button" type="button" hidden>Approve account</button>
+        <button id="import-repository-action" class="quiet-button" type="button" hidden>Import repository</button>
+        <button id="create-repository-action" class="primary-button" type="button">New repository</button>
+      </nav>
+    </header>
+    <p id="host-message" class="hint" role="status"></p>
     <div id="repository-list" class="repository-list" aria-live="polite"></div>
-    <form id="create-repository" class="create-repository" autocomplete="off">
+    </div>
+    <div id="repository-action-page" class="repository-action-page" hidden>
+    <button id="repository-action-back" class="quiet-button" type="button">← All repositories</button>
+    <article id="host-profile" class="create-repository" hidden></article>
+    <form id="create-repository" class="create-repository" autocomplete="off" hidden>
       <h3>Create a repository</h3><p>Creates a seeded-empty repository on <code id="default-branch">main</code>.</p>
       <label for="new-repository-name">Repository name</label><input id="new-repository-name" required maxlength="64" pattern="[a-z0-9][a-z0-9-]{0,63}" placeholder="my-project">
       <button class="primary-button" type="submit">Create repository</button><p id="create-error" class="error" role="status"></p>
     </form>
-    <form id="import-repository" class="create-repository import-repository" autocomplete="off">
+    <form id="import-repository" class="create-repository import-repository" autocomplete="off" hidden>
       <h3>Import an existing repository</h3>
       <p>Prepare a repository, then push one branch directly from your local Git clone. No archive or bundle is needed.</p>
       <label for="import-repository-name">Repository name</label><input id="import-repository-name" required maxlength="64" pattern="[a-z0-9][a-z0-9-]{0,63}" placeholder="my-project">
@@ -142,6 +167,7 @@
       <button class="primary-button" type="submit">Approve account</button>
       <p id="approve-status" role="status" aria-live="polite"></p>
     </form>
+    </div>
   </section>
 
   <section id="workspace" hidden>

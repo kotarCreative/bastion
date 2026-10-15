@@ -1,8 +1,7 @@
 /* Bastion browser application.
  *
  * The access token lives in one module-local variable (page memory only). It
- * is never written to a cookie, URL, DOM node, or telemetry, and is cleared
- * from the input immediately after use. Untrusted server data is rendered
+ * is never written to a cookie, URL, DOM node, or telemetry. Untrusted server data is rendered
  * through textContent and attribute setters only.
  */
 "use strict";
@@ -25,10 +24,10 @@
   var authGeneration = 0;
   var session = null;
   var clerk = null;
+  var clerkSignInMounted = false;
   var clerkHadSession = false;
   var clerkExchangePending = false;
   var clerkExchangeRun = 0;
-  var clerkUserButtonMounted = false;
   var historyRendered = false;
   var treeState = { stack: [], entries: [], cursor: null, loading: false };
   var fullTree = true;
@@ -44,13 +43,14 @@
     homeNav: document.getElementById("home-nav"),
     sessionNav: document.getElementById("session-nav"),
     identity: document.getElementById("identity"),
-    clerkUserButton: document.getElementById("clerk-user-button"),
+    profileMenu: document.getElementById("profile-menu"),
+    profileMenuToggle: document.getElementById("profile-menu-toggle"),
+    profileMenuContent: document.getElementById("profile-menu-content"),
     manageAccount: document.getElementById("manage-account"),
     logout: document.getElementById("logout"),
     login: document.getElementById("login"),
-    loginForm: document.getElementById("login-form"),
-    tokenInput: document.getElementById("token"),
     loginError: document.getElementById("login-error"),
+    authStatus: document.getElementById("auth-status"),
     clerkAuth: document.getElementById("clerk-auth"),
     clerkSignIn: document.getElementById("clerk-sign-in"),
     clerkViewForm: document.getElementById("clerk-view-form"),
@@ -73,6 +73,11 @@
     cloneUrl: document.getElementById("clone-url"),
     cloneAuthorNote: document.getElementById("clone-author-note"),
     hostDashboard: document.getElementById("host-dashboard"),
+    repositoryIndex: document.getElementById("repository-index"),
+    actionPage: document.getElementById("repository-action-page"),
+    createAction: document.getElementById("create-repository-action"),
+    importAction: document.getElementById("import-repository-action"),
+    approveAction: document.getElementById("approve-account-action"),
     repositoryList: document.getElementById("repository-list"),
     hostMessage: document.getElementById("host-message"),
     createForm: document.getElementById("create-repository"),
@@ -145,8 +150,8 @@
       if (scoped && (requestSelection !== selectionRun || requestRepoId !== (session && session.repo && session.repo.repo_id) || requestCredential !== credential)) throw new Error("stale-session");
       if (hostRoute && requestCredential && requestCredential !== hostCredential && !options.allowStaleAuthResponse) throw new Error("stale-session");
       if (response.status === 401 && options.allowStaleAuthResponse && requestCredential && requestCredential !== hostCredential) throw new Error("stale-session");
-      // Sign-in attempts have their own generation/error handling; an invalid
-      // supplied JWT/token must not invalidate a different active session.
+      // Clerk exchanges have their own generation/error handling; an invalid
+      // JWT must not invalidate a different active session.
       if (response.status === 401 && !options.optionalAuth && !externalAuth) {
         if (requestCredential && requestCredential === hostCredential && (options.host || !scoped)) clearBastionSession();
         else if (requestCredential === credential) {
@@ -198,7 +203,40 @@
     if (name === "history" && !historyRendered) renderHistory();
   }
 
+  function isSignInPage() {
+    return window.location.pathname === "/sign-in";
+  }
+
+  function renderPublicPage() {
+    ELEMENTS.login.hidden = !isSignInPage();
+    ELEMENTS.homepage.hidden = isSignInPage();
+    document.title = isSignInPage() ? "Sign in | Bastion" : "Bastion | Permission-aware Git hosting";
+  }
+
+  function showSignInPage() {
+    if (!isSignInPage()) window.history.replaceState(null, "", "/sign-in");
+    renderPublicPage();
+    mountClerkSignIn();
+  }
+
+  function leaveSignInPage() {
+    if (isSignInPage()) window.history.replaceState(null, "", "/");
+    document.title = "Workspace | Bastion";
+  }
+
+  function mountClerkSignIn() {
+    if (!clerk || clerk.session || !isSignInPage() || clerkSignInMounted) return;
+    clerk.mountSignIn(ELEMENTS.clerkSignIn, {
+      routing: "hash",
+      forceRedirectUrl: "/",
+      signUpForceRedirectUrl: "/",
+    });
+    clerkSignInMounted = true;
+  }
+
   function clearBastionSession() {
+    var wasAuthenticated = Boolean(credential || hostCredential);
+    closeProfileMenu();
     authGeneration += 1;
     hostRun += 1; selectionRun += 1;
     invitationRun += 1;
@@ -218,13 +256,15 @@
     historyRendered = false;
     treeRun += 1;
     treeState = { stack: [], entries: [], cursor: null, loading: false };
-    ELEMENTS.tokenInput.value = "";
-    ELEMENTS.login.hidden = false;
-    ELEMENTS.homepage.hidden = false;
+    if (wasAuthenticated) showSignInPage();
+    else renderPublicPage();
     ELEMENTS.homeNav.hidden = false;
     ELEMENTS.sessionNav.hidden = true;
     ELEMENTS.workspace.hidden = true;
     ELEMENTS.hostDashboard.hidden = true;
+    ELEMENTS.actionPage.hidden = true;
+    ELEMENTS.createForm.hidden = true;
+    ELEMENTS.importForm.hidden = true;
     ELEMENTS.hostMessage.textContent = ""; clearChildren(ELEMENTS.repositoryList); ELEMENTS.createError.textContent = "";
     ELEMENTS.createName.value = "";
     if (ELEMENTS.createForm.querySelector) { var createButton = ELEMENTS.createForm.querySelector("button[type=submit]"); if (createButton) createButton.disabled = false; }
@@ -237,7 +277,6 @@
     if (ELEMENTS.cloneDialog.open) ELEMENTS.cloneDialog.close();
     ELEMENTS.manageAccount.hidden = true;
     ELEMENTS.logout.hidden = true;
-    ELEMENTS.clerkUserButton.hidden = true;
     document.getElementById("tab-permissions").hidden = true;
     ["panel-history", "panel-decision", "panel-credentials", "panel-permissions", "panel-profile"].forEach(function (id) {
       clearChildren(document.getElementById(id));
@@ -305,20 +344,47 @@
     return visibleText(clerk.session.id || "") + "|" + visibleText(clerk.session.user && clerk.session.user.id || clerk.user && clerk.user.id || "");
   }
 
-  function revokeLateLogin(result, token, repoId) {
-    if (result && result.body && result.body.mode === "host" && result.body.access_token) {
+  function revokeLateLogin(result) {
+    if (result && result.body && result.body.access_token) {
       fetch("/api/v1/logout", { method: "POST", headers: { Authorization: "Bearer " + result.body.access_token }, credentials: "omit", cache: "no-store" }).catch(function () {});
-    } else if (result && result.body && result.body.access_token) {
-      var path = repoId ? "/api/v1/repos/" + encodeURIComponent(repoId) + "/logout" : "/api/v1/logout";
-      fetch(path, { method: "POST", headers: { Authorization: "Bearer " + result.body.access_token }, credentials: "omit", cache: "no-store" }).catch(function () {});
-    } else if (token) {
-      fetch("/api/v1/logout", { method: "POST", headers: { Authorization: "Bearer " + token }, credentials: "omit", cache: "no-store" }).catch(function () {});
     }
   }
 
+  // Hash routes keep the account credential in memory while giving forms their
+  // own pages and supporting the browser's Back/Forward controls.
+  function showRepositoryPage(page, navigate) {
+    if (!hostCredential || session) return;
+    if ((page === "import" && !importLimits) || (page === "approve" && !(hostAccount && hostAccount.is_host_admin))) page = "list";
+    ELEMENTS.repositoryIndex.hidden = page !== "list";
+    ELEMENTS.actionPage.hidden = page === "list";
+    ELEMENTS.createForm.hidden = page !== "new";
+    ELEMENTS.importForm.hidden = page !== "import";
+    ELEMENTS.approveForm.hidden = page !== "approve";
+    var profile = document.getElementById("host-profile");
+    profile.hidden = page !== "profile";
+    if (page === "profile") {
+      clearChildren(profile);
+      profile.appendChild(element("h3", null, "Your profile"));
+      profile.appendChild(definitionList([
+        ["Username", hostAccount && hostAccount.owner_name],
+        ["Account", hostAccount && hostAccount.account_id],
+      ]));
+    }
+    ELEMENTS.importList.hidden = page !== "import";
+    ELEMENTS.importAction.hidden = !importLimits;
+    ELEMENTS.approveAction.hidden = !(hostAccount && hostAccount.is_host_admin);
+    if (navigate) window.location.hash = page === "list" ? "#repositories" : "#repositories/" + page;
+  }
+
+  function repositoryPageFromHash() {
+    var match = /^#repositories\/(new|import|approve|profile)$/.exec(window.location.hash || "");
+    return match ? match[1] : "list";
+  }
+
   function renderRepositories() {
-    if (ELEMENTS.approveForm) ELEMENTS.approveForm.hidden = !(hostAccount && hostAccount.is_host_admin);
     if (!hostCredential) return;
+    leaveSignInPage();
+    showRepositoryPage(repositoryPageFromHash(), false);
     var run = ++hostRun, selection = selectionRun;
     ELEMENTS.hostDashboard.hidden = false; ELEMENTS.workspace.hidden = true;
     ELEMENTS.homepage.hidden = true; ELEMENTS.login.hidden = true; ELEMENTS.sessionNav.hidden = false;
@@ -326,13 +392,15 @@
     request("/api/v1/repos", { host: true }).then(function (result) {
       if (run !== hostRun || selection !== selectionRun || !hostCredential || session) return;
       if (result.status !== 200) throw new Error("repos");
-      repositories = result.body.repos || []; ELEMENTS.hostMessage.textContent = repositories.length ? "Choose a repository to continue." : "No repositories yet. Create your first repository.";
+      repositories = result.body.repos || []; ELEMENTS.hostMessage.textContent = repositories.length ? repositories.length + (repositories.length === 1 ? " repository" : " repositories") : "No repositories yet. Create your first repository.";
       repositories.forEach(function (repo) {
         var card = element("article", "repository-card");
-        card.appendChild(element("h3", null, repo.owner_name + " / " + repo.name));
-        card.appendChild(element("p", "hint", repo.branch || "main"));
-        var open = textButton("primary-button", "Open repository"); open.addEventListener("click", function () { openHostedRepository(repo); });
-        card.appendChild(open); ELEMENTS.repositoryList.appendChild(card);
+        var heading = element("h3");
+        var open = textButton("repository-name", repo.owner_name + " / " + repo.name);
+        open.addEventListener("click", function () { openHostedRepository(repo); });
+        heading.appendChild(open); card.appendChild(heading);
+        card.appendChild(element("p", "hint", "Default branch: " + (repo.branch || "main")));
+        ELEMENTS.repositoryList.appendChild(card);
       });
       if (importLimits && loadPendingImports) loadPendingImports(run, selection);
     }).catch(function () { if (run === hostRun && selection === selectionRun && hostCredential && !session) {
@@ -356,6 +424,7 @@
   }
 
   function openHostedRepository(repo, viewId) {
+    showRepositoryPage("list", true);
     var old = credential;
     var previousRepoId = session && session.repo && session.repo.repo_id;
     if (old && previousRepoId) fetch("/api/v1/repos/" + encodeURIComponent(previousRepoId) + "/logout", { method: "POST", headers: { Authorization: "Bearer " + old }, cache: "no-store", credentials: "omit" }).catch(function () {});
@@ -1292,11 +1361,11 @@
   }
 
   function openSession(token, envelope) {
+    leaveSignInPage();
     credential = token;
     session = envelope;
     ELEMENTS.hostDashboard.hidden = true;
     ELEMENTS.homepage.hidden = true; ELEMENTS.login.hidden = true; ELEMENTS.sessionNav.hidden = false;
-    ELEMENTS.identity.hidden = false; ELEMENTS.identity.textContent = session.repo ? session.repo.owner_name + " / " + session.repo.name + " · view " + session.view_id : session.principal.id + " / " + session.view_id;
     ELEMENTS.logout.hidden = false;
     historyRendered = false;
     treeState = { stack: [], entries: [], cursor: null, loading: false };
@@ -1307,7 +1376,7 @@
     ELEMENTS.sessionNav.hidden = false;
     ELEMENTS.workspace.hidden = false;
     ELEMENTS.identity.hidden = false;
-    ELEMENTS.identity.textContent = session.repo ? session.repo.owner_name + " / " + session.repo.name + " · view " + session.view_id : session.principal.id + " / " + session.view_id;
+    ELEMENTS.identity.textContent = (hostAccount ? hostAccount.owner_name : session.principal.id) + " · view " + session.view_id;
     ELEMENTS.manageAccount.hidden = !clerk;
     ELEMENTS.logout.hidden = false;
     ELEMENTS.repoOwner.textContent = session.repo ? session.repo.owner_name : session.principal.id;
@@ -1349,17 +1418,13 @@
   }
 
   function showClerkError(message) {
+    ELEMENTS.authStatus.hidden = true;
     ELEMENTS.loginError.hidden = false;
     ELEMENTS.loginError.textContent = message;
   }
 
-  function mountClerkUserButton() {
-    if (!clerk) return;
-    if (!clerkUserButtonMounted) {
-      clerk.mountUserButton(ELEMENTS.clerkUserButton, { afterSignOutUrl: "/" });
-      clerkUserButtonMounted = true;
-    }
-    ELEMENTS.clerkUserButton.hidden = false;
+  function updateAccountMenu() {
+    ELEMENTS.manageAccount.hidden = !clerk;
   }
 
   function exchangeClerkSession(view) {
@@ -1382,10 +1447,11 @@
       });
     }).then(function (result) {
       if (generation !== authGeneration || identity !== currentClerkIdentity()) {
-        if (result.status === 200) revokeLateLogin(result, null, null);
+        if (result.status === 200) revokeLateLogin(result);
         return;
       }
       if (result.status === 409 && Array.isArray(result.body.view_ids)) {
+        showSignInPage();
         clearChildren(ELEMENTS.clerkView);
         result.body.view_ids.forEach(function (viewId) {
           var option = element("option", null, viewId);
@@ -1397,10 +1463,11 @@
         return;
       }
       if (result.status !== 200) {
+        showSignInPage();
         showClerkError(result.status === 403 ? "Your account has not been approved for this workspace." : "Your sign-in could not be verified.");
         return;
       }
-      mountClerkUserButton();
+      updateAccountMenu();
       if (hostMode && result.body.account) {
         hostCredential = result.body.access_token;
         hostAccount = result.body.account;
@@ -1410,16 +1477,23 @@
       }
       openSession(result.body.access_token, result.body.session);
     }).catch(function () {
-      if (generation === authGeneration && identity === currentClerkIdentity()) showClerkError("Sign-in failed. Please try again.");
+      if (generation === authGeneration && identity === currentClerkIdentity()) {
+        showSignInPage();
+        showClerkError("Sign-in failed. Please try again.");
+      }
     }).then(function () { if (exchangeRun === clerkExchangeRun) clerkExchangePending = false; });
   }
 
   function configureClerk(config) {
     hostMode = config.mode === "host";
     importLimits = hostMode && config.import_mode === "first-push" && config.import_limits && Number.isSafeInteger(config.import_limits.pack_bytes) && config.import_limits.pack_bytes > 0 ? config.import_limits : null;
-    if (ELEMENTS.importForm) ELEMENTS.importForm.hidden = !hostMode || !importLimits;
+    if (ELEMENTS.importAction) ELEMENTS.importAction.hidden = !hostMode || !importLimits;
     if (hostMode && !importLimits) ELEMENTS.importStatus.textContent = "First-push import is unavailable on this server.";
-    if (!config.enabled) return Promise.resolve();
+    if (!config.enabled) {
+      ELEMENTS.authStatus.textContent = "Sign-in is unavailable because Clerk is not configured on this server. Contact your administrator.";
+      ELEMENTS.sessionNote.textContent = "Browser sign-in requires Clerk.";
+      return Promise.resolve();
+    }
     ELEMENTS.clerkAuth.hidden = false;
     ELEMENTS.sessionNote.textContent = "Authentication, recovery, MFA, and account security are managed by Clerk.";
     return loadScript(config.frontend_api_origin + "/npm/@clerk/ui@1/dist/ui.browser.js")
@@ -1428,9 +1502,39 @@
       })
       .then(function () {
         clerk = window.Clerk;
-        return clerk.load({ ui: { ClerkUI: window.__internal_ClerkUICtor } });
+        return clerk.load({
+          ui: { ClerkUI: window.__internal_ClerkUICtor },
+          appearance: {
+            variables: {
+              colorPrimary: "#ccff5f",
+              colorPrimaryForeground: "#090c12",
+              colorBackground: "#10151e",
+              colorForeground: "#e5e9ef",
+              colorMutedForeground: "#a1abba",
+              colorInput: "#090c12",
+              colorInputForeground: "#e5e9ef",
+              colorNeutral: "#e5e9ef",
+              colorDanger: "#ff83b5",
+              colorSuccess: "#ccff5f",
+              borderRadius: "3px",
+              fontFamily: 'Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+            },
+            elements: {
+              rootBox: "bastion-auth-root",
+              cardBox: "bastion-auth-box",
+              card: "bastion-auth-card",
+              headerTitle: "bastion-auth-title",
+              socialButtonsBlockButton: "bastion-auth-social",
+              formFieldInput: "bastion-auth-input",
+              formButtonPrimary: "bastion-auth-submit",
+              footer: "bastion-auth-footer",
+              footerActionLink: "bastion-auth-link",
+            },
+          },
+        });
       })
       .then(function () {
+        ELEMENTS.authStatus.hidden = true;
         clerkHadSession = Boolean(clerk.session);
         var listenerIdentity = currentClerkIdentity();
         clerk.addListener(function (state) {
@@ -1440,58 +1544,50 @@
           if (hasSession && (!clerkHadSession || identity !== listenerIdentity) && !session) {
             authGeneration += 1;
             clerkExchangePending = false; clerkExchangeRun += 1;
-            mountClerkUserButton();
+            updateAccountMenu();
             exchangeClerkSession();
           }
           if (clerkHadSession && !hasSession) {
             clerkExchangePending = false; clerkExchangeRun += 1;
             revokeAndClear(false);
+            mountClerkSignIn();
           }
           listenerIdentity = identity;
           clerkHadSession = hasSession;
         });
         if (clerk.isSignedIn) {
-          mountClerkUserButton();
+          updateAccountMenu();
           exchangeClerkSession();
         } else {
-          clerk.mountSignIn(ELEMENTS.clerkSignIn);
+          mountClerkSignIn();
         }
       });
   }
 
-  function authenticate(token) {
-    var generation = ++authGeneration;
-    request("/api/v1/session", { headers: { Authorization: "Bearer " + token }, skipCredential: true }).then(function (result) {
-      if (generation !== authGeneration) { if (result.status === 200) revokeLateLogin(result, token, null); return; }
-      ELEMENTS.tokenInput.value = "";
-      if (result.status !== 200) {
-        showClerkError(result.status === 403 ? "This token cannot open the browser interface." : "Sign-in failed.");
-        return;
-      }
-      if (hostMode && result.body.account) {
-        if (hostCredential && hostCredential !== token) clearImportState();
-        hostCredential = token; hostAccount = result.body.account; ELEMENTS.tokenInput.value = ""; ELEMENTS.identity.textContent = result.body.account.owner_name; ELEMENTS.identity.hidden = false; ELEMENTS.logout.hidden = false; ELEMENTS.login.hidden = true; ELEMENTS.homepage.hidden = true; ELEMENTS.homeNav.hidden = true; ELEMENTS.sessionNav.hidden = false; renderRepositories(); return;
-      }
-      openSession(token, result.body);
-    }).catch(function (error) {
-      if (generation !== authGeneration) return;
-      ELEMENTS.tokenInput.value = "";
-      if (!error || error.message !== "auth-required") showClerkError("Sign-in failed.");
-    });
-  }
-
-  ELEMENTS.loginForm.addEventListener("submit", function (event) {
-    event.preventDefault();
-    var token = ELEMENTS.tokenInput.value.trim();
-    ELEMENTS.tokenInput.value = "";
-    ELEMENTS.loginError.hidden = true;
-    if (token) authenticate(token);
-  });
   ELEMENTS.clerkViewForm.addEventListener("submit", function (event) {
     event.preventDefault();
     exchangeClerkSession(ELEMENTS.clerkView.value);
   });
-  ELEMENTS.manageAccount.addEventListener("click", function () { if (clerk) clerk.openUserProfile(); });
+  function closeProfileMenu() {
+    ELEMENTS.profileMenuContent.hidden = true;
+    ELEMENTS.profileMenuToggle.setAttribute("aria-expanded", "false");
+  }
+  ELEMENTS.profileMenuToggle.addEventListener("click", function () {
+    var open = ELEMENTS.profileMenuContent.hidden;
+    ELEMENTS.profileMenuContent.hidden = !open;
+    ELEMENTS.profileMenuToggle.setAttribute("aria-expanded", String(open));
+  });
+  if (window.addEventListener) {
+    window.addEventListener("click", function (event) {
+      if (!ELEMENTS.profileMenu.contains(event.target)) closeProfileMenu();
+    });
+    window.addEventListener("keydown", function (event) {
+      if (event.key === "Escape" && !ELEMENTS.profileMenuContent.hidden) {
+        closeProfileMenu(); ELEMENTS.profileMenuToggle.focus();
+      }
+    });
+  }
+  ELEMENTS.manageAccount.addEventListener("click", function () { closeProfileMenu(); if (clerk) clerk.openUserProfile(); });
   ELEMENTS.logout.addEventListener("click", function () {
     revokeAndClear(true);
   });
@@ -1499,6 +1595,13 @@
     tab.addEventListener("click", function () { showPanel(tab.dataset.panel); });
   });
   document.getElementById("repository-nav").addEventListener("click", function () { showPanel("code"); });
+  ELEMENTS.createAction.addEventListener("click", function () { showRepositoryPage("new", true); });
+  ELEMENTS.importAction.addEventListener("click", function () { showRepositoryPage("import", true); });
+  ELEMENTS.approveAction.addEventListener("click", function () { showRepositoryPage("approve", true); });
+  document.getElementById("repository-action-back").addEventListener("click", function () { showRepositoryPage("list", true); renderRepositories(); });
+  if (window.addEventListener) window.addEventListener("hashchange", function () {
+    if (hostCredential && !session) showRepositoryPage(repositoryPageFromHash(), false);
+  });
   ELEMENTS.repositoryListNav.addEventListener("click", function () { var repoId = session && session.repo && session.repo.repo_id, token = credential; if (repoId && token) fetch("/api/v1/repos/" + encodeURIComponent(repoId) + "/logout", { method: "POST", headers: { Authorization: "Bearer " + token }, credentials: "omit", cache: "no-store" }).catch(function () {}); clearRepositorySession(); renderRepositories(); });
   ELEMENTS.createForm.addEventListener("submit", function (event) {
     event.preventDefault(); if (!hostCredential || createPending) return;
@@ -1521,7 +1624,7 @@
       if (!hostCredential || hostCredential !== creatingHost) return;
       if (result.status !== 201 && result.status !== 200) throw new Error("create");
       createRequestId = null; ELEMENTS.createName.value = ""; ELEMENTS.createError.textContent = "";
-      if (selection === selectionRun && !session && !ELEMENTS.hostDashboard.hidden) renderRepositories();
+      if (selection === selectionRun && !session && !ELEMENTS.hostDashboard.hidden) { showRepositoryPage("list", true); renderRepositories(); }
       else if (hostCredential) repositories.push(result.body.repo);
     }).catch(function () { if (hostCredential === creatingHost && !session && !ELEMENTS.hostDashboard.hidden) ELEMENTS.createError.textContent = "Repository creation failed. Retry safely; the same request will be reused."; })
       .then(function () { if (hostCredential === creatingHost) { createPending = false; if (createButton) createButton.disabled = false; } });
@@ -1588,7 +1691,7 @@
           ELEMENTS.importSecret.value = ""; ELEMENTS.importInstructions.hidden = true;
           ELEMENTS.importCommands.textContent = ""; importRequest = null;
           setImport("Ready: " + (op.repo.owner_name || "") + " / " + op.repo.name, "");
-          if (!session && !ELEMENTS.hostDashboard.hidden) renderRepositories();
+          if (!session && !ELEMENTS.hostDashboard.hidden) { showRepositoryPage("list", true); renderRepositories(); }
         } else {
           showPushInstructions(op);
           if (op.state === "failed") setImport("Initial push was rejected.", "Correct the source and retry the Git push. If validation already pinned the source, retry that same branch tip.");
@@ -1671,7 +1774,11 @@
       }).catch(function () { if (activeList()) ELEMENTS.importList.textContent = "Pending imports are unavailable. Refresh the repository list to retry."; });
     };
   }
-  document.getElementById("profile-nav").addEventListener("click", function () { showPanel("profile"); });
+  document.getElementById("profile-nav").addEventListener("click", function () {
+    closeProfileMenu();
+    if (session) showPanel("profile");
+    else if (hostCredential) showRepositoryPage("profile", true);
+  });
   ELEMENTS.treeMore.addEventListener("click", function () { loadDirectory(false); });
   document.getElementById("tree-mode").addEventListener("click", function (event) {
     fullTree = !fullTree;

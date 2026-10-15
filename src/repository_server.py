@@ -1221,6 +1221,7 @@ def create_app(root: Path) -> Flask:
         return response
 
     @app.route("/", methods=["GET"])
+    @app.route("/sign-in", methods=["GET"])
     def landing():
         return _asset("index.html", "text/html; charset=utf-8")
 

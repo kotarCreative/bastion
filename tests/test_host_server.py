@@ -3,6 +3,18 @@ from host_server import create_app
 import subprocess
 
 
+def test_sign_in_page_is_public_and_supports_direct_navigation(tmp_path):
+    host = Host(tmp_path / "host")
+    client = create_app(host.root).test_client()
+    for path in ("/", "/sign-in"):
+        response = client.get(path)
+        assert response.status_code == 200
+        assert b'id="clerk-sign-in"' in response.data
+        assert b'href="/sign-in"' in response.data
+        assert "Content-Security-Policy" in response.headers
+    assert client.get("/sign-in/missing").status_code == 404
+
+
 def test_host_sessions_are_distinct_digest_only_and_revocable(tmp_path):
     host = Host(tmp_path / "host")
     account_id = host.approve_account("alice", ["alice@example.test"])

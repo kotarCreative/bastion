@@ -707,6 +707,7 @@ def create_app(root: Path | str, *, host_catalog=None) -> Flask:
             return Response("service unavailable", 503)
 
     @app.get("/")
+    @app.get("/sign-in")
     def landing():
         from repository_server import ASSET_DIR
         return Response((ASSET_DIR / "index.html").read_bytes(), content_type="text/html; charset=utf-8")

@@ -110,6 +110,15 @@ class DemoServerTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json(), {"enabled": False})
 
+    def test_sign_in_page_supports_direct_navigation_and_refresh(self) -> None:
+        response = self.client.get("/sign-in")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b'id="clerk-sign-in"', response.data)
+        self.assertIn(b'href="/sign-in"', response.data)
+        self.assertEqual(response.headers["Cache-Control"], "no-cache")
+        cached = self.client.get("/sign-in", headers={"If-None-Match": response.headers["ETag"]})
+        self.assertEqual(cached.status_code, 304)
+
     def test_assets_are_served(self) -> None:
         css = self.client.get("/assets/app.css")
         js = self.client.get("/assets/app.js")
@@ -146,9 +155,11 @@ class DemoServerTest(unittest.TestCase):
         self.assertNotIn("outerHTML", js)
         self.assertIn("page memory only", js)
         self.assertIn("Bearer ", js)
-        # The Git/API token input is cleared right after use.
-        self.assertIn('tokenInput.value = ""', js)
+        # Browser authentication is Clerk-only; there is no manual token form.
+        self.assertNotIn("tokenInput", js)
         shell = self.client.get("/").data.decode()
+        self.assertNotIn('id="login-form"', shell)
+        self.assertNotIn('name="token"', shell)
         self.assertNotIn('name="password"', shell)
         self.assertNotIn("<style", shell)
 

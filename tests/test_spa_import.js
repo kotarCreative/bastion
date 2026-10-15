@@ -25,18 +25,22 @@ Object.defineProperty(nodes.get("import-status"), "textContent", {
 const tabs=[...nodes.values()].filter(n=>n.id.startsWith("tab-")), panels=[...nodes.values()].filter(n=>n.id.startsWith("panel-"));
 tabs.forEach(n=>n.dataset.panel=n.id.slice(4));
 const calls=[], operations=new Map(), repos=[], copied=[];
-let uuid=0, failReserve=0, failCredential=0, failStatus=0, expireStatus=0, gateReserve=null, gateCredential=null, gateStatus=null, owner="alice", hostToken="host-token";
+let uuid=0, failReserve=0, failCredential=0, failStatus=0, expireStatus=0, gateReserve=null, gateCredential=null, gateStatus=null, owner="alice", hostToken="host-token", clerkSession, clerkListener;
 const existing={repo_id:"r1", name:"existing", owner_name:"alice", branch:"main", git_url:"/alice/existing.git", views:["owner"]};
 function deferred() { let resolve; const promise=new Promise(r=>resolve=r); return {promise,resolve}; }
 function shape(op) { return {import_id:op.import_id, name:op.name, branch:op.branch, state:op.state, repo:op.repo, git_url:`/${op.owner}/${op.name}.git`, username:"owner"}; }
+const newClerkSession=identity=>({id:"session-"+identity,user:{id:"user-"+identity},getToken:async()=>"jwt-"+identity});
+clerkSession=newClerkSession(owner);
+const clerk={get session(){return clerkSession},get isSignedIn(){return Boolean(clerkSession)},load:async()=>{},addListener(listener){clerkListener=listener},mountSignIn(){},signOut(){clerkSession=null;clerkListener?.({session:null});return Promise.resolve()}};
+const switchClerk=identity=>{owner=identity;clerkSession=newClerkSession(identity);clerkListener({session:clerkSession})};
 const ctx={console, URL, TextEncoder, Intl, Date, navigator:{clipboard:{writeText:async value=>{copied.push(value)}}},
-  document:{getElementById:id=>nodes.get(id), createElement:tag=>new Node(tag), querySelectorAll:s=>s===".tab"?tabs:panels},
-  window:{location:{protocol:"https:",host:"b.test",href:"https://b.test/"},scrollTo(){},setTimeout,clearTimeout,crypto:{randomUUID:()=>"uuid-"+(++uuid)}},
+  document:{getElementById:id=>nodes.get(id), createElement:tag=>new Node(tag), querySelectorAll:s=>s===".tab"?tabs:panels,head:{appendChild(node){node.fire("load")}}},
+  window:{location:{protocol:"https:",host:"b.test",href:"https://b.test/",pathname:"/"},Clerk:clerk,scrollTo(){},setTimeout,clearTimeout,crypto:{randomUUID:()=>"uuid-"+(++uuid)}},
   fetch:async(path, opts={})=>{
     const method=opts.method||"GET", token=opts.headers?.Authorization;
     calls.push({path,opts}); let status=200, body={};
-    if(path==="/api/v1/auth/config") body={enabled:false,mode:"host",import_mode:"first-push",import_limits:{pack_bytes:33554432}};
-    else if(path==="/api/v1/session") { hostToken=token.slice(7); body={mode:"host",account:{account_id:owner,owner_name:owner}}; }
+    if(path==="/api/v1/auth/config") body={enabled:true,mode:"host",frontend_api_origin:"https://clerk.test",publishable_key:"pk_test",import_mode:"first-push",import_limits:{pack_bytes:33554432}};
+    else if(path==="/api/v1/auth/clerk") { hostToken="host-token"; body={mode:"host",access_token:hostToken,account:{account_id:owner,owner_name:owner}}; }
     else if(path==="/api/v1/repos"&&method==="GET") body={repos:repos.slice()};
     else if(path==="/api/v1/imports"&&method==="GET") body={imports:[...operations.values()].filter(op=>op.owner===owner&&op.state!=="ready").map(shape)};
     else if(path==="/api/v1/imports"&&method==="POST") {
@@ -67,6 +71,7 @@ const ctx={console, URL, TextEncoder, Intl, Date, navigator:{clipboard:{writeTex
     else throw Error("Unexpected request: "+method+" "+path);
     return {status,json:async()=>body};
   }};
+ctx.window.history={replaceState(_state,_title,path){ctx.window.location.pathname=path;ctx.window.location.hash="";}};
 vm.runInNewContext(fs.readFileSync("templates/spa/app.js","utf8"),ctx);
 const settle=async()=>{for(let i=0;i<20;i++)await new Promise(r=>setImmediate(r))};
 const reserveCalls=()=>calls.filter(c=>c.path==="/api/v1/imports"&&c.opts.method==="POST");
@@ -75,8 +80,12 @@ function submit(name,branch="main") { fields(name,branch); nodes.get("import-rep
 function opNamed(name) { return [...operations.values()].find(op=>op.name===name); }
 function complete(op) { op.state="ready"; op.repo={repo_id:"r-"+op.import_id,name:op.name,owner_name:op.owner,branch:op.branch,git_url:`/${op.owner}/${op.name}.git`,views:["owner"]}; repos.push(op.repo); }
 (async()=>{
-  await settle(); nodes.get("token").value="host-token"; nodes.get("login-form").fire("submit"); await settle();
+  await settle();
+  assert.equal(nodes.get("import-repository").hidden,true);
+  assert.equal(nodes.get("import-repository-action").hidden,false);
+  nodes.get("import-repository-action").fire("click");
   assert.equal(nodes.get("import-repository").hidden,false);
+  assert.equal(nodes.get("create-repository").hidden,true);
   assert.equal(nodes.has("import-bundle"),false,"no file upload control");
   submit("Bad_Name"); await settle(); assert.equal(reserveCalls().length,0); assert.match(nodes.get("import-error").textContent,/lowercase/);
   submit("bad-branch","bad..branch"); await settle(); assert.equal(reserveCalls().length,0);
@@ -116,7 +125,7 @@ function complete(op) { op.state="ready"; op.repo={repo_id:"r-"+op.import_id,nam
   gateReserve.resolve(); await settle(); gateReserve=null; assert.equal(nodes.get("import-repository-name").value,"new-intent"); assert.equal(nodes.get("import-secret").value,""); assert.equal(submitButton.disabled,false);
   // Opening a repository while an external import completes cannot replace the workspace.
   submit("background"); await settle(); complete(opNamed("background"));
-  const open=nodes.get("repository-list").children.flatMap(n=>n.children).find(n=>n.textContent==="Open repository"); assert.ok(open); open.fire("click"); await settle();
+  const open=nodes.get("repository-list").children.flatMap(n=>n.children).flatMap(n=>n.children).find(n=>n.className==="repository-name"); assert.ok(open); open.fire("click"); await settle();
   nodes.get("import-check").fire("click"); await settle(); assert.equal(nodes.get("workspace").hidden,false); assert.equal(nodes.get("repo-name").textContent,"existing");
   assert.ok(calls.filter(c=>c.path.startsWith("/api/v1/imports")).every(c=>c.opts.headers.Authorization==="Bearer host-token"));
   assert.ok(calls.filter(c=>c.path.includes("/tree?")).every(c=>c.opts.headers.Authorization==="Bearer repo-token"));
@@ -124,7 +133,7 @@ function complete(op) { op.state="ready"; op.repo={repo_id:"r-"+op.import_id,nam
   nodes.get("repository-list-nav").fire("click"); await settle();
   gateCredential=deferred(); submit("logout-race"); await settle(); const gate=gateCredential;
   nodes.get("logout").fire("click"); await settle(); assert.equal(nodes.get("import-secret").value,"");
-  owner="charlie"; nodes.get("token").value="new-host"; nodes.get("login-form").fire("submit"); await settle();
+  switchClerk("charlie"); await settle();
   const status=nodes.get("import-status").textContent; gate.resolve(); await settle(); gateCredential=null;
   assert.equal(nodes.get("identity").textContent,"charlie"); assert.equal(nodes.get("import-secret").value,""); assert.equal(nodes.get("import-status").textContent,status);
   // Current host expiration clears the credential and form; late 401 does not clear a new login.
